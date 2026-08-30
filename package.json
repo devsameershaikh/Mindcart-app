@@ -1,0 +1,33 @@
+{
+  "name": "shoppingList",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "generate:logo": "node scripts/generate-logo.js",
+    "android:release": "npm run generate:logo && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "~54.0.36",
+    "expo-camera": "~17.0.10",
+    "expo-dev-client": "~6.0.21",
+    "expo-file-system": "~19.0.24",
+    "expo-notifications": "~0.32.17",
+    "expo-print": "~15.0.8",
+    "expo-sharing": "~14.0.8",
+    "expo-status-bar": "~3.0.9",
+    "lucide-react-native": "^1.33.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-safe-area-context": "~5.6.0",
+    "react-native-svg": "15.12.1"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.20.0"
+  },
+  "private": true
+}

@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "shopping list",
+    "slug": "shoppingList",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./src/assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+
+    "splash": {
+      "backgroundColor": "#ffffff"
+    },
+
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.sameer.shaikh.shoppingList"
+    },
+
+    "android": {
+      "package": "com.sameer.shaikh.shoppingList",
+      "edgeToEdgeEnabled": true
+    },
+
+    "extra": {
+      "eas": {
+        "projectId": "ed445fdb-2c8b-41ca-927a-519b5866ea5c"
+      }
+    },
+
+    "owner": "sameer.shaikh.dev"
+  }
+}

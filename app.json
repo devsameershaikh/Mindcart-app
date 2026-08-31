@@ -14,11 +14,11 @@
 
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.sameer.shaikh.shoppingList"
+      "bundleIdentifier": "com.samappstudio.shoppinglist"
     },
 
     "android": {
-      "package": "com.sameer.shaikh.shoppingList",
+      "package": "com.samappstudio.shoppinglist",
       "edgeToEdgeEnabled": true
     },
 

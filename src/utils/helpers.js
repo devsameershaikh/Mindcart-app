@@ -1,8 +1,25 @@
 // utils/helpers.js — pure logic ported verbatim from the web app's App.jsx.
 // None of this is platform-specific, so it moves over unchanged.
 
-export const UNITS = ["kg", "g", "litre", "ml", "packet", "piece", "dozen"];
-
+export const UNITS = [
+  "piece",
+  "kg",
+  "g",
+  "liter",
+  "ml",
+  "packet",
+  "pack",
+  "box",
+  "bottle",
+  "can",
+  "jar",
+  "bag",
+  "carton",
+  "dozen",
+  "pair",
+  "set",
+  "custom",
+];
 const ICON_RULES = [
   [["tea", "chai"], "🍵"], [["coffee"], "☕"], [["biscuit", "cookie"], "🍪"],
   [["shakkar", "sugar"], "🧂"], [["milk"], "🥛"], [["oil"], "🛢️"],

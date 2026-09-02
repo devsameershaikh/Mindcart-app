@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "shopping list",
-    "slug": "shoppingList",
+    "name": "Mind cart",
+    "slug": "mindcart",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./src/assets/icon.png",
@@ -14,11 +14,11 @@
 
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.sameer.shaikh.shoppingList"
+      "bundleIdentifier": "com.samappstudio.mindcart"
     },
 
     "android": {
-      "package": "com.sameer.shaikh.shoppingList",
+      "package": "com.samappstudio.mindcart",
       "edgeToEdgeEnabled": true
     },
 

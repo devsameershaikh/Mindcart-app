@@ -1,5 +1,22 @@
-export const UNITS = ["kg", "g", "litre", "ml", "packet", "piece", "dozen"];
-
+export const UNITS = [
+  "piece",
+  "kg",
+  "g",
+  "liter",
+  "ml",
+  "packet",
+  "pack",
+  "box",
+  "bottle",
+  "can",
+  "jar",
+  "bag",
+  "carton",
+  "dozen",
+  "pair",
+  "set",
+  "custom",
+];
 export const CATEGORIES = [
   "Kitchen",
   "Vegetables",

@@ -1,10 +1,4 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-// NEW DEPENDENCIES — run this before testing:
-//   npx expo install expo-camera expo-notifications
-// Both permissions (camera, notifications) are requested at runtime where
-// they're used below (openScanner / toggleReminders) — Expo Go handles that
-// fine; a production build should still add the expo-camera and
-// expo-notifications config plugins to app.json per their docs.
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Notifications from "expo-notifications";
 import {
@@ -89,6 +83,25 @@ const APP_VERSION = "1.0.0";
 const DEVELOPER_NAME = "Sameer Shaikh";
 const PRIVACY_POLICY_URL = "https://example.com/privacy-policy";
 const CONTACT_EMAIL = "support@example.com";
+// Short, plain-language Privacy Policy shown in-app (condensed from the
+// full policy). Edit this if your data practices change.
+const PRIVACY_POLICY_TEXT = `MindCart does not collect, store, or transmit your personal information to any server. You can use the app without an account.
+
+All your lists, items, quantities, prices, and notes stay stored locally on your device. We don't see or receive this information.
+
+We do not sell, rent, or share your data with third parties. If any third-party service (analytics, cloud backup, etc.) is added in the future, this policy will be updated first.
+
+Since your data lives on your device, keeping your device secure keeps your data secure.
+
+Not intended for children under 13.`;
+// Short, plain-language Terms of Use shown in-app. Edit this to match your
+// actual terms before publishing — keep it brief, this isn't a substitute
+// for proper legal text if your app needs one.
+const TERMS_OF_USE_TEXT = `By using MindCart, you agree to use the app for personal, lawful purposes only.
+
+All your lists and data are stored locally on your device — we don't collect or store it on any server. The app is provided "as is," without warranties of any kind, and we aren't liable for any loss of data.
+
+We may update these terms from time to time. Continued use of the app means you accept the current terms.`;
 const OPEN_SOURCE_LIBS = [
   { name: "React Native", note: "Core app framework" },
   { name: "Expo", note: "Build & runtime tooling" },
@@ -174,6 +187,8 @@ export default function DmartApp() {
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [aboutModalOpen, setAboutModalOpen] = useState(false);
+  const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
+  const [termsModalOpen, setTermsModalOpen] = useState(false);
 
   // Android 8+ silently drops scheduled notifications without a channel —
   // this only needs to run once, it's a no-op / ignored on iOS.
@@ -531,7 +546,7 @@ export default function DmartApp() {
     setExportingPdf(true);
     try {
       await exportListPdf({
-        listName: selectedList ? selectedList.name : "Shopping List",
+        listName: selectedList ? selectedList.name : "MindCart",
         profileName: profile.name,
         pendingItems,
         boughtItems,
@@ -604,7 +619,7 @@ function startNewTrip() {
     );
   }
   function openContactEmail() {
-    const subject = encodeURIComponent("Shopping List feedback");
+    const subject = encodeURIComponent("MindCart feedback");
     Linking.openURL(`mailto:${CONTACT_EMAIL}?subject=${subject}`).catch(() =>
       setNotice("Couldn't open your mail app.")
     );
@@ -628,7 +643,7 @@ function startNewTrip() {
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
               <Image source={require("./src/assets/icon.png")} style={{ width: 25, height: 25 }} />
 
-              <Text style={s.brand}>Shopping List</Text>
+              <Text style={s.brand}>MindCart</Text>
             </View>
             <TouchableOpacity onPress={() => setListsModalOpen(true)} style={s.listSwitcher}>
               <ListChecks size={13} color={t.accent} />
@@ -681,6 +696,20 @@ function startNewTrip() {
               >
                 <Info size={16} color={t.text} />
                 <Text style={s.headerMenuText}>About</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => { setHeaderMenuOpen(false); setPrivacyModalOpen(true); }}
+                style={s.headerMenuRow}
+              >
+                <ShieldCheck size={16} color={t.text} />
+                <Text style={s.headerMenuText}>Privacy Policy</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => { setHeaderMenuOpen(false); setTermsModalOpen(true); }}
+                style={s.headerMenuRow}
+              >
+                <FileText size={16} color={t.text} />
+                <Text style={s.headerMenuText}>Terms of Use</Text>
               </TouchableOpacity>
               {/* <TouchableOpacity
                 onPress={() => { setHeaderMenuOpen(false); sendTestNotification(); }}
@@ -1166,7 +1195,7 @@ function startNewTrip() {
                   source={require("./src/assets/icon.png")}
                   style={{ width: 64, height: 64, borderRadius: 16, marginBottom: 10 }}
                 />
-                <Text style={{ fontSize: 18, fontWeight: "800", color: t.text }}>Shopping List</Text>
+                <Text style={{ fontSize: 18, fontWeight: "800", color: t.text }}>MindCart</Text>
                 <Text style={{ fontSize: 12.5, color: t.accent, fontWeight: "600", marginTop: 2 }}>
                   Never forget to buy
                 </Text>
@@ -1174,7 +1203,7 @@ function startNewTrip() {
 
               {/* Short description */}
               <Text style={{ fontSize: 13, color: t.muted, textAlign: "center", lineHeight: 19, marginBottom: 18 }}>
-                Shopping List helps you plan your shopping trips with categorized items, quantities, prices, and reminders — 
+                MindCart helps you plan your shopping trips with categorized items, quantities, prices, and reminders — 
                 all saved on your device, so your lists are always ready when you need them.**
               </Text>
 
@@ -1269,6 +1298,44 @@ function startNewTrip() {
               />
               <Text style={{ color: t.text, fontSize: 14 }}>days of no activity</Text>
             </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ===== Privacy Policy ===== */}
+      <Modal visible={privacyModalOpen} transparent animationType="slide" onRequestClose={() => setPrivacyModalOpen(false)}>
+        <Pressable style={s.modalBackdrop} onPress={() => setPrivacyModalOpen(false)}>
+          <Pressable style={s.listsSheet} onPress={() => {}}>
+            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <Text style={s.sheetTitle}>Privacy Policy</Text>
+                <TouchableOpacity onPress={() => setPrivacyModalOpen(false)}>
+                  <X size={18} color={t.muted} />
+                </TouchableOpacity>
+              </View>
+              <Text style={{ fontSize: 13, color: t.muted, lineHeight: 20 }}>
+                {PRIVACY_POLICY_TEXT}
+              </Text>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ===== Terms of Use ===== */}
+      <Modal visible={termsModalOpen} transparent animationType="slide" onRequestClose={() => setTermsModalOpen(false)}>
+        <Pressable style={s.modalBackdrop} onPress={() => setTermsModalOpen(false)}>
+          <Pressable style={s.listsSheet} onPress={() => {}}>
+            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <Text style={s.sheetTitle}>Terms of Use</Text>
+                <TouchableOpacity onPress={() => setTermsModalOpen(false)}>
+                  <X size={18} color={t.muted} />
+                </TouchableOpacity>
+              </View>
+              <Text style={{ fontSize: 13, color: t.muted, lineHeight: 20 }}>
+                {TERMS_OF_USE_TEXT}
+              </Text>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>

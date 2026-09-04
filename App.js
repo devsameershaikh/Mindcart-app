@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { CameraView, useCameraPermissions } from "expo-camera";
+// import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Notifications from "expo-notifications";
 import {
   View,
@@ -181,7 +181,7 @@ export default function DmartApp() {
   const [fPrice, setFPrice] = useState("");
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scanLoading, setScanLoading] = useState(false);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  // const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const scanLockRef = useRef(false);
 
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
@@ -502,44 +502,44 @@ export default function DmartApp() {
   function toggleCollapse(cat) { setCollapsed((p) => ({ ...p, [cat]: !p[cat] })); }
 
   // ---------- Barcode scanning ----------
-  async function openScanner() {
-    if (!cameraPermission?.granted) {
-      const res = await requestCameraPermission();
-      if (!res.granted) { setNotice("Camera permission is needed to scan barcodes."); return; }
-    }
-    scanLockRef.current = false;
-    setScannerOpen(true);
-  }
-  function onBarcodeScanned(result) {
-    if (scanLockRef.current) return;
-    scanLockRef.current = true;
-    setScannerOpen(false);
-    // lookupBarcode(result.data);
-  }
+  // async function openScanner() {
+  //   if (!cameraPermission?.granted) {
+  //     const res = await requestCameraPermission();
+  //     if (!res.granted) { setNotice("Camera permission is needed to scan barcodes."); return; }
+  //   }
+  //   scanLockRef.current = false;
+  //   setScannerOpen(true);
+  // }
+  // function onBarcodeScanned(result) {
+  //   if (scanLockRef.current) return;
+  //   scanLockRef.current = true;
+  //   setScannerOpen(false);
+  //   // lookupBarcode(result.data);
+  // }
   // Uses UPCitemdb's free lookup endpoint — no API key needed, but it's a
   // trial/rate-limited endpoint, so failures (unknown code, rate limit,
   // offline) are expected sometimes; the user can still type the name in.
-  async function lookupBarcode(code) {
-    setScanLoading(true);
-    try {
-      const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(code)}`);
-      const data = await res.json();
-      const item = data?.items?.[0];
-      if (item?.title) {
-        setFName(item.title.length > 40 ? item.title.slice(0, 40) : item.title);
-        const price = item.lowest_recorded_price || item.highest_recorded_price || item.offers?.[0]?.price;
-        if (price) setFPrice(String(Math.round(Number(price))));
-        setNotice(`Found "${item.title}" — check the details before adding.`);
-      } else {
-        setNotice("No product found for that barcode — you can still type the name in.");
-      }
-    } catch(e) {
-      console.log("Barcode lookup error:", e);
-      setNotice("Couldn't look up that barcode — check your connection and try again.");
-    } finally {
-      setScanLoading(false);
-    }
-  }
+  // async function lookupBarcode(code) {
+  //   setScanLoading(true);
+  //   try {
+  //     const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(code)}`);
+  //     const data = await res.json();
+  //     const item = data?.items?.[0];
+  //     if (item?.title) {
+  //       setFName(item.title.length > 40 ? item.title.slice(0, 40) : item.title);
+  //       const price = item.lowest_recorded_price || item.highest_recorded_price || item.offers?.[0]?.price;
+  //       if (price) setFPrice(String(Math.round(Number(price))));
+  //       setNotice(`Found "${item.title}" — check the details before adding.`);
+  //     } else {
+  //       setNotice("No product found for that barcode — you can still type the name in.");
+  //     }
+  //   } catch(e) {
+  //     console.log("Barcode lookup error:", e);
+  //     setNotice("Couldn't look up that barcode — check your connection and try again.");
+  //   } finally {
+  //     setScanLoading(false);
+  //   }
+  // }
 
   async function exportPDF() {
     if (exportingPdf) return; // guard against double taps while one export is in flight

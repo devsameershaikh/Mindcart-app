@@ -81,7 +81,7 @@ export function validateItemName(name, category, items, excludeId = null) {
 }
 export function clampQty(qty) {
   const n = Math.floor(Number(qty));
-  if (!Number.isFinite(n) || n < 1) return 1;
+  if (!Number.isFinite(n) || n < 0) return 0;
   if (n > 999) return 999;
   return n;
 }

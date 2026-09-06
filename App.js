@@ -189,6 +189,7 @@ export default function DmartApp() {
   const [aboutModalOpen, setAboutModalOpen] = useState(false);
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const [termsModalOpen, setTermsModalOpen] = useState(false);
+  const [confirmNewTripOpen, setConfirmNewTripOpen] = useState(false);
 
   // Android 8+ silently drops scheduled notifications without a channel —
   // this only needs to run once, it's a no-op / ignored on iOS.
@@ -295,6 +296,16 @@ export default function DmartApp() {
   }, [items, debouncedSearch]);
   const { filtered, searchMatch, itemCategories, boughtItems, pendingItems, skippedItems, boughtTotal, pendingTotal } = derived;
   const noSearchResults = debouncedSearch.trim() && filtered.length === 0;
+
+  // "Start new trip" resets every item back to { checked:false, skipped:false,
+  // note:"", qty:0, price:"" }. The button should only be enabled when at
+  // least one item is NOT already sitting in that exact reset position —
+  // i.e. when pressing it would actually change something.
+  const tripDirty = items.some((i) => {
+    const hasNote = !!(i.note && i.note.trim());
+    const hasPrice = !(i.price === "" || i.price === null || i.price === undefined);
+    return i.checked || i.skipped || hasNote || hasPrice || Number(i.qty) !== 0;
+  });
 
   if (!appLoaded) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
 
@@ -462,7 +473,7 @@ export default function DmartApp() {
       id: makeId("item"),
       name,
       category,
-      qty: 1,
+      qty: 0,
       unit: fUnit,
       price: fPrice || "",
       checked: false,
@@ -543,6 +554,11 @@ export default function DmartApp() {
 
   async function exportPDF() {
     if (exportingPdf) return; // guard against double taps while one export is in flight
+     if (pendingItems.length === 0 && boughtItems.length === 0) {
+      console.log("No items to export.");
+    setNotice("No items to export.");
+    return;
+  }
     setExportingPdf(true);
     try {
       await exportListPdf({
@@ -578,6 +594,17 @@ function startNewTrip() {
   setNotice(`Started a new trip for "${selectedList.name}".`);
   bumpActivity(selectedListId);
 }
+// Called from the button — only ever opens the confirmation popup when
+// there's actually something to reset (button is disabled otherwise).
+function requestNewTrip() {
+  if (!tripDirty) return;
+  setConfirmNewTripOpen(true);
+}
+// Called when the user taps "Yes" in the confirmation popup.
+function confirmStartNewTrip() {
+  setConfirmNewTripOpen(false);
+  startNewTrip();
+}
 
   function addCategory(name) {
     const trimmed = name.trim();
@@ -587,6 +614,7 @@ function startNewTrip() {
 
   // ---------- Edit item ----------
   function startEditItem(item) {
+    console.log("Editing item:", item);
     setEditingItemId(item.id);
     setEName(item.name);
     setECategory(item.category);
@@ -634,9 +662,10 @@ function startNewTrip() {
   const s = makeStyles(t);
 
   return (
+    <View style={{ flex: 1, backgroundColor: t.bg }}>
     <SafeAreaView style={[s.screen, { backgroundColor: t.bg }]}>
       <StatusBar barStyle={dark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
         {/* ===== Header ===== */}
         <View style={s.headerRow}>
           <View>
@@ -664,63 +693,6 @@ function startNewTrip() {
             </TouchableOpacity>
           </View>
         </View>
-
-        {/* ===== Header overflow menu ===== */}
-        {headerMenuOpen && (
-          <Pressable style={s.menuBackdrop} onPress={() => setHeaderMenuOpen(false)}>
-            <Pressable style={s.headerMenuCard} onPress={() => {}}>
-              <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); setReminderModalOpen(true); }}
-                style={s.headerMenuRow}
-              >
-                <Bell size={16} color={reminderSettings.enabled ? t.accent : t.text} />
-                <Text style={s.headerMenuText}>Reminders</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); setCurrencyModalOpen(true); }}
-                style={s.headerMenuRow}
-              >
-                <Settings size={16} color={t.text} />
-                <Text style={s.headerMenuText}>Currency</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); setDark((d) => !d); }}
-                style={s.headerMenuRow}
-              >
-                {dark ? <SunMedium size={16} color={t.text} /> : <Moon size={16} color={t.text} />}
-                <Text style={s.headerMenuText}>{dark ? "Light mode" : "Dark mode"}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); setAboutModalOpen(true); }}
-                style={s.headerMenuRow}
-              >
-                <Info size={16} color={t.text} />
-                <Text style={s.headerMenuText}>About</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); setPrivacyModalOpen(true); }}
-                style={s.headerMenuRow}
-              >
-                <ShieldCheck size={16} color={t.text} />
-                <Text style={s.headerMenuText}>Privacy Policy</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); setTermsModalOpen(true); }}
-                style={s.headerMenuRow}
-              >
-                <FileText size={16} color={t.text} />
-                <Text style={s.headerMenuText}>Terms of Use</Text>
-              </TouchableOpacity>
-              {/* <TouchableOpacity
-                onPress={() => { setHeaderMenuOpen(false); sendTestNotification(); }}
-                style={s.headerMenuRow}
-              >
-                <BellRing size={16} color={t.accent2} />
-                <Text style={s.headerMenuText}>Send test notification</Text>
-              </TouchableOpacity> */}
-            </Pressable>
-          </Pressable>
-        )}
 
         {notice ? (
           <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
@@ -793,9 +765,13 @@ function startNewTrip() {
                   );
                 })() : null} */}
 
-                <TouchableOpacity onPress={startNewTrip} style={s.newTripBtn}>
-                  <RotateCcw size={13} color={t.accent} />
-                  <Text style={{ color: t.accent, fontWeight: "600", fontSize: 12.5 }}>Start new trip</Text>
+                <TouchableOpacity
+                  onPress={requestNewTrip}
+                  disabled={!tripDirty}
+                  style={[s.newTripBtn, !tripDirty && { borderColor: t.border, opacity: 0.5 }]}
+                >
+                  <RotateCcw size={13} color={tripDirty ? t.accent : t.muted} />
+                  <Text style={{ color: tripDirty ? t.accent : t.muted, fontWeight: "600", fontSize: 12.5 }}>Start new trip</Text>
                 </TouchableOpacity>
               </View>
 
@@ -832,11 +808,18 @@ function startNewTrip() {
                                 <Text style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
                                 <Text style={s.itemUnit}>{item.unit}</Text>
                               </View>
-                              <TouchableOpacity
-                                onPress={() => updateItem(item.id, { qty: Math.max(1, Number(item.qty) - 1) })}
-                                disabled={Number(item.qty) <= 1}
-                                style={[s.qtyBtn, Number(item.qty) <= 1 && { opacity: 0.5 }]}
-                              >
+                             <TouchableOpacity
+                              onPress={() =>
+                                updateItem(item.id, {
+                                     qty: Math.max(0, Number(item.qty) - 1)
+                                     })
+                                   }
+                                  disabled={Number(item.qty) <= 0}
+                                  style={[
+                                    s.qtyBtn,
+                                    Number(item.qty) <= 0 && { opacity: 0.5 }
+                                  ]}
+                                >
                                 <Text style={s.qtyBtnText}>−</Text>
                               </TouchableOpacity>
                               <Text style={s.qtyValue}>{item.qty}</Text>
@@ -852,6 +835,7 @@ function startNewTrip() {
                                 placeholder={currency.symbol}
                                 placeholderTextColor={t.muted}
                                 value={String(item.price ?? "")}
+                                editable={Number(item.qty) > 0}
                                 onChangeText={(v) => updateItem(item.id, { price: v })}
                                 style={s.priceInput}
                               />
@@ -951,7 +935,7 @@ function startNewTrip() {
                   <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
                   <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
                     <Plus size={15} color="#fff" />
-                    <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Adds</Text>
+                    <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -962,38 +946,17 @@ function startNewTrip() {
                 )}
                 {filtered.map((item) => (
                   <View key={item.id} style={s.itemCard}>
-                    {editingItemId === item.id ? (
-                      <View style={{ gap: 8 }}>
-                        <TextInput
-                          value={eName}
-                          maxLength={40}
-                          onChangeText={(v) => { setEName(v); if (editNameError) setEditNameError(""); }}
-                          style={[s.input, { borderColor: editNameError ? t.danger : t.border }]}
-                        />
-                        {editNameError ? <Text style={s.errorText}>{editNameError}</Text> : null}
-                        <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-                          <CategorySelect value={eCategory} categories={categories} onChange={setECategory} onAddCategory={addCategory} t={t} style={{ flex: 1, minWidth: 100 }} />
-                          <SimpleSelect value={eUnit} options={UNITS} onChange={setEUnit} title="Unit" t={t} style={{ flex: 1, minWidth: 90 }} />
-                          
-                        </View>
-                        <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
-                          <TouchableOpacity onPress={cancelEditItem} style={s.smallBtn}><Text style={s.smallBtnText}>Cancel</Text></TouchableOpacity>
-                          <TouchableOpacity onPress={saveEditItem} style={[s.smallBtn, { backgroundColor: t.accent, borderColor: t.accent }]}><Text style={[s.smallBtnText, { color: "#fff" }]}>Save</Text></TouchableOpacity>
-                        </View>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                      <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={s.itemName}>{item.name}</Text>
+                        <Text style={s.itemUnit}>
+                          {item.category} · {item.unit}
+                        </Text>
                       </View>
-                    ) : (
-                      <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                        <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
-                        <View style={{ flex: 1, minWidth: 0 }}>
-                          <Text style={s.itemName}>{item.name}</Text>
-                          <Text style={s.itemUnit}>
-                            {item.category} · {item.unit}
-                          </Text>
-                        </View>
-                        <TouchableOpacity onPress={() => startEditItem(item)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
-                        <TouchableOpacity onPress={() => deleteItem(item)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
-                      </View>
-                    )}
+                      <TouchableOpacity onPress={() => startEditItem(item)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
+                      <TouchableOpacity onPress={() => deleteItem(item)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
+                    </View>
                   </View>
                 ))}
               </View>
@@ -1016,7 +979,8 @@ function startNewTrip() {
       </KeyboardAvoidingView>
 
       {/* ===== Lists modal (create / rename / delete / switch) ===== */}
-      <Modal visible={listsModalOpen} transparent animationType="slide" onRequestClose={() => setListsModalOpen(false)}>
+      <Modal visible={listsModalOpen} transparent statusBarTranslucent animationType="slide" onRequestClose={() => setListsModalOpen(false)}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
         <Pressable style={s.modalBackdrop} onPress={() => setListsModalOpen(false)}>
           <Pressable style={s.listsSheet} onPress={() => {}}>
             <ScrollView keyboardShouldPersistTaps="handled">
@@ -1034,29 +998,14 @@ function startNewTrip() {
               <View style={{ gap: 8 }}>
                 {lists.map((list) => (
                   <View key={list.id} style={[s.listRow, { borderColor: list.id === selectedListId ? t.accent : t.border }]}>
-                    {renamingListId === list.id ? (
-                      <View style={{ flexDirection: "row", gap: 8 }}>
-                        <TextInput
-                          autoFocus
-                          value={renameDraft}
-                          maxLength={40}
-                          onChangeText={(v) => { setRenameDraft(v); if (listNameError) setListNameError(""); }}
-                          onSubmitEditing={commitRenameList}
-                          style={[s.input, { flex: 1, borderColor: listNameError ? t.danger : t.border }]}
-                        />
-                        <TouchableOpacity onPress={commitRenameList} style={[s.smallBtn, { backgroundColor: t.accent, borderColor: t.accent }]}><Text style={[s.smallBtnText, { color: "#fff" }]}>Save</Text></TouchableOpacity>
-                        <TouchableOpacity onPress={() => { setRenamingListId(null); setListNameError(""); }} style={s.smallBtn}><Text style={s.smallBtnText}>Cancel</Text></TouchableOpacity>
-                      </View>
-                    ) : (
-                      <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                        <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
-                          <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
-                          <Text style={{ fontSize: 11.5, color: t.muted }}>{(itemsByList[list.id] || []).length} items</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
-                        <TouchableOpacity onPress={() => setConfirmDeleteListId(list.id)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
-                      </View>
-                    )}
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
+                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
+                        <Text style={{ fontSize: 11.5, color: t.muted }}>{(itemsByList[list.id] || []).length} items</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
+                      <TouchableOpacity onPress={() => setConfirmDeleteListId(list.id)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
+                    </View>
                     {confirmDeleteListId === list.id && (
                       <View style={s.confirmDeleteBox}>
                         <Text style={{ fontSize: 12, color: t.text }}>Delete "{list.name}" and all its items? This can't be undone.</Text>
@@ -1073,10 +1022,48 @@ function startNewTrip() {
             </ScrollView>
           </Pressable>
         </Pressable>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* ===== Rename list popup — its own screen instead of an inline row,
+          so it never overlaps with other list rows in the sheet above. ===== */}
+      <Modal visible={renamingListId !== null} transparent statusBarTranslucent animationType="fade" onRequestClose={() => { setRenamingListId(null); setListNameError(""); }}>
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+        >
+          <Pressable style={s.modalBackdropCenter} onPress={() => { setRenamingListId(null); setListNameError(""); }}>
+            <Pressable style={s.popupCard} onPress={() => {}}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <Text style={s.sheetTitle}>Rename list</Text>
+                <TouchableOpacity onPress={() => { setRenamingListId(null); setListNameError(""); }}><X size={18} color={t.muted} /></TouchableOpacity>
+              </View>
+              <TextInput
+                autoFocus
+                value={renameDraft}
+                maxLength={40}
+                placeholder="List name"
+                placeholderTextColor={t.muted}
+                onChangeText={(v) => { setRenameDraft(v); if (listNameError) setListNameError(""); }}
+                onSubmitEditing={commitRenameList}
+                style={[s.input, { borderColor: listNameError ? t.danger : t.border }]}
+              />
+              {listNameError ? <Text style={s.errorText}>{listNameError}</Text> : null}
+              <View style={{ flexDirection: "row", gap: 8, marginTop: 14 }}>
+                <TouchableOpacity onPress={() => { setRenamingListId(null); setListNameError(""); }} style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 10 }]}>
+                  <Text style={s.smallBtnText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={commitRenameList} style={[s.addItemBtn, { flex: 1, justifyContent: "center", marginLeft: 0 }]}>
+                  <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </Pressable>
+          </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ===== New list popup ===== */}
-      <Modal visible={newListModalOpen} transparent animationType="fade" onRequestClose={() => setNewListModalOpen(false)}>
+      <Modal visible={newListModalOpen} transparent statusBarTranslucent animationType="fade" onRequestClose={() => setNewListModalOpen(false)}>
         <KeyboardAvoidingView
           style={{ flex: 1 }}
           behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -1112,23 +1099,88 @@ function startNewTrip() {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* ===== Currency modal: first-launch setup + later changes via the settings icon ===== */}
+      {/* ===== Edit item popup — a real Modal (like "New list") instead of an
+          inline row, wrapped in KeyboardAvoidingView so the keyboard never
+          covers the input. ===== */}
+      <Modal visible={editingItemId !== null} transparent statusBarTranslucent animationType="fade" onRequestClose={cancelEditItem}>
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+        >
+          <Pressable style={s.modalBackdropCenter} onPress={cancelEditItem}>
+            <Pressable style={s.popupCard} onPress={() => {}}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <Text style={s.sheetTitle}>Edit item</Text>
+                <TouchableOpacity onPress={cancelEditItem}><X size={18} color={t.muted} /></TouchableOpacity>
+              </View>
+              <TextInput
+                autoFocus
+                value={eName}
+                maxLength={40}
+                onChangeText={(v) => { setEName(v); if (editNameError) setEditNameError(""); }}
+                placeholder="Item name"
+                placeholderTextColor={t.muted}
+                style={[s.input, { borderColor: editNameError ? t.danger : t.border }]}
+              />
+              {editNameError ? <Text style={s.errorText}>{editNameError}</Text> : null}
+              <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                <CategorySelect value={eCategory} categories={categories} onChange={setECategory} onAddCategory={addCategory} t={t} style={{ flex: 1, minWidth: 100 }} />
+                <SimpleSelect value={eUnit} options={UNITS} onChange={setEUnit} title="Unit" t={t} style={{ flex: 1, minWidth: 90 }} />
+              </View>
+              <View style={{ flexDirection: "row", gap: 8, marginTop: 14 }}>
+                <TouchableOpacity onPress={cancelEditItem} style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 10 }]}>
+                  <Text style={s.smallBtnText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={saveEditItem} style={[s.addItemBtn, { flex: 1, justifyContent: "center", marginLeft: 0 }]}>
+                  <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </Pressable>
+          </Pressable>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* ===== Confirm "Start new trip" popup ===== */}
+      <Modal visible={confirmNewTripOpen} transparent statusBarTranslucent animationType="fade" onRequestClose={() => setConfirmNewTripOpen(false)}>
+        <Pressable style={s.modalBackdropCenter} onPress={() => setConfirmNewTripOpen(false)}>
+          <Pressable style={s.popupCard} onPress={() => {}}>
+            <Text style={s.sheetTitle}>Start a new trip?</Text>
+            <Text style={{ color: t.muted, fontSize: 13, marginTop: 8, lineHeight: 19 }}>
+              This clears checked items, notes, prices and quantities for "{selectedList ? selectedList.name : ""}". This can't be undone.
+            </Text>
+            <View style={{ flexDirection: "row", gap: 8, marginTop: 16 }}>
+              <TouchableOpacity onPress={() => setConfirmNewTripOpen(false)} style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 10 }]}>
+                <Text style={s.smallBtnText}>No</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={confirmStartNewTrip} style={[s.addItemBtn, { flex: 1, justifyContent: "center", marginLeft: 0 }]}>
+                <RotateCcw size={14} color="#fff" />
+                <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>Yes, reset</Text>
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ===== Currency picker: a dedicated full-screen search page (not a
+          bottom sheet) — the title/search bar stay pinned at the top and
+          only the results list scrolls, so opening the keyboard never makes
+          the whole picker look like it's shrinking. ===== */}
       <Modal
         visible={currencyModalOpen || needsCurrencySetup}
-        transparent
         animationType="slide"
+        statusBarTranslucent
         onRequestClose={() => { if (!needsCurrencySetup) setCurrencyModalOpen(false); }}
       >
-        <Pressable
-          style={s.modalBackdrop}
-          onPress={() => { if (!needsCurrencySetup) setCurrencyModalOpen(false); }}
-        >
-          <Pressable style={s.listsSheet} onPress={() => {}}>
-            <ScrollView keyboardShouldPersistTaps="handled">
+        <SafeAreaView style={{ flex: 1, backgroundColor: t.bg }}>
+          <StatusBar barStyle={dark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
+            <View style={{ paddingHorizontal: 18, paddingTop: 10 }}>
               <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
                 <Text style={s.sheetTitle}>{needsCurrencySetup ? "Pick your currency" : "Currency"}</Text>
                 {!needsCurrencySetup && (
-                  <TouchableOpacity onPress={() => setCurrencyModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
+                  <TouchableOpacity onPress={() => setCurrencyModalOpen(false)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <X size={20} color={t.muted} />
+                  </TouchableOpacity>
                 )}
               </View>
               <Text style={{ fontSize: 12.5, color: t.muted, marginBottom: 12 }}>
@@ -1138,44 +1190,50 @@ function startNewTrip() {
               </Text>
 
               <TextInput
+                autoFocus={!needsCurrencySetup}
                 value={currencySearch}
                 onChangeText={setCurrencySearch}
                 placeholder="Search currency (e.g. USD, Euro)"
                 placeholderTextColor={t.muted}
                 style={[s.input, { marginBottom: 10 }]}
               />
+            </View>
 
-              <View style={{ gap: 6 }}>
-                {filteredCurrencies.map((cur) => {
-                  const isSelected = currency.code === cur.code;
-                  return (
-                    <TouchableOpacity
-                      key={cur.code}
-                      onPress={() => selectCurrency(cur)}
-                      style={[s.listRow, { borderColor: isSelected ? t.accent : t.border, flexDirection: "row", alignItems: "center", gap: 10 }]}
-                    >
-                      <Text style={{ fontSize: 16, width: 34, textAlign: "center", color: t.text, fontWeight: "700" }}>{cur.symbol}</Text>
-                      <View style={{ flex: 1 }}>
-                        <Text style={{ color: t.text, fontWeight: "700", fontSize: 14 }}>{cur.code}</Text>
-                        <Text style={{ color: t.muted, fontSize: 11.5 }}>{cur.name}</Text>
-                      </View>
-                      {isSelected && <Check size={16} color={t.accent} />}
-                    </TouchableOpacity>
-                  );
-                })}
-                {filteredCurrencies.length === 0 && (
-                  <Text style={s.emptyText}>No currency matches "{currencySearch}".</Text>
-                )}
-              </View>
+            <ScrollView
+              style={{ flex: 1 }}
+              contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 24, gap: 6 }}
+              keyboardShouldPersistTaps="handled"
+            >
+              {filteredCurrencies.map((cur) => {
+                const isSelected = currency.code === cur.code;
+                return (
+                  <TouchableOpacity
+                    key={cur.code}
+                    onPress={() => selectCurrency(cur)}
+                    style={[s.listRow, { borderColor: isSelected ? t.accent : t.border, flexDirection: "row", alignItems: "center", gap: 10 }]}
+                  >
+                    <Text style={{ fontSize: 16, width: 34, textAlign: "center", color: t.text, fontWeight: "700" }}>{cur.symbol}</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: t.text, fontWeight: "700", fontSize: 14 }}>{cur.code}</Text>
+                      <Text style={{ color: t.muted, fontSize: 11.5 }}>{cur.name}</Text>
+                    </View>
+                    {isSelected && <Check size={16} color={t.accent} />}
+                  </TouchableOpacity>
+                );
+              })}
+              {filteredCurrencies.length === 0 && (
+                <Text style={s.emptyText}>No currency matches "{currencySearch}".</Text>
+              )}
             </ScrollView>
-          </Pressable>
-        </Pressable>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
       </Modal>
 
       {/* ===== About modal: opened from the hamburger menu, same style as the settings/currency sheet ===== */}
       <Modal
         visible={aboutModalOpen}
         transparent
+        statusBarTranslucent
         animationType="slide"
         onRequestClose={() => setAboutModalOpen(false)}
       >
@@ -1267,7 +1325,7 @@ function startNewTrip() {
       </Modal> */}
 
       {/* ===== Reminders settings ===== */}
-      <Modal visible={reminderModalOpen} transparent animationType="slide" onRequestClose={() => setReminderModalOpen(false)}>
+      <Modal visible={reminderModalOpen} transparent statusBarTranslucent animationType="slide" onRequestClose={() => setReminderModalOpen(false)}>
         <Pressable style={s.modalBackdrop} onPress={() => setReminderModalOpen(false)}>
           <Pressable style={s.listsSheet} onPress={() => {}}>
             <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
@@ -1303,7 +1361,7 @@ function startNewTrip() {
       </Modal>
 
       {/* ===== Privacy Policy ===== */}
-      <Modal visible={privacyModalOpen} transparent animationType="slide" onRequestClose={() => setPrivacyModalOpen(false)}>
+      <Modal visible={privacyModalOpen} transparent statusBarTranslucent animationType="slide" onRequestClose={() => setPrivacyModalOpen(false)}>
         <Pressable style={s.modalBackdrop} onPress={() => setPrivacyModalOpen(false)}>
           <Pressable style={s.listsSheet} onPress={() => {}}>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
@@ -1322,7 +1380,7 @@ function startNewTrip() {
       </Modal>
 
       {/* ===== Terms of Use ===== */}
-      <Modal visible={termsModalOpen} transparent animationType="slide" onRequestClose={() => setTermsModalOpen(false)}>
+      <Modal visible={termsModalOpen} transparent statusBarTranslucent animationType="slide" onRequestClose={() => setTermsModalOpen(false)}>
         <Pressable style={s.modalBackdrop} onPress={() => setTermsModalOpen(false)}>
           <Pressable style={s.listsSheet} onPress={() => {}}>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
@@ -1340,6 +1398,76 @@ function startNewTrip() {
         </Pressable>
       </Modal>
     </SafeAreaView>
+
+    {/* ===== Header overflow menu =====
+        Rendered as a plain in-tree overlay (not RN's <Modal>) so it never
+        creates a separate native window on Android — that's what was
+        causing the stray dark edge/shadow border around the screen. It
+        sits as a sibling of the SafeAreaView, inside the same top-level
+        flex:1 View, so it still paints over the *entire* device screen
+        (including the status bar area), just without a native Dialog. */}
+    {headerMenuOpen && (
+      <Pressable style={s.menuBackdrop} onPress={() => setHeaderMenuOpen(false)}>
+        <Pressable style={s.headerMenuCard} onPress={() => {}}>
+          <View style={s.headerMenuTitleRow}>
+            <Text style={s.headerMenuTitle}>Menu</Text>
+            <TouchableOpacity onPress={() => setHeaderMenuOpen(false)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <X size={16} color={t.muted} />
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); setReminderModalOpen(true); }}
+            style={s.headerMenuRow}
+          >
+            <Bell size={16} color={reminderSettings.enabled ? t.accent : t.text} />
+            <Text style={s.headerMenuText}>Reminders</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); setCurrencyModalOpen(true); }}
+            style={s.headerMenuRow}
+          >
+            <Settings size={16} color={t.text} />
+            <Text style={s.headerMenuText}>Currency</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); setDark((d) => !d); }}
+            style={s.headerMenuRow}
+          >
+            {dark ? <SunMedium size={16} color={t.text} /> : <Moon size={16} color={t.text} />}
+            <Text style={s.headerMenuText}>{dark ? "Light mode" : "Dark mode"}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); setAboutModalOpen(true); }}
+            style={s.headerMenuRow}
+          >
+            <Info size={16} color={t.text} />
+            <Text style={s.headerMenuText}>About</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); setPrivacyModalOpen(true); }}
+            style={s.headerMenuRow}
+          >
+            <ShieldCheck size={16} color={t.text} />
+            <Text style={s.headerMenuText}>Privacy Policy</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); setTermsModalOpen(true); }}
+            style={s.headerMenuRow}
+          >
+            <FileText size={16} color={t.text} />
+            <Text style={s.headerMenuText}>Terms of Use</Text>
+          </TouchableOpacity>
+          {/* <TouchableOpacity
+            onPress={() => { setHeaderMenuOpen(false); sendTestNotification(); }}
+            style={s.headerMenuRow}
+          >
+            <BellRing size={16} color={t.accent2} />
+            <Text style={s.headerMenuText}>Send test notification</Text>
+          </TouchableOpacity> */}
+        </Pressable>
+      </Pressable>
+    )}
+    </View>
   );
 }
 
@@ -1412,8 +1540,10 @@ function makeStyles(t) {
     qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "600", color: t.text },
 
     priceInput: { width: 56, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
-    menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.3)", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },
-    headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, paddingVertical: 6, minWidth: 170, elevation: 4, shadowColor: "#000", shadowOpacity: 0.2, shadowRadius: 8, shadowOffset: { width: 0, height: 4 } },
+    menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "transparent", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },
+    headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, paddingVertical: 6, minWidth: 180, elevation: 6, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 6 } },
+    headerMenuTitleRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 8, paddingHorizontal: 14, borderBottomWidth: 1, borderBottomColor: t.border, marginBottom: 2 },
+    headerMenuTitle: { fontSize: 12.5, fontWeight: "700", color: t.muted, textTransform: "uppercase", letterSpacing: 0.4 },
     headerMenuRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, paddingHorizontal: 14 },
     headerMenuText: { color: t.text, fontSize: 13.5, fontWeight: "600" },
     noteInput: { marginTop: 6, marginLeft: 32, borderBottomWidth: 1, borderColor: t.border, borderStyle: "dashed", color: t.muted, fontSize: 12, fontStyle: "italic", paddingVertical: 3 },

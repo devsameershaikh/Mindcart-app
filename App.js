@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 // import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Notifications from "expo-notifications";
+import DateTimePicker from "@react-native-community/datetimepicker";
 import {
   View,
   Text,
@@ -17,6 +18,7 @@ import {
   Animated,
   Linking,
   ActivityIndicator,
+  AppState,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
@@ -111,11 +113,26 @@ const OPEN_SOURCE_LIBS = [
   { name: "lucide-react-native", note: "Icon set" },
 ];
 
-// ---------- Reminders ----------
-// These are local, on-device notifications only — scheduled directly by
-// this app based on inactivity, never sent from a server. That means no
-// push token / EAS project ID / backend is needed, just the runtime
-// permission prompt (see toggleReminders below).
+// ---------- Daily testing reminder (closed testing only) ----------
+// A separate, much simpler reminder aimed at beta testers during closed
+// testing: one local notification a day at a fixed time, cycling through
+// 4 different messages so nobody sees the exact same line two days running.
+// Opening the app at any point resets the cycle back to Day 1 for
+// "tomorrow", so someone who actually uses the app daily never sees these.
+const DAILY_TEST_MESSAGES = [
+  "🛒 Kya lena hai bhai? Ya sab yaad rehta hai?",
+  "Quick check-in 🙂 Try adding/editing a few items today.",
+  "🛒 Kuch kharidna tha na… ya bhool gaye?",
+  "🛒 Ghar se nikle? List toh le jao! 😂",
+  "😂 Kuch bhool gaye toh screenshot mat lena, list dekh lena.",
+  "🛒 Market mein khade hoke yaad karne ka plan hai kya? 😂"
+];
+
+const DAILY_TEST_LOOKAHEAD_DAYS = 60;
+
+const DAILY_TEST_DEFAULT_HOUR = 20; // 8 PM, 24h device-local time
+const DAILY_TEST_DEFAULT_MINUTE = 0;
+
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert: true,
@@ -126,8 +143,6 @@ Notifications.setNotificationHandler({
   }),
 });
 
-// Replaces the old fixed IndianRupee icon with the user's chosen symbol,
-// rendered like a small icon so it drops into existing icon+text rows.
 function CurrencyGlyph({ symbol, color, size = 12 }) {
   return <Text style={{ color, fontSize: size, fontWeight: "800" }}>{symbol}</Text>;
 }
@@ -159,6 +174,7 @@ export default function DmartApp() {
   const [categoryTouched, setCategoryTouched] = useState(false);
   const [itemNameError, setItemNameError] = useState("");
   const [noteDrafts, setNoteDrafts] = useState({});
+  const [priceDrafts, setPriceDrafts] = useState({});
 
   const [editingItemId, setEditingItemId] = useState(null);
   const [eName, setEName] = useState("");
@@ -184,7 +200,13 @@ export default function DmartApp() {
   // const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const scanLockRef = useRef(false);
 
+  const renameInputRef = useRef(null);
+  const newListInputRef = useRef(null);
+  const editItemInputRef = useRef(null);
+  const currencySearchInputRef = useRef(null);
+
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
+  const [dailyTestPickerOpen, setDailyTestPickerOpen] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [aboutModalOpen, setAboutModalOpen] = useState(false);
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
@@ -253,6 +275,8 @@ export default function DmartApp() {
     // eslint-disable-next-line
   }, [pendingDelete]);
 
+  const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
+
   // auto-clear inline notices after a few seconds
   useEffect(() => {
     if (!notice) return;
@@ -260,7 +284,25 @@ export default function DmartApp() {
     return () => clearTimeout(timer);
   }, [notice]);
 
+  // Daily testing reminder: re-lays the batch on every app load, whenever
+  // the time changes, or when the app comes to the foreground — i.e. any
+  // sign of the tester actually being here. Must stay above the
+  // `if (!appLoaded)` early return below, like every other hook in this
+  // component — hooks can't be called conditionally.
+  useEffect(() => {
+    if (!appLoaded) return;
+    const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
+    const minute = Number(dailyTestSettings.minute) ?? DAILY_TEST_DEFAULT_MINUTE;
+    scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
+    const sub = AppState.addEventListener("change", (nextState) => {
+      if (nextState === "active") scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line
+  }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
+
   const t = getTheme(dark);
+  const s = useMemo(() => makeStyles(t), [t]);
 
   // Currency lives on the profile object, which is already persisted and
   // loaded as one blob (see the load/save effects above), so no changes
@@ -417,6 +459,58 @@ export default function DmartApp() {
       const days = Number(value) || 5;
       for (const l of lists) await scheduleReminderForList(l, days);
     }
+  }
+  // ---------- Daily testing reminder ----------
+  // Always on (no user toggle) — runs for every install during closed
+  // testing. Manually remove this feature/effect once testing ends.
+  async function cancelDailyTestNotifications(ids) {
+    for (const id of ids || []) {
+      try { await Notifications.cancelScheduledNotificationAsync(id); } catch {}
+    }
+  }
+  // Wipes any previously-scheduled batch and lays down a fresh
+  // DAILY_TEST_LOOKAHEAD_DAYS run starting tomorrow, Day 1 of the cycle, at
+  // the given hour:minute. Calling this on every app open is what keeps
+  // daily users from ever seeing these — their "tomorrow" keeps getting
+  // pushed forward. Requests notification permission on the fly since
+  // there's no separate enable toggle to trigger the prompt.
+  async function scheduleDailyTestReminders(hour, minute, currentIds) {
+    let perm = await Notifications.getPermissionsAsync();
+    if (!perm.granted) {
+      try { perm = await Notifications.requestPermissionsAsync(); } catch {}
+    }
+    if (!perm.granted) return; // no permission — nothing to schedule yet, will retry next app open
+    await cancelDailyTestNotifications(currentIds);
+    const ids = [];
+    const now = new Date();
+    for (let dayOffset = 1; dayOffset <= DAILY_TEST_LOOKAHEAD_DAYS; dayOffset++) {
+      const fireDate = new Date(now);
+      fireDate.setDate(fireDate.getDate() + dayOffset);
+      fireDate.setHours(hour, minute, 0, 0);
+      const message = DAILY_TEST_MESSAGES[(dayOffset - 1) % DAILY_TEST_MESSAGES.length];
+      try {
+        const id = await Notifications.scheduleNotificationAsync({
+          content: { title: "MindCart", body: message },
+          trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: fireDate, channelId: "default" },
+        });
+        ids.push(id);
+      } catch {
+        // scheduling can fail without permission — safe to skip that day
+      }
+    }
+    setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute, notifIds: ids } }));
+  }
+  function updateDailyTestTime(hour, minute) {
+    setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute } }));
+  }
+  // Display-only helper — storage/scheduling still use 24h hour/minute
+  // numbers throughout; this just formats them as "8:00 PM" for the UI.
+  function formatTime12h(hour, minute) {
+    const h = Number(hour);
+    const m = Number(minute);
+    const period = h >= 12 ? "PM" : "AM";
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:${String(m).padStart(2, "0")} ${period}`;
   }
   // Fires a few seconds from now so notification setup can be verified
   // immediately, instead of waiting days for a real reminder to trigger.
@@ -586,11 +680,26 @@ export default function DmartApp() {
     updateItem(item.id, { note: draft.trim() });
   }
 
+  // Price works like notes: keep the raw text the user is typing in local
+  // state and only run it through clampPrice() on blur. Piping every
+  // keystroke through updateItem -> clampPrice and back into a controlled
+  // TextInput let the clamp "fight" the user's typing (snapping the value
+  // back to a reformatted string on every character), which showed up as
+  // the input flickering/jumping while editing a price.
+  function priceValue(item) { return priceDrafts[item.id] !== undefined ? priceDrafts[item.id] : String(item.price ?? ""); }
+  function commitPrice(item) {
+    const draft = priceDrafts[item.id];
+    setPriceDrafts((prev) => { const p = { ...prev }; delete p[item.id]; return p; });
+    if (draft === undefined || draft === String(item.price ?? "")) return;
+    updateItem(item.id, { price: draft });
+  }
+
 function startNewTrip() {
   setListItems(selectedListId, (prev) =>
     prev.map((i) => ({ ...i, checked: false, skipped: false, note: "", qty: 0, price: "" }))
   );
   setNoteDrafts({});
+  setPriceDrafts({});
   setNotice(`Started a new trip for "${selectedList.name}".`);
   bumpActivity(selectedListId);
 }
@@ -658,8 +767,6 @@ function confirmStartNewTrip() {
     if (!q) return true;
     return c.code.toLowerCase().includes(q) || c.name.toLowerCase().includes(q);
   });
-
-  const s = makeStyles(t);
 
   return (
     <View style={{ flex: 1, backgroundColor: t.bg }}>
@@ -834,9 +941,10 @@ function confirmStartNewTrip() {
                                 keyboardType="decimal-pad"
                                 placeholder={currency.symbol}
                                 placeholderTextColor={t.muted}
-                                value={String(item.price ?? "")}
+                                value={priceValue(item)}
                                 editable={Number(item.qty) > 0}
-                                onChangeText={(v) => updateItem(item.id, { price: v })}
+                                onChangeText={(v) => setPriceDrafts((prev) => ({ ...prev, [item.id]: v }))}
+                                onBlur={() => commitPrice(item)}
                                 style={s.priceInput}
                               />
                               {!item.checked && (
@@ -978,9 +1086,13 @@ function confirmStartNewTrip() {
         </View>
       </KeyboardAvoidingView>
 
-      {/* ===== Lists modal (create / rename / delete / switch) ===== */}
-      <Modal visible={listsModalOpen} transparent statusBarTranslucent animationType="slide" onRequestClose={() => setListsModalOpen(false)}>
-        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
+      {/* ===== Lists modal (create / rename / delete / switch) =====
+          In-tree overlay instead of RN's <Modal> — see the header-menu
+          comment below for why: native <Modal> creates a separate Android
+          window on open/close, and that window transition is what was
+          showing up as a flash/flicker every time a popup opened. */}
+      {listsModalOpen && (
+        <KeyboardAvoidingView style={[s.overlayFill, { zIndex: 40, elevation: 20 }]} behavior={Platform.OS === "ios" ? "padding" : "height"}>
         <Pressable style={s.modalBackdrop} onPress={() => setListsModalOpen(false)}>
           <Pressable style={s.listsSheet} onPress={() => {}}>
             <ScrollView keyboardShouldPersistTaps="handled">
@@ -1023,13 +1135,13 @@ function confirmStartNewTrip() {
           </Pressable>
         </Pressable>
         </KeyboardAvoidingView>
-      </Modal>
+      )}
 
       {/* ===== Rename list popup — its own screen instead of an inline row,
           so it never overlaps with other list rows in the sheet above. ===== */}
-      <Modal visible={renamingListId !== null} transparent statusBarTranslucent animationType="fade" onRequestClose={() => { setRenamingListId(null); setListNameError(""); }}>
+      {renamingListId !== null && (
         <KeyboardAvoidingView
-          style={{ flex: 1 }}
+          style={[s.overlayFill, { zIndex: 41, elevation: 21 }]}
           behavior={Platform.OS === "ios" ? "padding" : "height"}
         >
           <Pressable style={s.modalBackdropCenter} onPress={() => { setRenamingListId(null); setListNameError(""); }}>
@@ -1039,6 +1151,7 @@ function confirmStartNewTrip() {
                 <TouchableOpacity onPress={() => { setRenamingListId(null); setListNameError(""); }}><X size={18} color={t.muted} /></TouchableOpacity>
               </View>
               <TextInput
+                ref={renameInputRef}
                 autoFocus
                 value={renameDraft}
                 maxLength={40}
@@ -1060,12 +1173,12 @@ function confirmStartNewTrip() {
             </Pressable>
           </Pressable>
         </KeyboardAvoidingView>
-      </Modal>
+      )}
 
       {/* ===== New list popup ===== */}
-      <Modal visible={newListModalOpen} transparent statusBarTranslucent animationType="fade" onRequestClose={() => setNewListModalOpen(false)}>
+      {newListModalOpen && (
         <KeyboardAvoidingView
-          style={{ flex: 1 }}
+          style={[s.overlayFill, { zIndex: 42, elevation: 22 }]}
           behavior={Platform.OS === "ios" ? "padding" : "height"}
         >
           <Pressable style={s.modalBackdropCenter} onPress={() => setNewListModalOpen(false)}>
@@ -1075,6 +1188,7 @@ function confirmStartNewTrip() {
                 <TouchableOpacity onPress={() => setNewListModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
               </View>
               <TextInput
+                ref={newListInputRef}
                 autoFocus
                 value={newListName}
                 maxLength={40}
@@ -1097,14 +1211,14 @@ function confirmStartNewTrip() {
             </Pressable>
           </Pressable>
         </KeyboardAvoidingView>
-      </Modal>
+      )}
 
-      {/* ===== Edit item popup — a real Modal (like "New list") instead of an
-          inline row, wrapped in KeyboardAvoidingView so the keyboard never
-          covers the input. ===== */}
-      <Modal visible={editingItemId !== null} transparent statusBarTranslucent animationType="fade" onRequestClose={cancelEditItem}>
+      {/* ===== Edit item popup — a plain in-tree overlay (like "New list")
+          instead of a real Modal, wrapped in KeyboardAvoidingView so the
+          keyboard never covers the input. ===== */}
+      {editingItemId !== null && (
         <KeyboardAvoidingView
-          style={{ flex: 1 }}
+          style={[s.overlayFill, { zIndex: 43, elevation: 23 }]}
           behavior={Platform.OS === "ios" ? "padding" : "height"}
         >
           <Pressable style={s.modalBackdropCenter} onPress={cancelEditItem}>
@@ -1114,6 +1228,7 @@ function confirmStartNewTrip() {
                 <TouchableOpacity onPress={cancelEditItem}><X size={18} color={t.muted} /></TouchableOpacity>
               </View>
               <TextInput
+                ref={editItemInputRef}
                 autoFocus
                 value={eName}
                 maxLength={40}
@@ -1138,10 +1253,11 @@ function confirmStartNewTrip() {
             </Pressable>
           </Pressable>
         </KeyboardAvoidingView>
-      </Modal>
+      )}
 
       {/* ===== Confirm "Start new trip" popup ===== */}
-      <Modal visible={confirmNewTripOpen} transparent statusBarTranslucent animationType="fade" onRequestClose={() => setConfirmNewTripOpen(false)}>
+      {confirmNewTripOpen && (
+        <View style={[s.overlayFill, { zIndex: 44, elevation: 24 }]}>
         <Pressable style={s.modalBackdropCenter} onPress={() => setConfirmNewTripOpen(false)}>
           <Pressable style={s.popupCard} onPress={() => {}}>
             <Text style={s.sheetTitle}>Start a new trip?</Text>
@@ -1159,16 +1275,14 @@ function confirmStartNewTrip() {
             </View>
           </Pressable>
         </Pressable>
-      </Modal>
+        </View>
+      )}
 
-      {/* ===== Currency picker: a dedicated full-screen search page (not a
-          bottom sheet) — the title/search bar stay pinned at the top and
-          only the results list scrolls, so opening the keyboard never makes
-          the whole picker look like it's shrinking. ===== */}
       <Modal
         visible={currencyModalOpen || needsCurrencySetup}
         animationType="slide"
         statusBarTranslucent
+        onShow={() => { if (!needsCurrencySetup) setTimeout(() => currencySearchInputRef.current?.focus(), 60); }}
         onRequestClose={() => { if (!needsCurrencySetup) setCurrencyModalOpen(false); }}
       >
         <SafeAreaView style={{ flex: 1, backgroundColor: t.bg }}>
@@ -1190,7 +1304,7 @@ function confirmStartNewTrip() {
               </Text>
 
               <TextInput
-                autoFocus={!needsCurrencySetup}
+                ref={currencySearchInputRef}
                 value={currencySearch}
                 onChangeText={setCurrencySearch}
                 placeholder="Search currency (e.g. USD, Euro)"
@@ -1328,6 +1442,7 @@ function confirmStartNewTrip() {
       <Modal visible={reminderModalOpen} transparent statusBarTranslucent animationType="slide" onRequestClose={() => setReminderModalOpen(false)}>
         <Pressable style={s.modalBackdrop} onPress={() => setReminderModalOpen(false)}>
           <Pressable style={s.listsSheet} onPress={() => {}}>
+            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
             <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
               <Text style={s.sheetTitle}>Shopping reminders</Text>
               <TouchableOpacity onPress={() => setReminderModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
@@ -1356,6 +1471,58 @@ function confirmStartNewTrip() {
               />
               <Text style={{ color: t.text, fontSize: 14 }}>days of no activity</Text>
             </View>
+
+            <View style={{ marginTop: 22, paddingTop: 16, borderTopWidth: 1, borderColor: t.border }}>
+              <Text style={{ color: t.text, fontWeight: "700", fontSize: 14, marginBottom: 4 }}>Daily testing reminder</Text>
+
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                <Text style={{ color: t.text, fontSize: 14 }}>Send at</Text>
+                <TouchableOpacity
+                  onPress={() => setDailyTestPickerOpen(true)}
+                  style={[s.smallBtn, { paddingHorizontal: 14, paddingVertical: 8 }]}
+                >
+                  <Text style={{ color: t.text, fontWeight: "700", fontSize: 14 }}>
+                    {formatTime12h(dailyTestSettings.hour ?? DAILY_TEST_DEFAULT_HOUR, dailyTestSettings.minute ?? DAILY_TEST_DEFAULT_MINUTE)}
+                  </Text>
+                </TouchableOpacity>
+                <Text style={{ color: t.muted, fontSize: 12 }}>device time — default 8:00 PM</Text>
+              </View>
+
+              {dailyTestPickerOpen && (
+                <View style={{ marginTop: 10, alignItems: Platform.OS === "ios" ? "center" : "flex-start" }}>
+                  <DateTimePicker
+                    value={(() => {
+                      const d = new Date();
+                      d.setHours(Number(dailyTestSettings.hour ?? DAILY_TEST_DEFAULT_HOUR));
+                      d.setMinutes(Number(dailyTestSettings.minute ?? DAILY_TEST_DEFAULT_MINUTE));
+                      d.setSeconds(0);
+                      d.setMilliseconds(0);
+                      return d;
+                    })()}
+                    mode="time"
+                    is24Hour={false}
+                    display={Platform.OS === "android" ? "clock" : "spinner"}
+                    onChange={(event, selectedDate) => {
+                      // Android's dialog closes itself after a pick or a
+                      // cancel — hide our wrapper either way. iOS's spinner
+                      // stays open inline until the "Done" button below.
+                      if (Platform.OS === "android") setDailyTestPickerOpen(false);
+                      if (event.type === "dismissed") return;
+                      if (selectedDate) updateDailyTestTime(selectedDate.getHours(), selectedDate.getMinutes());
+                    }}
+                  />
+                  {Platform.OS === "ios" && (
+                    <TouchableOpacity
+                      onPress={() => setDailyTestPickerOpen(false)}
+                      style={[s.addItemBtn, { marginTop: 8, marginLeft: 0 }]}
+                    >
+                      <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>Done</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              )}
+            </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -1541,6 +1708,7 @@ function makeStyles(t) {
 
     priceInput: { width: 56, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
     menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "transparent", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },
+    overlayFill: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0 },
     headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, paddingVertical: 6, minWidth: 180, elevation: 6, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 6 } },
     headerMenuTitleRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 8, paddingHorizontal: 14, borderBottomWidth: 1, borderBottomColor: t.border, marginBottom: 2 },
     headerMenuTitle: { fontSize: 12.5, fontWeight: "700", color: t.muted, textTransform: "uppercase", letterSpacing: 0.4 },

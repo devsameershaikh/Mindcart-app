@@ -19,21 +19,28 @@ import {
   Linking,
   ActivityIndicator,
   AppState,
+  LayoutAnimation,
+  UIManager,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
+import * as Haptics from "expo-haptics";
 import {
   Plus, Trash2, Moon, SunMedium, Search, Settings, ChevronDown, Check,
   FileDown, Home, ListPlus, EyeOff, RotateCcw, Pencil, X, ListChecks,
   Barcode, Bell, Menu, BellRing, Info, Mail, ShieldCheck, FileText,
-  ChevronRight,
+  ChevronRight, Users, Layers, UserCircle2, Eye,
+  Cloud, Crown, Sparkles, LogOut, Palette, Wallet, BellDot,
+  Zap, ArrowRight, Star, ShoppingBag,
 } from "lucide-react-native";
 
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
-import { getTheme } from "./src/utils/theme";
+import { getTheme, RADIUS } from "./src/utils/theme";
 import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, clampQty, clampPrice } from "./src/utils/helpers";
 import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
 import SimpleSelect from "./src/components/Simpleselect";
+import FamilySyncScreen from "./src/screens/FamilySyncScreen";
 
 // This app is local-first: everything lives in on-device storage (see
 // storage.js). There is no login, no backend, and no network calls for
@@ -143,8 +150,62 @@ Notifications.setNotificationHandler({
   }),
 });
 
+// Old-architecture Android needs this opt-in for LayoutAnimation to animate
+// list insert/remove/reorder; harmless no-op everywhere else (new
+// architecture / iOS animate these automatically).
+if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
+// Small helper so every "this changes the shape of the list" action gets
+// the same gentle ease-in-ease-out slide/fade instead of an abrupt pop.
+function animateListChange() {
+  LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+}
+// Best-effort haptics — silently no-ops on web/unsupported devices.
+function tapHaptic(style) {
+  Haptics.impactAsync(style || Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+}
+
 function CurrencyGlyph({ symbol, color, size = 12 }) {
   return <Text style={{ color, fontSize: size, fontWeight: "800" }}>{symbol}</Text>;
+}
+
+// A checkbox that gives a small satisfying "pop" (scale bounce) + a light
+// haptic tap whenever it's toggled, instead of just flipping state instantly.
+function AnimatedCheckbox({ checked, onPress, style }) {
+  const scale = useRef(new Animated.Value(1)).current;
+  function handlePress() {
+    tapHaptic(Haptics.ImpactFeedbackStyle.Medium);
+    Animated.sequence([
+      Animated.timing(scale, { toValue: 0.75, duration: 70, useNativeDriver: true }),
+      Animated.spring(scale, { toValue: 1, useNativeDriver: true, friction: 4, tension: 140 }),
+    ]).start();
+    onPress();
+  }
+  return (
+    <TouchableOpacity onPress={handlePress} activeOpacity={0.8}>
+      <Animated.View style={[style, { transform: [{ scale }] }]}>
+        {checked && <Check size={13} color="#fff" />}
+      </Animated.View>
+    </TouchableOpacity>
+  );
+}
+
+// Red "Delete" panel revealed by swiping an item row to the left —
+// used by <Swipeable renderRightActions={...}> below.
+function SwipeDeleteAction({ t, onDelete }) {
+  return (
+    <TouchableOpacity
+      onPress={() => { tapHaptic(Haptics.ImpactFeedbackStyle.Heavy); onDelete(); }}
+      style={{
+        backgroundColor: t.danger, justifyContent: "center", alignItems: "center",
+        width: 76, borderRadius: RADIUS.md, marginLeft: 8, gap: 3,
+      }}
+    >
+      <Trash2 size={17} color="#fff" />
+      <Text style={{ color: "#fff", fontSize: 10.5, fontWeight: "700" }}>Delete</Text>
+    </TouchableOpacity>
+  );
 }
 
 export default function DmartApp() {
@@ -160,6 +221,7 @@ export default function DmartApp() {
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
 
   const [tab, setTab] = useState("home");
+  const [homeFilter, setHomeFilter] = useState("all"); // "all" | "pending" | "bought"
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
@@ -204,6 +266,18 @@ export default function DmartApp() {
   const newListInputRef = useRef(null);
   const editItemInputRef = useRef(null);
   const currencySearchInputRef = useRef(null);
+
+  // ---------- New sections (UI-only shells: Master Items) ----------
+  const MASTER_ITEMS = [
+    { name: "Basmati Rice", category: "Kitchen", unit: "kg" },
+    { name: "Milk", category: "Dairy", unit: "litre" },
+    { name: "Eggs", category: "Dairy", unit: "packet" },
+    { name: "Bread", category: "Bakery", unit: "loaf" },
+    { name: "Onions", category: "Produce", unit: "kg" },
+    { name: "Tomatoes", category: "Produce", unit: "kg" },
+    { name: "Cooking Oil", category: "Kitchen", unit: "litre" },
+    { name: "Sugar", category: "Kitchen", unit: "kg" },
+  ];
 
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
   const [dailyTestPickerOpen, setDailyTestPickerOpen] = useState(false);
@@ -350,6 +424,18 @@ export default function DmartApp() {
   });
 
   if (!appLoaded) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
+
+  // First-run welcome screen — shown once, then never again (flag lives on
+  // the already-persisted profile object, so no storage.js changes needed).
+  if (!profile.onboardingSeen) {
+    return (
+      <OnboardingScreen
+        t={t}
+        dark={dark}
+        onGetStarted={() => setProfile((p) => ({ ...p, onboardingSeen: true }))}
+      />
+    );
+  }
 
   function setListItems(listId, updater) {
     setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || []) }));
@@ -575,6 +661,7 @@ export default function DmartApp() {
       note: "",
       createdAt: Date.now(),
     }));
+    animateListChange();
     setListItems(selectedListId, (prev) => [...prev, ...newItems]);
     setFName("");
     setFPrice("");
@@ -586,6 +673,7 @@ export default function DmartApp() {
   function updateItem(id, patch) {
     if (patch.qty !== undefined) patch = { ...patch, qty: clampQty(patch.qty) };
     if (patch.price !== undefined) patch = { ...patch, price: clampPrice(patch.price) };
+    if (patch.checked !== undefined || patch.skipped !== undefined) animateListChange();
     setListItems(selectedListId, (prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
     if (patch.checked !== undefined) bumpActivity(selectedListId);
   }
@@ -593,6 +681,7 @@ export default function DmartApp() {
   // optimistic delete with a 5s "Undo" window
   function deleteItem(item) {
     if (pendingDelete) clearTimeout(pendingDelete.timer); 
+    animateListChange();
     setListItems(selectedListId, (prev) => prev.filter((i) => i.id !== item.id));
     const timer = setTimeout(() => setPendingDelete(null), 5000);
     setPendingDelete({ item, timer });
@@ -600,6 +689,7 @@ export default function DmartApp() {
   function undoDelete() {
     if (!pendingDelete) return;
     clearTimeout(pendingDelete.timer);
+    animateListChange();
     setListItems(selectedListId, (prev) => [...prev, pendingDelete.item]);
     setPendingDelete(null);
   }
@@ -721,6 +811,19 @@ function confirmStartNewTrip() {
     setCategories((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
   }
 
+  // ---------- Master items: quick-add a common item straight into the current list ----------
+  function addMasterItem(mi) {
+    const dup = items.some((i) => i.name.toLowerCase() === mi.name.toLowerCase());
+    if (dup) { setNotice(`"${mi.name}" is already on this list.`); return; }
+    animateListChange();
+    setListItems(selectedListId, (prev) => [...prev, {
+      id: makeId("item"), name: mi.name, category: mi.category, qty: 0, unit: mi.unit,
+      price: "", checked: false, skipped: false, note: "", createdAt: Date.now(),
+    }]);
+    setNotice(`Added "${mi.name}" to ${selectedList ? selectedList.name : "your list"}.`);
+    bumpActivity(selectedListId);
+  }
+
   // ---------- Edit item ----------
   function startEditItem(item) {
     console.log("Editing item:", item);
@@ -769,6 +872,7 @@ function confirmStartNewTrip() {
   });
 
   return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
     <View style={{ flex: 1, backgroundColor: t.bg }}>
     <SafeAreaView style={[s.screen, { backgroundColor: t.bg }]}>
       <StatusBar barStyle={dark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
@@ -776,15 +880,16 @@ function confirmStartNewTrip() {
         {/* ===== Header ===== */}
         <View style={s.headerRow}>
           <View>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <Image source={require("./src/assets/icon.png")} style={{ width: 25, height: 25 }} />
-
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <View style={{ width: 30, height: 30, borderRadius: RADIUS.sm, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+                <Image source={require("./src/assets/icon.png")} style={{ width: 22, height: 22 }} />
+              </View>
               <Text style={s.brand}>MindCart</Text>
             </View>
             <TouchableOpacity onPress={() => setListsModalOpen(true)} style={s.listSwitcher}>
-              <ListChecks size={13} color={t.accent} />
+              <ListChecks size={12} color={t.accent} />
               <Text style={s.listSwitcherText}>{selectedList ? selectedList.name : "Select list"}</Text>
-              <ChevronDown size={13} color={t.accent} />
+              <ChevronDown size={12} color={t.accent} />
             </TouchableOpacity>
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
@@ -882,45 +987,84 @@ function confirmStartNewTrip() {
                 </TouchableOpacity>
               </View>
 
+              {/* ===== Segmented filter: All / Pending / Bought ===== */}
+              <View style={s.segmentWrap}>
+                {[
+                  { id: "all", label: `All (${items.length})` },
+                  { id: "pending", label: `Pending (${pendingItems.length})` },
+                  { id: "bought", label: `Bought (${boughtItems.length})` },
+                ].map((seg) => (
+                  <TouchableOpacity
+                    key={seg.id}
+                    onPress={() => { animateListChange(); setHomeFilter(seg.id); }}
+                    style={[s.segmentBtn, homeFilter === seg.id && s.segmentBtnActive]}
+                  >
+                    <Text style={[s.segmentText, homeFilter === seg.id && s.segmentTextActive]}>{seg.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
               {items.length === 0 && (
-                <Text style={s.emptyText}>"{selectedList ? selectedList.name : ""}" is empty — add items from the "Add" tab first.</Text>
+                <View style={s.emptyStateWrap}>
+                  <View style={s.emptyStateIconWrap}>
+                    <ShoppingBag size={28} color={t.accent} />
+                  </View>
+                  <Text style={s.emptyStateTitle}>"{selectedList ? selectedList.name : "This list"}" is empty</Text>
+                  <Text style={s.emptyStateSub}>Nothing here yet — add your first item and MindCart will remember it for next time.</Text>
+                  <TouchableOpacity onPress={() => setTab("add")} style={s.emptyStateBtn}>
+                    <Plus size={16} color="#fff" />
+                    <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13.5 }}>Add your first item</Text>
+                  </TouchableOpacity>
+                </View>
               )}
               {items.length > 0 && noSearchResults && (
-                <Text style={s.emptyText}>No items match "{debouncedSearch}" in this list.</Text>
+                <View style={s.emptyStateWrap}>
+                  <View style={s.emptyStateIconWrap}><Search size={26} color={t.accent} /></View>
+                  <Text style={s.emptyStateTitle}>No matches for "{debouncedSearch}"</Text>
+                  <Text style={s.emptyStateSub}>Try a different search, or clear it to see everything on this list.</Text>
+                </View>
               )}
 
               {itemCategories.map((cat) => {
-                const catItems = filtered.filter((i) => i.category === cat && !i.skipped);
+                const catItems = filtered.filter((i) => {
+                  if (i.category !== cat || i.skipped) return false;
+                  if (homeFilter === "pending") return !i.checked;
+                  if (homeFilter === "bought") return i.checked;
+                  return true;
+                });
                 if (catItems.length === 0) return null;
                 const isCollapsed = collapsed[cat];
                 return (
                   <View key={cat} style={{ marginTop: 14 }}>
-                    <TouchableOpacity onPress={() => toggleCollapse(cat)} style={s.catHeader}>
+                    <TouchableOpacity onPress={() => { animateListChange(); toggleCollapse(cat); }} style={s.catHeader}>
                       <Text style={s.catHeaderText}>{cat}</Text>
                       <ChevronDown size={15} color={t.muted} style={{ transform: [{ rotate: isCollapsed ? "-90deg" : "0deg" }] }} />
                     </TouchableOpacity>
                     {!isCollapsed && (
                       <View style={{ gap: 8, marginTop: 6 }}>
                         {catItems.map((item) => (
-                          <View key={item.id} style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
+                          <Swipeable
+                            key={item.id}
+                            overshootRight={false}
+                            renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                          >
+                          <View style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
                             <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                              <TouchableOpacity
+                              <AnimatedCheckbox
+                                checked={item.checked}
                                 onPress={() => updateItem(item.id, { checked: !item.checked })}
                                 style={[s.checkbox, { borderColor: item.checked ? t.accent : t.border, backgroundColor: item.checked ? t.accent : "transparent" }]}
-                              >
-                                {item.checked && <Check size={13} color="#fff" />}
-                              </TouchableOpacity>
+                              />
                               <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
                               <View style={{ flex: 1, minWidth: 0 }}>
                                 <Text style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
                                 <Text style={s.itemUnit}>{item.unit}</Text>
                               </View>
                              <TouchableOpacity
-                              onPress={() =>
-                                updateItem(item.id, {
-                                     qty: Math.max(0, Number(item.qty) - 1)
-                                     })
-                                   }
+                              onPress={() => {
+                                    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                    updateItem(item.id, { qty: Math.max(0, Number(item.qty) - 1) });
+                                   }}
                                   disabled={Number(item.qty) <= 0}
                                   style={[
                                     s.qtyBtn,
@@ -931,7 +1075,10 @@ function confirmStartNewTrip() {
                               </TouchableOpacity>
                               <Text style={s.qtyValue}>{item.qty}</Text>
                               <TouchableOpacity
-                                onPress={() => updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) })}
+                                onPress={() => {
+                                  tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                  updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) });
+                                }}
                                 disabled={Number(item.qty) >= 999}
                                 style={[s.qtyBtn, Number(item.qty) >= 999 && { opacity: 0.5 }]}
                               >
@@ -963,6 +1110,7 @@ function confirmStartNewTrip() {
                               style={s.noteInput}
                             />
                           </View>
+                          </Swipeable>
                         ))}
                       </View>
                     )}
@@ -970,7 +1118,7 @@ function confirmStartNewTrip() {
                 );
               })}
 
-              {skippedItems.length > 0 && (
+              {skippedItems.length > 0 && homeFilter !== "bought" && (
                 <View style={{ marginTop: 10 }}>
                   <TouchableOpacity onPress={() => toggleCollapse("__skipped__")} style={s.catHeader}>
                     <Text style={[s.catHeaderText, { color: t.muted }]}>Not buying this time ({skippedItems.length})</Text>
@@ -979,7 +1127,12 @@ function confirmStartNewTrip() {
                   {!collapsed["__skipped__"] && (
                     <View style={{ gap: 8, marginTop: 6 }}>
                       {skippedItems.map((item) => (
-                        <View key={item.id} style={[s.itemCard, { flexDirection: "row", alignItems: "center", gap: 10, opacity: 0.6 }]}>
+                        <Swipeable
+                          key={item.id}
+                          overshootRight={false}
+                          renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                        >
+                        <View style={[s.itemCard, { flexDirection: "row", alignItems: "center", gap: 10, opacity: 0.6 }]}>
                           <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
                           <View style={{ flex: 1, minWidth: 0 }}>
                             <Text style={s.itemName}>{item.name}</Text>
@@ -989,6 +1142,7 @@ function confirmStartNewTrip() {
                             <Text style={{ color: t.accent, fontWeight: "600", fontSize: 11.5 }}>Add back</Text>
                           </TouchableOpacity>
                         </View>
+                        </Swipeable>
                       ))}
                     </View>
                   )}
@@ -1050,10 +1204,25 @@ function confirmStartNewTrip() {
 
               <View style={{ marginTop: 16, gap: 8 }}>
                 {filtered.length === 0 && (
-                  <Text style={s.emptyText}>{items.length === 0 ? "No items yet." : `No items match "${debouncedSearch}".`}</Text>
+                  <View style={s.emptyStateWrap}>
+                    <View style={s.emptyStateIconWrap}>
+                      {items.length === 0 ? <ListPlus size={26} color={t.accent} /> : <Search size={26} color={t.accent} />}
+                    </View>
+                    <Text style={s.emptyStateTitle}>{items.length === 0 ? "No items yet" : `No items match "${debouncedSearch}"`}</Text>
+                    <Text style={s.emptyStateSub}>
+                      {items.length === 0
+                        ? "Type a name above and tap Add to build out this list."
+                        : "Try a different search or add it as a brand-new item."}
+                    </Text>
+                  </View>
                 )}
                 {filtered.map((item) => (
-                  <View key={item.id} style={s.itemCard}>
+                  <Swipeable
+                    key={item.id}
+                    overshootRight={false}
+                    renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                  >
+                  <View style={s.itemCard}>
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
                       <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
                       <View style={{ flex: 1, minWidth: 0 }}>
@@ -1063,24 +1232,164 @@ function confirmStartNewTrip() {
                         </Text>
                       </View>
                       <TouchableOpacity onPress={() => startEditItem(item)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
-                      <TouchableOpacity onPress={() => deleteItem(item)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
                     </View>
                   </View>
+                  </Swipeable>
                 ))}
               </View>
             </>
+          )}
+
+          {tab === "master" && (
+            <View style={{ gap: 10 }}>
+              <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
+                <View style={[s.tabIconWrap, s.tabIconWrapActive, { width: 44, height: 44 }]}>
+                  <Layers size={20} color="#fff" />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ color: t.text, fontWeight: "800", fontSize: 15 }}>Master Items</Text>
+                  <Text style={{ color: t.muted, fontSize: 12, marginTop: 2 }}>Your household's frequently bought items — tap + to drop one into "{selectedList ? selectedList.name : "this list"}".</Text>
+                </View>
+              </View>
+
+              {MASTER_ITEMS.map((mi) => {
+                const already = items.some((i) => i.name.toLowerCase() === mi.name.toLowerCase());
+                return (
+                  <View key={mi.name} style={[s.itemCard, { flexDirection: "row", alignItems: "center", gap: 10 }]}>
+                    <Text style={{ fontSize: 18 }}>{getIcon(mi.name)}</Text>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={s.itemName}>{mi.name}</Text>
+                      <Text style={s.itemUnit}>{mi.category} · {mi.unit} · Master Item</Text>
+                    </View>
+                    <TouchableOpacity
+                      onPress={() => addMasterItem(mi)}
+                      disabled={already}
+                      style={[s.masterAddBtn, already && { opacity: 0.4 }]}
+                    >
+                      {already ? <Check size={16} color={t.accent2} /> : <Plus size={16} color="#fff" />}
+                    </TouchableOpacity>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+
+          {tab === "family" && (
+            <FamilySyncScreen t={t} s={s} selectedList={selectedList} items={items} />
+          )}
+
+          {tab === "profile" && (
+            <View style={{ gap: 14 }}>
+              <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
+                <View style={s.avatarCircleLg}>
+                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(profile.name || "U").slice(0, 1).toUpperCase()}</Text>
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <TextInput
+                    value={profile.name}
+                    onChangeText={(v) => setProfile((p) => ({ ...p, name: v }))}
+                    placeholder="Your name"
+                    placeholderTextColor={t.muted}
+                    style={{ color: t.text, fontWeight: "800", fontSize: 16, padding: 0 }}
+                  />
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 }}>
+                    <Crown size={12} color={t.accent2} />
+                    <Text style={{ color: t.accent2, fontSize: 11.5, fontWeight: "700" }}>Family Plan Manager</Text>
+                  </View>
+                </View>
+              </View>
+
+              <Text style={s.sectionLabel}>Preferences</Text>
+              <View style={{ gap: 8 }}>
+                <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><Palette size={16} color={t.accent} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Dark Mode</Text>
+                    <Text style={s.itemUnit}>Switch light and dark theme</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => setDark((d) => !d)} style={[s.toggleTrack, dark && s.toggleTrackOn]}>
+                    <View style={[s.toggleThumb, dark && s.toggleThumbOn]} />
+                  </TouchableOpacity>
+                </View>
+
+                <TouchableOpacity style={s.settingsRow} onPress={() => setCurrencyModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Wallet size={16} color={t.accent2} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Currency</Text>
+                    <Text style={s.itemUnit}>List total calculations</Text>
+                  </View>
+                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "700", marginRight: 4 }}>{currency.code}</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+
+                <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><BellDot size={16} color={t.accent} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Store Reminders</Text>
+                    <Text style={s.itemUnit}>Nudge me if a list goes quiet</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => toggleReminders(!reminderSettings.enabled)} style={[s.toggleTrack, reminderSettings.enabled && s.toggleTrackOn]}>
+                    <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              <Text style={s.sectionLabel}>Data & Cloud</Text>
+              <View style={{ gap: 8 }}>
+                <TouchableOpacity style={s.settingsRow} onPress={exportPDF} disabled={exportingPdf}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><FileDown size={16} color={t.accent} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Export Shopping Data</Text>
+                    <Text style={s.itemUnit}>Download this list as a PDF</Text>
+                  </View>
+                  {exportingPdf ? <ActivityIndicator size="small" color={t.accent} /> : <ChevronRight size={16} color={t.muted} />}
+                </TouchableOpacity>
+                <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Cloud size={16} color={t.accent2} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Cloud Backup</Text>
+                    <Text style={s.itemUnit}>Not connected yet</Text>
+                  </View>
+                  <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "700" }}>Coming soon</Text>
+                </View>
+              </View>
+
+              <Text style={s.sectionLabel}>Support & Legal</Text>
+              <View style={{ gap: 8 }}>
+                <TouchableOpacity style={s.settingsRow} onPress={() => setPrivacyModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.surface2 }]}><ShieldCheck size={16} color={t.text} /></View>
+                  <Text style={[s.itemName, { flex: 1 }]}>Privacy Policy</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+                <TouchableOpacity style={s.settingsRow} onPress={() => setTermsModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.surface2 }]}><FileText size={16} color={t.text} /></View>
+                  <Text style={[s.itemName, { flex: 1 }]}>Terms of Use</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+                <TouchableOpacity style={s.settingsRow} onPress={() => setAboutModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.surface2 }]}><Info size={16} color={t.text} /></View>
+                  <Text style={[s.itemName, { flex: 1 }]}>About MindCart</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+              </View>
+            </View>
           )}
         </ScrollView>
 
         {/* ===== Bottom tab bar ===== */}
         <View style={s.tabBar}>
           {[
-            { id: "home", label: "Home / Buy", icon: Home },
-            { id: "add", label: "Add / Manage", icon: ListPlus },
+            { id: "home", label: "Home", icon: Home },
+            { id: "add", label: "Add", icon: ListPlus },
+            { id: "master", label: "Master", icon: Layers },
+            { id: "family", label: "Family", icon: Users },
+            { id: "profile", label: "Profile", icon: UserCircle2 },
           ].map(({ id, label, icon: Icon }) => (
             <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
-              <Icon size={19} color={tab === id ? t.accent : t.muted} />
-              <Text style={{ fontSize: 11.5, fontWeight: "600", color: tab === id ? t.accent : t.muted }}>{label}</Text>
+              <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
+                <Icon size={18} color={tab === id ? "#fff" : t.muted} />
+              </View>
+              <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
             </TouchableOpacity>
           ))}
         </View>
@@ -1635,6 +1944,99 @@ function confirmStartNewTrip() {
       </Pressable>
     )}
     </View>
+    </GestureHandlerRootView>
+  );
+}
+
+// ---------- First-run onboarding ----------
+// Marketing copy below is placeholder — edit the description and feature
+// chips to match your actual app before publishing.
+function OnboardingScreen({ t, dark, onGetStarted }) {
+  const features = [
+    { icon: Zap, label: "1-Handed Fast", note: "Quick tap shopping" },
+    { icon: Users, label: "Family Sync", note: "Live permissions" },
+    { icon: Layers, label: "Master Pantry", note: "Reusable items" },
+  ];
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: t.bg }}>
+      <StatusBar barStyle={dark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
+      <ScrollView
+        contentContainerStyle={{ flexGrow: 1, paddingHorizontal: 26, paddingTop: 20, paddingBottom: 24 }}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <View style={{ width: 34, height: 34, borderRadius: RADIUS.sm, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+              <Image source={require("./src/assets/icon.png")} style={{ width: 24, height: 24 }} />
+            </View>
+            <Text style={{ fontSize: 19, fontWeight: "800", color: t.text }}>Mind<Text style={{ color: t.accent }}>Cart</Text></Text>
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: t.accent2Soft, paddingHorizontal: 10, paddingVertical: 5, borderRadius: RADIUS.pill }}>
+            <Users size={12} color={t.accent2} />
+            <Text style={{ fontSize: 11, fontWeight: "700", color: t.accent2 }}>Family Ready</Text>
+          </View>
+        </View>
+
+        <View style={{ alignItems: "center", marginTop: 36, marginBottom: 30 }}>
+          <View style={{
+            width: 108, height: 108, borderRadius: RADIUS.xl, backgroundColor: t.accentSoft,
+            alignItems: "center", justifyContent: "center",
+          }}>
+            <ShoppingBag size={48} color={t.accent} />
+          </View>
+        </View>
+
+        <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
+          Remember what to buy.
+        </Text>
+        <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
+          Shop smarter. Together.
+        </Text>
+        <Text style={{ fontSize: 14, color: t.muted, lineHeight: 21 }}>
+          Effortless collaborative lists with real-time family syncing, smart units, and instant budget tracking.
+        </Text>
+
+        <View style={{ flexDirection: "row", gap: 10, marginTop: 26 }}>
+          {features.map(({ icon: Icon, label, note }) => (
+            <View key={label} style={{
+              flex: 1, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border,
+              borderRadius: RADIUS.md, padding: 12, alignItems: "flex-start", gap: 6,
+            }}>
+              <Icon size={17} color={t.accent} />
+              <Text style={{ fontSize: 11.5, fontWeight: "800", color: t.text }}>{label}</Text>
+              <Text style={{ fontSize: 10, color: t.muted }}>{note}</Text>
+            </View>
+          ))}
+        </View>
+
+        <View style={{ flex: 1 }} />
+
+        <TouchableOpacity
+          onPress={onGetStarted}
+          style={{
+            marginTop: 30, backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 15,
+            flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8,
+          }}
+        >
+          <Text style={{ color: "#fff", fontWeight: "800", fontSize: 15 }}>Get Started — It's Free</Text>
+          <ArrowRight size={17} color="#fff" />
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={onGetStarted}
+          style={{
+            marginTop: 10, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 14,
+            alignItems: "center", backgroundColor: t.surface,
+          }}
+        >
+          <Text style={{ color: t.text, fontWeight: "700", fontSize: 14 }}>Continue with Google</Text>
+        </TouchableOpacity>
+
+        <View style={{ flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 4, marginTop: 16 }}>
+          <Star size={12} color={t.accent2} fill={t.accent2} />
+          <Text style={{ fontSize: 11.5, color: t.muted, fontWeight: "600" }}>Free forever · No account required</Text>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -1681,56 +2083,88 @@ function Loader({ t }) {
 }
 
 function makeStyles(t) {
+  const cardShadow = { shadowColor: t.shadow, shadowOpacity: 1, shadowRadius: 14, shadowOffset: { width: 0, height: 6 }, elevation: 3 };
   return StyleSheet.create({
     screen: { flex: 1 },
-    headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingHorizontal: 16, paddingTop: 12 },
-    brand: { fontSize: 22, fontWeight: "800", color: t.text },
-    listSwitcher: { marginTop: 4, flexDirection: "row", alignItems: "center", gap: 4 },
-    listSwitcherText: { color: t.accent, fontSize: 13, fontWeight: "700" },
-    iconBtn: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 999, width: 38, height: 38, alignItems: "center", justifyContent: "center" },
-    notice: { marginHorizontal: 16, marginTop: 12, backgroundColor: `${t.accent2}22`, borderWidth: 1, borderColor: `${t.accent2}55`, borderRadius: 10, padding: 10 },
-    undoRow: { marginHorizontal: 16, marginTop: 12, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, padding: 10, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-    searchWrap: { marginHorizontal: 16, marginTop: 16, marginBottom: 8, position: "relative", justifyContent: "center" },
-    searchIcon: { position: "absolute", left: 12, zIndex: 1 },
-    searchInput: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, paddingVertical: 9, paddingLeft: 34, paddingRight: 12, color: t.text, fontSize: 14 },
-    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 16, padding: 16, marginTop: 4 },
-    newTripBtn: { marginTop: 12, borderWidth: 1, borderColor: t.accent, borderRadius: 10, padding: 8, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
-    emptyText: { textAlign: "center", color: t.muted, fontSize: 13, paddingVertical: 20 },
-    catHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 4, paddingHorizontal: 2 },
-    catHeaderText: { fontSize: 15, fontWeight: "700", color: t.accent },
-    itemCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, padding: 10 },
-    checkbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, alignItems: "center", justifyContent: "center" },
-    itemName: { fontSize: 14, fontWeight: "600", color: t.text },
-    itemUnit: { fontSize: 11.5, color: t.muted },
-    qtyBtn: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 6, width: 24, height: 24, alignItems: "center", justifyContent: "center" },
+    headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingHorizontal: 18, paddingTop: 12 },
+    brand: { fontSize: 21, fontWeight: "800", color: t.text, letterSpacing: -0.3 },
+    listSwitcher: { marginTop: 5, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: t.accentSoft, alignSelf: "flex-start", paddingHorizontal: 9, paddingVertical: 4, borderRadius: RADIUS.pill },
+    listSwitcherText: { color: t.accent, fontSize: 12.5, fontWeight: "700" },
+    iconBtn: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.pill, width: 40, height: 40, alignItems: "center", justifyContent: "center", ...cardShadow },
+    notice: { marginHorizontal: 18, marginTop: 12, backgroundColor: t.accent2Soft, borderWidth: 1, borderColor: `${t.accent2}45`, borderRadius: RADIUS.md, padding: 12 },
+    undoRow: { marginHorizontal: 18, marginTop: 12, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 12, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+    searchWrap: { marginHorizontal: 18, marginTop: 16, marginBottom: 8, position: "relative", justifyContent: "center" },
+    searchIcon: { position: "absolute", left: 14, zIndex: 1 },
+    searchInput: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 11, paddingLeft: 38, paddingRight: 12, color: t.text, fontSize: 14 },
+    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 18, marginTop: 4, ...cardShadow },
+    newTripBtn: { marginTop: 14, backgroundColor: t.accentSoft, borderRadius: RADIUS.md, padding: 10, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+    emptyText: { textAlign: "center", color: t.muted, fontSize: 13, paddingVertical: 24 },
+    catHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6, paddingHorizontal: 2 },
+    catHeaderText: { fontSize: 14.5, fontWeight: "800", color: t.accent, textTransform: "uppercase", letterSpacing: 0.3 },
+    itemCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+    checkbox: { width: 22, height: 22, borderRadius: 7, borderWidth: 2, alignItems: "center", justifyContent: "center" },
+    itemName: { fontSize: 14, fontWeight: "700", color: t.text },
+    itemUnit: { fontSize: 11.5, color: t.muted, marginTop: 1 },
+    qtyBtn: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 8, width: 24, height: 24, alignItems: "center", justifyContent: "center" },
     qtyBtnText: { color: t.text, fontSize: 15, fontWeight: "700" },
-    qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "600", color: t.text },
+    qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "700", color: t.text },
 
-    priceInput: { width: 56, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
+    priceInput: { width: 58, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
     menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "transparent", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },
     overlayFill: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0 },
-    headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, paddingVertical: 6, minWidth: 180, elevation: 6, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 6 } },
+    headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 6, minWidth: 180, elevation: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 14, shadowOffset: { width: 0, height: 8 } },
     headerMenuTitleRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 8, paddingHorizontal: 14, borderBottomWidth: 1, borderBottomColor: t.border, marginBottom: 2 },
     headerMenuTitle: { fontSize: 12.5, fontWeight: "700", color: t.muted, textTransform: "uppercase", letterSpacing: 0.4 },
     headerMenuRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, paddingHorizontal: 14 },
     headerMenuText: { color: t.text, fontSize: 13.5, fontWeight: "600" },
-    noteInput: { marginTop: 6, marginLeft: 32, borderBottomWidth: 1, borderColor: t.border, borderStyle: "dashed", color: t.muted, fontSize: 12, fontStyle: "italic", paddingVertical: 3 },
-    addBackBtn: { borderWidth: 1, borderColor: t.accent, borderRadius: 8, paddingVertical: 5, paddingHorizontal: 10 },
-    addCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 16, padding: 16, marginTop: 14 },
+    noteInput: { marginTop: 8, marginLeft: 32, borderBottomWidth: 1, borderColor: t.border, borderStyle: "dashed", color: t.muted, fontSize: 12, fontStyle: "italic", paddingVertical: 3 },
+    addBackBtn: { borderWidth: 1, borderColor: t.accent, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10 },
+    addCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 18, marginTop: 14, ...cardShadow },
     addHint: { fontSize: 13, color: t.muted, fontWeight: "600", marginBottom: 10 },
-    input: { backgroundColor: t.surface2, borderWidth: 1, borderRadius: 10, paddingVertical: 9, paddingHorizontal: 12, color: t.text, fontSize: 14 },
+    input: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 12, color: t.text, fontSize: 14 },
     errorText: { color: t.danger, fontSize: 11.5, marginTop: 4 },
-    addItemBtn: { marginLeft: "auto", backgroundColor: t.accent, borderRadius: 10, paddingVertical: 9, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 6 },
-    smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: 8, paddingVertical: 5, paddingHorizontal: 10 },
-    smallBtnText: { color: t.text, fontSize: 12, fontWeight: "600" },
-    tabBar: { flexDirection: "row", borderTopWidth: 1, borderColor: t.border, backgroundColor: t.surface },
-    tabBtn: { flex: 1, paddingVertical: 10, alignItems: "center", gap: 3 },
-    modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
-    modalBackdropCenter: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "center", alignItems: "center", padding: 20 },
-    listsSheet: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: 18, maxHeight: "80%" },
-    popupCard: { width: "100%", maxWidth: 420, backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: 18, padding: 18 },
+    addItemBtn: { marginLeft: "auto", backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", gap: 6 },
+    smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10, backgroundColor: t.surface },
+    smallBtnText: { color: t.text, fontSize: 12, fontWeight: "700" },
+    tabBar: { flexDirection: "row", borderTopWidth: 1, borderColor: t.border, backgroundColor: t.surface, paddingTop: 6, paddingBottom: 4 },
+    tabBtn: { flex: 1, paddingVertical: 6, alignItems: "center", gap: 2 },
+    tabIconWrap: { width: 34, height: 34, borderRadius: RADIUS.pill, alignItems: "center", justifyContent: "center" },
+    tabIconWrapActive: { backgroundColor: t.accent },
+    modalBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "flex-end" },
+    modalBackdropCenter: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "center", alignItems: "center", padding: 20 },
+    listsSheet: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl, padding: 20, maxHeight: "80%" },
+    popupCard: { width: "100%", maxWidth: 420, backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 20 },
     sheetTitle: { fontSize: 18, fontWeight: "800", color: t.text },
-    listRow: { backgroundColor: t.surface, borderWidth: 1, borderRadius: 12, padding: 12 },
-    confirmDeleteBox: { marginTop: 8, padding: 8, backgroundColor: `${t.danger}18`, borderWidth: 1, borderColor: `${t.danger}55`, borderRadius: 8 },
+    listRow: { backgroundColor: t.surface, borderWidth: 1, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+    confirmDeleteBox: { marginTop: 8, padding: 10, backgroundColor: t.dangerSoft, borderWidth: 1, borderColor: `${t.danger}55`, borderRadius: RADIUS.sm },
+
+    // ---- New sections: Master Items / Family / Profile ----
+    masterAddBtn: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.accent2, alignItems: "center", justifyContent: "center" },
+    permChip: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 9, backgroundColor: t.surface2 },
+    permChipActive: { borderColor: t.accent, backgroundColor: t.accentSoft },
+    permBadge: { backgroundColor: t.accentSoft, borderRadius: RADIUS.pill, paddingHorizontal: 10, paddingVertical: 5, marginRight: 4 },
+    avatarCircle: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    avatarCircleLg: { width: 54, height: 54, borderRadius: RADIUS.pill, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    sectionLabel: { color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.5, marginTop: 6, marginBottom: 2 },
+    settingsRow: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+    settingsIconWrap: { width: 34, height: 34, borderRadius: RADIUS.sm, alignItems: "center", justifyContent: "center" },
+    toggleTrack: { width: 42, height: 24, borderRadius: RADIUS.pill, backgroundColor: t.border, padding: 2, justifyContent: "center" },
+    toggleTrackOn: { backgroundColor: t.accent },
+    toggleThumb: { width: 20, height: 20, borderRadius: RADIUS.pill, backgroundColor: "#fff" },
+    toggleThumbOn: { transform: [{ translateX: 18 }] },
+
+    // ---- Segmented filter (Home: All / Pending / Bought) ----
+    segmentWrap: { flexDirection: "row", backgroundColor: t.surface2, borderRadius: RADIUS.pill, padding: 3, marginTop: 14, gap: 2 },
+    segmentBtn: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 8, borderRadius: RADIUS.pill },
+    segmentBtnActive: { backgroundColor: t.accent, ...cardShadow },
+    segmentText: { fontSize: 12, fontWeight: "700", color: t.muted },
+    segmentTextActive: { color: "#fff" },
+
+    // ---- Empty states ----
+    emptyStateWrap: { alignItems: "center", paddingVertical: 36, paddingHorizontal: 20, gap: 10 },
+    emptyStateIconWrap: { width: 64, height: 64, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center", marginBottom: 4 },
+    emptyStateTitle: { color: t.text, fontSize: 15, fontWeight: "800", textAlign: "center" },
+    emptyStateSub: { color: t.muted, fontSize: 12.5, textAlign: "center", lineHeight: 18 },
+    emptyStateBtn: { marginTop: 6, backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 11, paddingHorizontal: 20, flexDirection: "row", alignItems: "center", gap: 6 },
   });
 }

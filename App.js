@@ -24,6 +24,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
+console.log("Swipeable:", Swipeable);
 import * as Haptics from "expo-haptics";
 import {
   Plus, Trash2, Moon, SunMedium, Search, Settings, ChevronDown, Check,
@@ -551,8 +552,29 @@ export default function DmartApp() {
   // `if (!appLoaded)` early return — hooks can't be called conditionally,
   // and useMemo is a hook, so it has to run on every render regardless of
   // whether the loader is about to be shown instead.
-  const items = itemsByList[selectedListId] || [];
+  // Safety net: even with the id-checks in addItemIfNew/onItemCreated/etc.,
+  // this guarantees no two rows ever render with the same key, no matter
+  // which sync path (local, API response, socket broadcast) a duplicate
+  // might slip in from.
+  const items = useMemo(() => {
+    const raw = itemsByList[selectedListId] || [];
+    const seen = new Set();
+    const deduped = [];
+    for (const it of raw) {
+      if (seen.has(it.id)) continue;
+      seen.add(it.id);
+      deduped.push(it);
+    }
+    return deduped;
+  }, [itemsByList, selectedListId]);
   const selectedList = lists.find((l) => l.id === selectedListId) || lists[0];
+  // A READ-only collaborator could otherwise tap every add/check/edit/delete
+  // control in the UI (none of them are currently disabled for that role) —
+  // the server would correctly reject the write, but only after the local
+  // state was already optimistically changed, leaving their screen showing
+  // something that silently never saved. Local-only lists have no role and
+  // are always writable.
+  const canWrite = !selectedList?.role || selectedList.role !== "READ";
 
   const derived = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
@@ -583,22 +605,24 @@ export default function DmartApp() {
     return i.checked || i.skipped || hasNote || hasPrice || Number(i.qty) !== 0;
   });
 
-  if (!appLoaded) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
+  if (!appLoaded || authLoading) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
 
-  // First-run welcome screen — shown once, then never again (flag lives on
-  // the already-persisted profile object, so no storage.js changes needed).
-  if (!profile.onboardingSeen) {
-    return (
-      <OnboardingScreen
-        t={t}
-        dark={dark}
-        onGetStarted={() => setProfile((p) => ({ ...p, onboardingSeen: true }))}
-      />
-    );
-  }
+  // OnboardingScreen IS the entry/sign-in screen now: shown whenever there's
+  // no signed-in user, with its "Continue with Google" button wired to the
+  // real signIn() from AuthContext. Nothing past this point renders until
+  // `user` is real, so there's no separate SignInScreen step anymore.
+  if (!user) return <OnboardingScreen t={t} dark={dark} onGetStarted={signIn} signingIn={signingIn} />;
 
   function setListItems(listId, updater) {
     setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || []) }));
+  }
+  // Adds an item only if its id isn't already in the list. Cloud items can
+  // arrive twice — once from the direct API response, once from the
+  // "item:created" socket broadcast — and whichever arrives second must be
+  // a no-op instead of a blind append, or React ends up with two list
+  // entries sharing the same key.
+  function addItemIfNew(listId, item) {
+    setListItems(listId, (prev) => (prev.some((i) => i.id === item.id) ? prev : [...prev, item]));
   }
 
   // ---------- List management ----------
@@ -650,12 +674,20 @@ export default function DmartApp() {
     if (err) { setListNameError(err); return; }
     const name = renameDraft.trim();
     const target = lists.find((l) => l.id === renamingListId);
+    if (target?.role && target.role !== "OWNER" && target.role !== "WRITE") {
+      setNotice("You have view-only access to this list.");
+      setRenamingListId(null);
+      return;
+    }
     setLists((prev) => prev.map((l) => (l.id === renamingListId ? { ...l, name } : l)));
     setRenamingListId(null);
     setRenameDraft("");
     setListNameError("");
     if (target?.role) {
-      renameListApi(renamingListId, name).catch((e) => setNotice(`Rename didn't save to the cloud: ${e?.message || "network error"}`));
+      renameListApi(renamingListId, name).catch((e) => {
+        setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
+        setNotice(`Rename didn't save, so it's been undone: ${e?.message || "network error"}`);
+      });
     }
   }
   function deleteList(listId) {
@@ -885,7 +917,10 @@ export default function DmartApp() {
 
   // ---------- Item management ----------
   async function addItem() {
+    console.log("Adding item:", fName, fCategory, fUnit, fPrice);
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (!fName.trim()) return;
+    console.log("Raw input:", fName);
     const rawNames = fName.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 20);
     if (rawNames.length === 0) return;
     const category = (fCategory || "Other").trim() || "Other";
@@ -901,6 +936,7 @@ export default function DmartApp() {
       if (validationErr) { errors.push(validationErr); continue; }
       seenInBatch.push(capped);
       toAdd.push(capped);
+      console.log("Adding item:", capped);
     }
 
     if (toAdd.length === 0) {
@@ -918,7 +954,7 @@ export default function DmartApp() {
       for (const name of toAdd) {
         try {
           const { item } = await createItemApi(selectedListId, { name, category, unit: fUnit, price: fPrice || null });
-          setListItems(selectedListId, (prev) => [...prev, item]);
+          addItemIfNew(selectedListId, item);
         } catch (e) {
           setNotice(`Couldn't add "${name}" to the cloud: ${e?.message || "network error"}`);
         }
@@ -939,17 +975,24 @@ export default function DmartApp() {
   }
 
   function updateItem(id, patch) {
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (patch.qty !== undefined) patch = { ...patch, qty: clampQty(patch.qty) };
     if (patch.price !== undefined) patch = { ...patch, price: clampPrice(patch.price) };
     if (patch.checked !== undefined || patch.skipped !== undefined) animateListChange();
-    setListItems(selectedListId, (prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
-    if (patch.checked !== undefined) bumpActivity(selectedListId);
-    if (selectedList?.role) {
+    const listId = selectedListId;
+    const isCloudList = !!selectedList?.role;
+    const previous = items.find((i) => i.id === id);
+    setListItems(listId, (prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
+    if (patch.checked !== undefined) bumpActivity(listId);
+    if (isCloudList) {
       // Optimistic: local state already updated above for a snappy UI;
       // this just persists it. Other members see it live via the socket.
-      updateItemApi(selectedListId, id, patch).catch((e) =>
-        setNotice(`Change didn't save to the cloud: ${e?.message || "network error"}`)
-      );
+      // If it fails to save, undo the local change instead of leaving
+      // this device permanently out of sync with everyone else's.
+      updateItemApi(listId, id, patch).catch((e) => {
+        if (previous) setListItems(listId, (prev) => prev.map((i) => (i.id === id ? previous : i)));
+        setNotice(`Change didn't save, so it's been undone: ${e?.message || "network error"}`);
+      });
     }
   }
 
@@ -957,6 +1000,7 @@ export default function DmartApp() {
   // server delete only fires once that window closes without an Undo —
   // that's the real point of no return, so it doubles as the sync trigger.
   function deleteItem(item) {
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (pendingDelete) clearTimeout(pendingDelete.timer);
     animateListChange();
     const listId = selectedListId;
@@ -965,9 +1009,12 @@ export default function DmartApp() {
     const timer = setTimeout(() => {
       setPendingDelete(null);
       if (isCloudList) {
-        deleteItemApi(listId, item.id).catch((e) =>
-          setNotice(`Delete didn't sync to the cloud: ${e?.message || "network error"}`)
-        );
+        deleteItemApi(listId, item.id).catch((e) => {
+          // The item never actually left the server — don't let it
+          // silently vanish forever from just this one device.
+          setListItems(listId, (prev) => (prev.some((i) => i.id === item.id) ? prev : [...prev, item]));
+          setNotice(`Delete didn't sync, so "${item.name}" is back: ${e?.message || "network error"}`);
+        });
       }
     }, 5000);
     setPendingDelete({ item, timer });
@@ -1071,13 +1118,28 @@ export default function DmartApp() {
   }
 
 function startNewTrip() {
-  setListItems(selectedListId, (prev) =>
-    prev.map((i) => ({ ...i, checked: false, skipped: false, note: "", qty: 0, price: "" }))
-  );
+  if (!canWrite) { setNotice("You have view-only access to this list."); return; }
+  const listId = selectedListId;
+  const isCloudList = !!selectedList?.role;
+  const resetItems = items.map((i) => ({ ...i, checked: false, skipped: false, note: "", qty: 0, price: "" }));
+  setListItems(listId, () => resetItems);
   setNoteDrafts({});
   setPriceDrafts({});
   setNotice(`Started a new trip for "${selectedList.name}".`);
-  bumpActivity(selectedListId);
+  bumpActivity(listId);
+  if (isCloudList) {
+    // This previously only reset local state — on a shared list, every
+    // other member (and this device, on its next refresh) would still see
+    // the old checked/qty/price/note values, since the server was never
+    // told anything changed.
+    Promise.allSettled(
+      resetItems.map((i) => updateItemApi(listId, i.id, { checked: false, skipped: false, note: "", qty: 0, price: "" }))
+    ).then((results) => {
+      if (results.some((r) => r.status === "rejected")) {
+        setNotice(`"${selectedList.name}" reset locally, but some items didn't sync to the cloud.`);
+      }
+    });
+  }
 }
 // Called from the button — only ever opens the confirmation popup when
 // there's actually something to reset (button is disabled otherwise).
@@ -1098,16 +1160,32 @@ function confirmStartNewTrip() {
   }
 
   // ---------- Master items: quick-add a common item straight into the current list ----------
-  function addMasterItem(mi) {
+  async function addMasterItem(mi) {
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     const dup = items.some((i) => i.name.toLowerCase() === mi.name.toLowerCase());
     if (dup) { setNotice(`"${mi.name}" is already on this list.`); return; }
     animateListChange();
-    setListItems(selectedListId, (prev) => [...prev, {
-      id: makeId("item"), name: mi.name, category: mi.category, qty: 0, unit: mi.unit,
-      price: "", checked: false, skipped: false, note: "", createdAt: Date.now(),
-    }]);
+    const listId = selectedListId;
+    const isCloudList = !!selectedList?.role;
+    if (isCloudList) {
+      // This used to only touch local state, so a quick-added item on a
+      // shared list would vanish for everyone the moment the app next
+      // refetched from the server (which never knew about it).
+      try {
+        const { item } = await createItemApi(listId, { name: mi.name, category: mi.category, unit: mi.unit, price: null });
+        addItemIfNew(listId, item);
+      } catch (e) {
+        setNotice(`Couldn't add "${mi.name}" to the cloud: ${e?.message || "network error"}`);
+        return;
+      }
+    } else {
+      setListItems(listId, (prev) => [...prev, {
+        id: makeId("item"), name: mi.name, category: mi.category, qty: 0, unit: mi.unit,
+        price: "", checked: false, skipped: false, note: "", createdAt: Date.now(),
+      }]);
+    }
     setNotice(`Added "${mi.name}" to ${selectedList ? selectedList.name : "your list"}.`);
-    bumpActivity(selectedListId);
+    bumpActivity(listId);
   }
 
   // ---------- Edit item ----------
@@ -2287,7 +2365,7 @@ function confirmStartNewTrip() {
 // ---------- First-run onboarding ----------
 // Marketing copy below is placeholder — edit the description and feature
 // chips to match your actual app before publishing.
-function OnboardingScreen({ t, dark, onGetStarted }) {
+function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
   const features = [
     { icon: Zap, label: "1-Handed Fast", note: "Quick tap shopping" },
     { icon: Users, label: "Family Sync", note: "Live permissions" },
@@ -2349,27 +2427,25 @@ function OnboardingScreen({ t, dark, onGetStarted }) {
 
         <TouchableOpacity
           onPress={onGetStarted}
+          disabled={signingIn}
           style={{
             marginTop: 30, backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 15,
             flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8,
+            opacity: signingIn ? 0.7 : 1,
           }}
         >
-          <Text style={{ color: "#fff", fontWeight: "800", fontSize: 15 }}>Get Started — It's Free</Text>
-          <ArrowRight size={17} color="#fff" />
+          {signingIn ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <Image source={{ uri: "https://developers.google.com/identity/images/g-logo.png" }} style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: "#fff" }} />
+              <Text style={{ color: "#fff", fontWeight: "800", fontSize: 15 }}>Continue with Google</Text>
+            </>
+          )}
         </TouchableOpacity>
-        <TouchableOpacity
-          onPress={onGetStarted}
-          style={{
-            marginTop: 10, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 14,
-            alignItems: "center", backgroundColor: t.surface,
-          }}
-        >
-          <Text style={{ color: t.text, fontWeight: "700", fontSize: 14 }}>Continue with Google</Text>
-        </TouchableOpacity>
-
         <View style={{ flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 4, marginTop: 16 }}>
           <Star size={12} color={t.accent2} fill={t.accent2} />
-          <Text style={{ fontSize: 11.5, color: t.muted, fontWeight: "600" }}>Free forever · No account required</Text>
+          <Text style={{ fontSize: 11.5, color: t.muted, fontWeight: "600" }}>Synced securely with your Google account</Text>
         </View>
       </ScrollView>
     </SafeAreaView>

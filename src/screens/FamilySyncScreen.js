@@ -12,10 +12,9 @@ import {
 // Sharing model recap (matches the backend):
 //   - A list must first live in the cloud to be shared at all.
 //   - Only the list's OWNER can invite, change roles, or remove people.
-//   - An invite is either scoped to just this list, or (toggle below)
-//     "all my lists" — a standing family-member invite that also covers
-//     every list the owner creates afterwards. That's the better default
-//     for an actual household instead of re-inviting per list.
+//   - An invite is either scoped to just this list (the default), or
+//     (toggle below) "all my lists" — a standing family-member invite that
+//     also covers every list the owner creates afterwards.
 export default function FamilySyncScreen({
   t, s, selectedList, items = [],
   isSignedIn, signingIn, isCloudList, isOwner,
@@ -24,7 +23,13 @@ export default function FamilySyncScreen({
 }) {
   const [inviteEmail, setInviteEmail] = useState("");
   const [invitePerm, setInvitePerm] = useState("READ");
-  const [allLists, setAllLists] = useState(true); // default to "family member", not one-off share
+  // IMPORTANT: default to sharing ONLY this list. "All my lists" hands the
+  // recipient every list you currently own (and every list you create
+  // later) the moment they accept — that mismatch between "I shared one
+  // list" and "they now see all of them" is what was showing up as
+  // confusing duplicate/extra lists on the recipient's side. Only flip
+  // this on when the person explicitly wants a standing family member.
+  const [allLists, setAllLists] = useState(false);
   const [sending, setSending] = useState(false);
 
   async function handleInvite() {
@@ -144,9 +149,13 @@ export default function FamilySyncScreen({
               <View style={[s.toggleThumb, allLists && s.toggleThumbOn]} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={{ color: t.text, fontSize: 12.5, fontWeight: "700" }}>Add as family member</Text>
+              <Text style={{ color: t.text, fontSize: 12.5, fontWeight: "700" }}>
+                {allLists ? "Sharing: all my lists" : "Sharing: just this list"}
+              </Text>
               <Text style={{ color: t.muted, fontSize: 11 }}>
-                {allLists ? "They'll get this list and every list you create later" : "They'll only get this one list"}
+                {allLists
+                  ? `They'll get every list you own now, and any you create later — not just "${selectedList ? selectedList.name : "this list"}"`
+                  : `They'll only get "${selectedList ? selectedList.name : "this list"}" — turn this on to make them a standing family member instead`}
               </Text>
             </View>
           </TouchableOpacity>

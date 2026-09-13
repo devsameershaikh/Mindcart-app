@@ -3,15 +3,47 @@
 // local preferences (theme, currency, reminder settings), while this file
 // owns anything shared with other people — lists, items, and sharing/invites.
 
+import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
-// Set this to your deployed backend URL (Railway/Render), e.g.
-// "https://mindcart-backend.up.railway.app"
-// While developing: Android emulator -> "http://10.0.2.2:4000",
-// iOS simulator -> "http://localhost:4000", physical device -> your
-// computer's LAN IP e.g. "http://192.168.1.23:4000" (must match the
-// backend's PORT in .env, which defaults to 4000).
-export const API_BASE_URL = "http://10.0.2.2:4000";
+// ============================================================
+// BACKEND URL — the #1 reason "nothing works" is this pointing
+// at the wrong place. Fill in the two lines below.
+// ============================================================
+//
+// 1) PROD_API_URL — your deployed backend (Railway/Render/etc), e.g.
+//      "https://mindcart-backend.up.railway.app"
+//    Used automatically for release/production builds.
+//
+// 2) DEV_LAN_IP — required if you're testing on a PHYSICAL phone (not
+//    an emulator/simulator) with a local backend. Set it to your
+//    computer's LAN IP, e.g. "192.168.1.23" (find it with `ipconfig`
+//    on Windows or `ifconfig`/`ipconfig getifaddr en0` on Mac — must
+//    be the same Wi-Fi network as the phone, and must match the
+//    backend's PORT in .env, default 4000).
+//
+// If you leave DEV_LAN_IP blank, dev builds fall back to the emulator
+// loopback addresses below, which do NOT work on a real device:
+//   - Android emulator -> 10.0.2.2 (maps to your computer's localhost)
+//   - iOS simulator     -> localhost (shares your computer's network stack)
+const PROD_API_URL = ""; // e.g. "https://mindcart-backend.up.railway.app"
+const DEV_LAN_IP = ""; // e.g. "192.168.1.23" — required for a physical device
+
+function resolveApiBaseUrl() {
+  if (!__DEV__) {
+    if (!PROD_API_URL) {
+      console.warn(
+        "[api.js] PROD_API_URL is empty in a production build — every request will fail. Set it before publishing."
+      );
+    }
+    return PROD_API_URL || "http://localhost:4000";
+  }
+  if (DEV_LAN_IP) return `http://${DEV_LAN_IP}:4001`;
+  if (Platform.OS === "android") return "http://10.0.2.2:4001"; // Android emulator only
+  return "http://localhost:4000"; // iOS simulator only
+}
+
+export const API_BASE_URL = resolveApiBaseUrl();
 const TOKEN_KEY = "mindcart_session_token_v1";
 
 let cachedToken = null;
@@ -34,11 +66,21 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     const token = await getToken();
     if (token) headers.Authorization = `Bearer ${token}`;
   }
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (networkError) {
+    // RN's fetch throws a generic "Network request failed" for anything
+    // from "server not running" to "wrong IP for this device" — surface
+    // the URL it tried so it's obvious what to fix.
+    throw new Error(
+      `Couldn't reach the backend at ${API_BASE_URL} — check it's running and that this device can reach that address (see the comment at the top of src/utils/api.js).`
+    );
+  }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);

@@ -34,7 +34,7 @@ export const useAuth = () => useContext(AuthContext);
 // This must be your Google OAuth "Web application" client ID.
 // Do NOT use the Android client ID here.
 const GOOGLE_WEB_CLIENT_ID =
-  "861993628635-m0elkbft86hq83ejupcu6vm14cpc1034.apps.googleusercontent.com";
+  "861993628635-m0elkbfssssssjupcu6vm14cpc1034.apps.googleusercontent.com";
 
 // Configure Google Sign-In once.
 GoogleSignin.configure({

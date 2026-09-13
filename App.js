@@ -183,6 +183,15 @@ function CurrencyGlyph({ symbol, color, size = 12 }) {
   return <Text style={{ color, fontSize: size, fontWeight: "800" }}>{symbol}</Text>;
 }
 
+// Converts an items array into the { itemId: item } map shape used by
+// itemsByList. Used for the local-storage migration and anywhere a batch
+// of items (e.g. from the server) needs folding into that map at once.
+function arrayToItemMap(arr) {
+  const map = {};
+  for (const it of arr) map[it.id] = it;
+  return map;
+}
+
 // A checkbox that gives a small satisfying "pop" (scale bounce) + a light
 // haptic tap whenever it's toggled, instead of just flipping state instantly.
 function AnimatedCheckbox({ checked, onPress, style }) {
@@ -319,17 +328,49 @@ export default function DmartApp() {
       try {
         const { lists: cloudLists } = await fetchLists();
         if (cancelled) return;
+        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+        let legacyLocal = [];
         setLists((prev) => {
-          const localOnly = prev.filter((l) => !l.role);
+          legacyLocal = prev.filter((l) => !l.role && !cloudIds.has(l.id));
           const cloudAsLocal = cloudLists.map((cl) => ({
             id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
             createdAt: new Date(cl.createdAt).getTime(),
           }));
-          return [...cloudAsLocal, ...localOnly];
+          // Promote in place (same id, so nothing about the list's
+          // identity or its items changes) rather than waiting for the
+          // user to hit a manual "make shareable" button.
+          const promoted = legacyLocal.map((l) => ({ ...l, role: "OWNER" }));
+          return [...cloudAsLocal, ...promoted];
         });
+        // One-time migration for lists created before every list was
+        // cloud-first: push the list and its existing items to Neon under
+        // their current ids. This MUST create the list and wait for that
+        // to resolve (success or queued-offline, both fine) before
+        // touching its items — firing them in parallel let an item POST
+        // reach the server before its list's POST did, which the server
+        // correctly rejects with 404 since the list didn't exist yet.
+        for (const l of legacyLocal) {
+          try {
+            await createListApi(l.id, l.name);
+          } catch (e) {
+            setNotice(`Couldn't move "${l.name}" to the cloud: ${e?.message || "unknown error"}`);
+            continue; // don't attempt its items against a list that never landed
+          }
+          const existingItems = Object.values(itemsByList[l.id] || {});
+          for (const it of existingItems) {
+            try {
+              await createItemApi(l.id, { id: it.id, name: it.name, category: it.category, unit: it.unit, price: it.price || null });
+              if (it.checked || it.skipped || it.qty || it.note) {
+                await updateItemApi(l.id, it.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
+              }
+            } catch (e) {
+              setNotice(`Couldn't sync "${it.name}" from "${l.name}": ${e?.message || "unknown error"}`);
+            }
+          }
+        }
         setItemsByList((prev) => {
           const next = { ...prev };
-          for (const cl of cloudLists) next[cl.id] = cl.items;
+          for (const cl of cloudLists) next[cl.id] = arrayToItemMap(cl.items);
           return next;
         });
         setCloudMembersByList((prev) => {
@@ -368,7 +409,7 @@ export default function DmartApp() {
           const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime() }));
           return [...cloudAsLocal, ...localOnly];
         });
-        setItemsByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.items; return next; });
+        setItemsByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = arrayToItemMap(cl.items); return next; });
         setCloudMembersByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.members; return next; });
         cloudLists.forEach((cl) => joinListRoom(cl.id));
         setNotice("Invite accepted — the list is now in your list switcher.");
@@ -391,12 +432,13 @@ export default function DmartApp() {
     const socket = getSocket();
     if (!socket) return;
 
-    const onItemCreated = ({ listId, item }) =>
-      setItemsByList((prev) => (prev[listId]?.some((i) => i.id === item.id) ? prev : { ...prev, [listId]: [...(prev[listId] || []), item] }));
-    const onItemUpdated = ({ listId, item }) =>
-      setItemsByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).map((i) => (i.id === item.id ? item : i)) }));
-    const onItemDeleted = ({ listId, itemId }) =>
-      setItemsByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((i) => i.id !== itemId) }));
+    // All three of these are id-keyed map operations now, so it doesn't
+    // matter whether this socket event arrives before or after the local
+    // optimistic update for the same change — upserting/removing by id is
+    // idempotent either way.
+    const onItemCreated = ({ listId, item }) => upsertItem(listId, item);
+    const onItemUpdated = ({ listId, item }) => upsertItem(listId, item);
+    const onItemDeleted = ({ listId, itemId }) => removeItemFromList(listId, itemId);
     const onListUpdated = ({ listId, name }) =>
       setLists((prev) => prev.map((l) => (l.id === listId ? { ...l, name } : l)));
     const onListDeleted = ({ listId }) => {
@@ -460,7 +502,18 @@ export default function DmartApp() {
       setDark(state.theme !== "light");
       setLists(state.lists);
       setSelectedListId(state.selectedListId);
-      setItemsByList(state.itemsByList);
+      // One-time migration: itemsByList used to store `listId -> item[]`.
+      // It's now `listId -> { itemId: item }`. Anyone with existing local
+      // data would otherwise get `Object.values`/map ops on an array,
+      // which happens to work by accident for reads but breaks writes —
+      // so convert once on load and never touch this shape again.
+      const rawItemsByList = state.itemsByList || {};
+      const migrated = {};
+      for (const listId of Object.keys(rawItemsByList)) {
+        const value = rawItemsByList[listId];
+        migrated[listId] = Array.isArray(value) ? arrayToItemMap(value) : value;
+      }
+      setItemsByList(migrated);
       setCategories(state.categories);
       setAppLoaded(true);
     })();
@@ -479,7 +532,7 @@ export default function DmartApp() {
         itemsByList,
         categories,
         preferences: {},
-      });
+      })  
     }, 250);
     return () => clearTimeout(timer);
     // eslint-disable-next-line
@@ -552,20 +605,19 @@ export default function DmartApp() {
   // `if (!appLoaded)` early return — hooks can't be called conditionally,
   // and useMemo is a hook, so it has to run on every render regardless of
   // whether the loader is about to be shown instead.
-  // Safety net: even with the id-checks in addItemIfNew/onItemCreated/etc.,
-  // this guarantees no two rows ever render with the same key, no matter
-  // which sync path (local, API response, socket broadcast) a duplicate
-  // might slip in from.
+  //
+  // ---------- Items storage: a map keyed by id, per list ----------
+  // itemsByList[listId] is { [itemId]: item }, NOT an array. A map can't
+  // hold two entries under the same key, so "the same item got added
+  // twice" (from a REST response and a socket broadcast both trying to
+  // add it) becomes structurally impossible instead of something every
+  // call site has to remember to guard against.
+  // `items` (below) is the sorted array view used everywhere else in the
+  // component — nothing downstream of `items` needs to know storage is a
+  // map at all.
   const items = useMemo(() => {
-    const raw = itemsByList[selectedListId] || [];
-    const seen = new Set();
-    const deduped = [];
-    for (const it of raw) {
-      if (seen.has(it.id)) continue;
-      seen.add(it.id);
-      deduped.push(it);
-    }
-    return deduped;
+    const map = itemsByList[selectedListId] || {};
+    return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }, [itemsByList, selectedListId]);
   const selectedList = lists.find((l) => l.id === selectedListId) || lists[0];
   // A READ-only collaborator could otherwise tap every add/check/edit/delete
@@ -613,16 +665,44 @@ export default function DmartApp() {
   // `user` is real, so there's no separate SignInScreen step anymore.
   if (!user) return <OnboardingScreen t={t} dark={dark} onGetStarted={signIn} signingIn={signingIn} />;
 
+  // setListItems' updater now receives/returns the { itemId: item } map for
+  // this list, not an array. upsertItem/removeItemFromList/patchItem below
+  // are the only primitives the rest of the component should need — every
+  // one of them is safe to call twice with the same item/id, which is the
+  // whole point (REST responses and socket broadcasts can both fire for
+  // the same change, in either order).
   function setListItems(listId, updater) {
-    setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || []) }));
+    setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || {}) }));
   }
-  // Adds an item only if its id isn't already in the list. Cloud items can
-  // arrive twice — once from the direct API response, once from the
-  // "item:created" socket broadcast — and whichever arrives second must be
-  // a no-op instead of a blind append, or React ends up with two list
-  // entries sharing the same key.
-  function addItemIfNew(listId, item) {
-    setListItems(listId, (prev) => (prev.some((i) => i.id === item.id) ? prev : [...prev, item]));
+  function upsertItem(listId, item) {
+    setListItems(listId, (map) => ({ ...map, [item.id]: item }));
+  }
+  function upsertItems(listId, itemsArr) {
+    setListItems(listId, (map) => ({ ...map, ...arrayToItemMap(itemsArr) }));
+  }
+  function removeItemFromList(listId, itemId) {
+    setListItems(listId, (map) => {
+      if (!(itemId in map)) return map;
+      const next = { ...map };
+      delete next[itemId];
+      return next;
+    });
+  }
+  function patchItem(listId, itemId, patch) {
+    setListItems(listId, (map) => (map[itemId] ? { ...map, [itemId]: { ...map[itemId], ...patch } } : map));
+  }
+  // Replaces a locally-generated optimistic id with the server's
+  // authoritative item once the create request resolves. If the backend
+  // happens to honor the client-supplied id, oldId === newItem.id and this
+  // is just a plain upsert; if the backend generates its own id instead,
+  // this still leaves exactly one copy of the item under the right key.
+  function reconcileOptimisticItem(listId, oldId, newItem) {
+    setListItems(listId, (map) => {
+      const next = { ...map };
+      delete next[oldId];
+      next[newItem.id] = newItem;
+      return next;
+    });
   }
 
   // ---------- List management ----------
@@ -637,27 +717,27 @@ export default function DmartApp() {
     if (err) return;
     const name = newListName.trim();
 
-    // Signed in -> this list lives in Neon from the start, so it can be
-    // shared immediately. Signed out -> exactly the old local-only flow.
-    let id, role, createdAt;
-    if (user) {
-      try {
-        const { list } = await createListApi(name);
-        id = list.id; role = "OWNER"; createdAt = Date.now();
-      } catch (e) {
-        setListNameError(e?.message || "Couldn't create list in the cloud.");
-        return;
-      }
-    } else {
-      id = makeId("list"); createdAt = Date.now();
+    // Every list is a cloud list from creation now, under a permanent
+    // client-generated id (see makeId/storage.js). createListApi tries
+    // the network immediately; if there's no connection it queues the
+    // create instead of failing, so this succeeds either way — the list
+    // just shows as `pending` until the queue flushes and the real
+    // server copy comes back over the socket.
+    const id = makeId("list");
+    const createdAt = Date.now();
+    let queued = false;
+    try {
+      const result = await createListApi(id, name);
+      queued = !!result.queued;
+    } catch (e) {
+      setListNameError(e?.message || "Couldn't create this list.");
+      return;
     }
 
-    setLists((prev) => [...prev, { id, name, role, createdAt, lastActivityAt: Date.now() }]);
-    setItemsByList((prev) => ({ ...prev, [id]: [] }));
-    if (role) {
-      setCloudMembersByList((prev) => ({ ...prev, [id]: [{ ...user, role: "OWNER" }] }));
-      joinListRoom(id);
-    }
+    setLists((prev) => [...prev, { id, name, role: "OWNER", createdAt, lastActivityAt: Date.now(), pending: queued }]);
+    setItemsByList((prev) => ({ ...prev, [id]: {} }));
+    setCloudMembersByList((prev) => ({ ...prev, [id]: [{ ...user, role: "OWNER" }] }));
+    joinListRoom(id);
     setSelectedListId(id);
     setNewListName("");
     setListNameError("");
@@ -683,12 +763,10 @@ export default function DmartApp() {
     setRenamingListId(null);
     setRenameDraft("");
     setListNameError("");
-    if (target?.role) {
-      renameListApi(renamingListId, name).catch((e) => {
-        setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
-        setNotice(`Rename didn't save, so it's been undone: ${e?.message || "network error"}`);
-      });
-    }
+    renameListApi(renamingListId, name).catch((e) => {
+      setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
+      setNotice(`Rename didn't save, so it's been undone: ${e?.message || "network error"}`);
+    });
   }
   function deleteList(listId) {
     if (lists.length <= 1) {
@@ -703,35 +781,32 @@ export default function DmartApp() {
     setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
     if (selectedListId === listId) setSelectedListId(remaining[0].id);
     setConfirmDeleteListId(null);
-    if (removed?.role) {
-      deleteListApi(listId).catch((e) => setNotice(`Delete didn't sync to the cloud: ${e?.message || "network error"}`));
-    }
+    deleteListApi(listId).catch((e) => setNotice(`Delete didn't sync: ${e?.message || "network error"}`));
   }
 
   // ---------- Family sharing ----------
-  // A local-only list has to move to the cloud before it can be shared —
-  // this creates it on the server, re-creates its items there, then swaps
-  // the local entry for the cloud one (same name, new ids under the hood).
+  // Every list gets created in the cloud from the start now (see addList),
+  // so in normal use this never has anything to do. It only matters for
+  // lists that predate this change and are still sitting around without a
+  // `role` (the mount-time migration below promotes those automatically,
+  // but this is a manual fallback for the same case). Since the list and
+  // its items already own their permanent ids, this just pushes the
+  // EXISTING ids to the server — no more re-creating everything under new
+  // ids, which is also what makes it safe to retry if it's interrupted.
   async function makeListShareable(list) {
     if (!user) { signIn(); return; }
     try {
-      const { list: cloudList } = await createListApi(list.name);
-      const existing = itemsByList[list.id] || [];
-      const newItems = [];
+      await createListApi(list.id, list.name);
+      const existing = Object.values(itemsByList[list.id] || {});
       for (const it of existing) {
-        const { item } = await createItemApi(cloudList.id, { name: it.name, category: it.category, unit: it.unit, price: it.price || null });
+        await createItemApi(list.id, { id: it.id, name: it.name, category: it.category, unit: it.unit, price: it.price || null });
         if (it.checked || it.skipped || it.qty || it.note) {
-          await updateItemApi(cloudList.id, item.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
-          newItems.push({ ...item, checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
-        } else {
-          newItems.push(item);
+          await updateItemApi(list.id, it.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
         }
       }
-      setLists((prev) => [{ id: cloudList.id, name: cloudList.name, role: "OWNER", createdAt: Date.now() }, ...prev.filter((l) => l.id !== list.id)]);
-      setItemsByList((prev) => { const next = { ...prev }; delete next[list.id]; next[cloudList.id] = newItems; return next; });
-      setCloudMembersByList((prev) => ({ ...prev, [cloudList.id]: [{ id: user.id, name: user.name, email: user.email, avatarUrl: user.avatarUrl, role: "OWNER" }] }));
-      setSelectedListId(cloudList.id);
-      joinListRoom(cloudList.id);
+      setLists((prev) => prev.map((l) => (l.id === list.id ? { ...l, role: "OWNER" } : l)));
+      setCloudMembersByList((prev) => ({ ...prev, [list.id]: [{ id: user.id, name: user.name, email: user.email, avatarUrl: user.avatarUrl, role: "OWNER" }] }));
+      joinListRoom(list.id);
       setNotice(`"${list.name}" is now shareable.`);
     } catch (e) {
       setNotice(`Couldn't move this list to the cloud: ${e?.message || "network error"}`);
@@ -945,26 +1020,51 @@ export default function DmartApp() {
     }
     setItemNameError("");
 
-    const isCloudList = !!selectedList?.role;
     animateListChange();
 
-    if (isCloudList) {
-      // Awaited so the item carries its real server id from the start —
-      // simpler than reconciling a temp local id with the server's later.
-      for (const name of toAdd) {
-        try {
-          const { item } = await createItemApi(selectedListId, { name, category, unit: fUnit, price: fPrice || null });
-          addItemIfNew(selectedListId, item);
-        } catch (e) {
-          setNotice(`Couldn't add "${name}" to the cloud: ${e?.message || "network error"}`);
+    // Optimistic: show the item immediately under its permanent,
+    // client-generated id (this is the SAME id the server will store it
+    // under, online or not — see makeId/storage.js). createItemApi tries
+    // the network right away; if that fails only because there's no
+    // connection, it queues the write and resolves anyway (queued: true)
+    // instead of throwing, so the item just stays on screen marked
+    // `pending` until the real server copy arrives over the socket once
+    // the queue flushes. A genuine failure (bad request, no permission)
+    // still throws and gets rolled back below.
+    for (const name of toAdd) {
+      const id = makeId("item");
+      upsertItem(selectedListId, {
+        id, name, category, qty: 0, unit: fUnit, price: fPrice || "",
+        checked: false, skipped: false, note: "", createdAt: Date.now(), pending: true,
+      });
+      try {
+        const { item, queued } = await createItemApi(selectedListId, { id, name, category, unit: fUnit, price: fPrice || null });
+        // reconcileOptimisticItem (not upsertItem): if the server ever
+        // returns a different id than the one we optimistically rendered
+        // under, this removes the stale local-id copy instead of leaving
+        // two entries on screen for one saved row.
+        if (!queued) reconcileOptimisticItem(selectedListId, id, item); // clears pending; if queued it stays pending until the socket confirms it later
+      } catch (e) {
+        if (e?.status === 404) {
+          // The list looks synced locally (it has a role) but doesn't
+          // actually exist on the server — most likely an earlier create
+          // for the list itself never landed. Recreating is a safe no-op
+          // if it already exists (the backend treats a repeat id as
+          // success), so just retry once instead of dropping the item.
+          try {
+            await createListApi(selectedListId, selectedList.name);
+            const { item, queued } = await createItemApi(selectedListId, { id, name, category, unit: fUnit, price: fPrice || null });
+            if (!queued) reconcileOptimisticItem(selectedListId, id, item);
+            continue;
+          } catch (e2) {
+            removeItemFromList(selectedListId, id);
+            setNotice(`Couldn't add "${name}": ${e2?.message || "something went wrong"}`);
+            continue;
+          }
         }
+        removeItemFromList(selectedListId, id);
+        setNotice(`Couldn't add "${name}": ${e?.message || "something went wrong"}`);
       }
-    } else {
-      const newItems = toAdd.map((name) => ({
-        id: makeId("item"), name, category, qty: 0, unit: fUnit, price: fPrice || "",
-        checked: false, skipped: false, note: "", createdAt: Date.now(),
-      }));
-      setListItems(selectedListId, (prev) => [...prev, ...newItems]);
     }
 
     setFName("");
@@ -980,20 +1080,19 @@ export default function DmartApp() {
     if (patch.price !== undefined) patch = { ...patch, price: clampPrice(patch.price) };
     if (patch.checked !== undefined || patch.skipped !== undefined) animateListChange();
     const listId = selectedListId;
-    const isCloudList = !!selectedList?.role;
     const previous = items.find((i) => i.id === id);
-    setListItems(listId, (prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
+    patchItem(listId, id, patch);
     if (patch.checked !== undefined) bumpActivity(listId);
-    if (isCloudList) {
-      // Optimistic: local state already updated above for a snappy UI;
-      // this just persists it. Other members see it live via the socket.
-      // If it fails to save, undo the local change instead of leaving
-      // this device permanently out of sync with everyone else's.
-      updateItemApi(listId, id, patch).catch((e) => {
-        if (previous) setListItems(listId, (prev) => prev.map((i) => (i.id === id ? previous : i)));
-        setNotice(`Change didn't save, so it's been undone: ${e?.message || "network error"}`);
-      });
-    }
+    // Optimistic: local state already updated above for a snappy UI; this
+    // just persists it. Other members see it live via the socket once it
+    // actually reaches the server. If offline, api.js queues this instead
+    // of rejecting — nothing to undo. A real failure (not a connectivity
+    // one) still undoes the local change so this device doesn't silently
+    // drift from what's actually saved.
+    updateItemApi(listId, id, patch).catch((e) => {
+      if (previous) upsertItem(listId, previous);
+      setNotice(`Change didn't save, so it's been undone: ${e?.message || "network error"}`);
+    });
   }
 
   // optimistic delete with a 5s "Undo" window. For cloud lists the actual
@@ -1004,18 +1103,17 @@ export default function DmartApp() {
     if (pendingDelete) clearTimeout(pendingDelete.timer);
     animateListChange();
     const listId = selectedListId;
-    const isCloudList = !!selectedList?.role;
-    setListItems(listId, (prev) => prev.filter((i) => i.id !== item.id));
+    removeItemFromList(listId, item.id);
     const timer = setTimeout(() => {
       setPendingDelete(null);
-      if (isCloudList) {
-        deleteItemApi(listId, item.id).catch((e) => {
-          // The item never actually left the server — don't let it
-          // silently vanish forever from just this one device.
-          setListItems(listId, (prev) => (prev.some((i) => i.id === item.id) ? prev : [...prev, item]));
-          setNotice(`Delete didn't sync, so "${item.name}" is back: ${e?.message || "network error"}`);
-        });
-      }
+      deleteItemApi(listId, item.id).catch((e) => {
+        // A real (non-connectivity) failure — the item never actually
+        // left the server, so don't let it silently vanish forever from
+        // just this one device. An offline delete queues instead of
+        // rejecting, so this branch is only for genuine errors.
+        upsertItem(listId, item);
+        setNotice(`Delete didn't sync, so "${item.name}" is back: ${e?.message || "network error"}`);
+      });
     }, 5000);
     setPendingDelete({ item, timer });
   }
@@ -1023,9 +1121,10 @@ export default function DmartApp() {
     if (!pendingDelete) return;
     clearTimeout(pendingDelete.timer);
     animateListChange();
-    setListItems(selectedListId, (prev) => [...prev, pendingDelete.item]);
+    upsertItem(selectedListId, pendingDelete.item);
     setPendingDelete(null);
   }
+
 
   function toggleCollapse(cat) { setCollapsed((p) => ({ ...p, [cat]: !p[cat] })); }
 
@@ -1122,7 +1221,7 @@ function startNewTrip() {
   const listId = selectedListId;
   const isCloudList = !!selectedList?.role;
   const resetItems = items.map((i) => ({ ...i, checked: false, skipped: false, note: "", qty: 0, price: "" }));
-  setListItems(listId, () => resetItems);
+  setListItems(listId, () => arrayToItemMap(resetItems));
   setNoteDrafts({});
   setPriceDrafts({});
   setNotice(`Started a new trip for "${selectedList.name}".`);
@@ -1166,27 +1265,36 @@ function confirmStartNewTrip() {
     if (dup) { setNotice(`"${mi.name}" is already on this list.`); return; }
     animateListChange();
     const listId = selectedListId;
-    const isCloudList = !!selectedList?.role;
-    if (isCloudList) {
-      // This used to only touch local state, so a quick-added item on a
-      // shared list would vanish for everyone the moment the app next
-      // refetched from the server (which never knew about it).
-      try {
-        const { item } = await createItemApi(listId, { name: mi.name, category: mi.category, unit: mi.unit, price: null });
-        addItemIfNew(listId, item);
-      } catch (e) {
-        setNotice(`Couldn't add "${mi.name}" to the cloud: ${e?.message || "network error"}`);
-        return;
+    const id = makeId("item");
+    upsertItem(listId, {
+      id, name: mi.name, category: mi.category, qty: 0, unit: mi.unit,
+      price: "", checked: false, skipped: false, note: "", createdAt: Date.now(), pending: true,
+    });
+    try {
+      const { item, queued } = await createItemApi(listId, { id, name: mi.name, category: mi.category, unit: mi.unit, price: null });
+      if (!queued) reconcileOptimisticItem(listId, id, item);
+    } catch (e) {
+      if (e?.status === 404) {
+        try {
+          await createListApi(listId, selectedList.name);
+          const { item, queued } = await createItemApi(listId, { id, name: mi.name, category: mi.category, unit: mi.unit, price: null });
+          if (!queued) reconcileOptimisticItem(listId, id, item);
+          setNotice(`Added "${mi.name}" to ${selectedList ? selectedList.name : "your list"}.`);
+          return;
+        } catch (e2) {
+          removeItemFromList(listId, id);
+          setNotice(`Couldn't add "${mi.name}": ${e2?.message || "something went wrong"}`);
+          return;
+        }
       }
-    } else {
-      setListItems(listId, (prev) => [...prev, {
-        id: makeId("item"), name: mi.name, category: mi.category, qty: 0, unit: mi.unit,
-        price: "", checked: false, skipped: false, note: "", createdAt: Date.now(),
-      }]);
+      removeItemFromList(listId, id);
+      setNotice(`Couldn't add "${mi.name}": ${e?.message || "something went wrong"}`);
+      return;
     }
     setNotice(`Added "${mi.name}" to ${selectedList ? selectedList.name : "your list"}.`);
     bumpActivity(listId);
   }
+
 
   // ---------- Edit item ----------
   function startEditItem(item) {
@@ -1836,7 +1944,7 @@ function confirmStartNewTrip() {
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
                       <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
                         <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
-                        <Text style={{ fontSize: 11.5, color: t.muted }}>{(itemsByList[list.id] || []).length} items</Text>
+                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
                       </TouchableOpacity>
                       <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
                       <TouchableOpacity onPress={() => setConfirmDeleteListId(list.id)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>

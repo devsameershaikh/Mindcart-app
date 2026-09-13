@@ -7,7 +7,11 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 // Set this to your deployed backend URL (Railway/Render), e.g.
 // "https://mindcart-backend.up.railway.app"
-export const API_BASE_URL = "http://10.0.2.2:4001";
+// While developing: Android emulator -> "http://10.0.2.2:4000",
+// iOS simulator -> "http://localhost:4000", physical device -> your
+// computer's LAN IP e.g. "http://192.168.1.23:4000" (must match the
+// backend's PORT in .env, which defaults to 4000).
+export const API_BASE_URL = "http://10.0.2.2:4000";
 const TOKEN_KEY = "mindcart_session_token_v1";
 
 let cachedToken = null;

@@ -41,11 +41,23 @@ import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
 import SimpleSelect from "./src/components/Simpleselect";
 import FamilySyncScreen from "./src/screens/FamilySyncScreen";
+import { useAuth } from "./src/context/AuthContext";
+import {
+  fetchLists, createList as createListApi, renameList as renameListApi, deleteListApi,
+  createItem as createItemApi, updateItemApi, deleteItemApi,
+  sendInvite, fetchInvites, acceptInvite, declineInvite, revokeInvite,
+  changeMemberRole as changeMemberRoleApi, removeMember as removeMemberApi,
+} from "./src/utils/api";
+import { getSocket, joinListRoom } from "./src/utils/socket";
 
 // This app is local-first: everything lives in on-device storage (see
-// storage.js). There is no login, no backend, and no network calls for
-// list/item data. storage.js is the single seam where cloud sync could be
-// added later without touching the rest of this file.
+// storage.js) by default, so it works fully offline with no account.
+// Signing in with Google (AuthContext) additionally syncs specific lists to
+// the MindCart backend (Neon Postgres via Prisma) so they can be shared with
+// family and stay live across devices. A list is a "cloud list" once it has
+// a `role` field on it (OWNER/WRITE/READ, set when it's fetched from or
+// created on the server) — local-only lists never get that field and are
+// never sent anywhere.
 
 // ---------- Currency ----------
 // Symbol-only: picking a currency just changes the label shown next to
@@ -287,6 +299,147 @@ export default function DmartApp() {
   const [termsModalOpen, setTermsModalOpen] = useState(false);
   const [confirmNewTripOpen, setConfirmNewTripOpen] = useState(false);
 
+  // ---------- Cloud sync (Google sign-in + Neon backend) ----------
+  const { user, authLoading, signingIn, signIn, signOut } = useAuth();
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [cloudMembersByList, setCloudMembersByList] = useState({}); // listId -> members[] (from GET /lists)
+  const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
+  const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
+  const [respondingInviteId, setRespondingInviteId] = useState(null);
+
+  // Pull down every list this account owns or has been shared into, once
+  // right after sign-in. Cloud lists are merged in alongside any local-only
+  // lists (kept exactly as they were, untouched) rather than replacing them.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    (async () => {
+      setCloudSyncing(true);
+      try {
+        const { lists: cloudLists } = await fetchLists();
+        if (cancelled) return;
+        setLists((prev) => {
+          const localOnly = prev.filter((l) => !l.role);
+          const cloudAsLocal = cloudLists.map((cl) => ({
+            id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
+            createdAt: new Date(cl.createdAt).getTime(),
+          }));
+          return [...cloudAsLocal, ...localOnly];
+        });
+        setItemsByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) next[cl.id] = cl.items;
+          return next;
+        });
+        setCloudMembersByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) next[cl.id] = cl.members;
+          return next;
+        });
+        // If nothing is selected yet (or the only thing selected was the
+        // placeholder local default list) and cloud lists exist, land on one.
+        if (cloudLists.length) {
+          setSelectedListId((cur) => (cur ? cur : cloudLists[0].id));
+        }
+      } catch (e) {
+        setNotice(`Couldn't load your cloud lists: ${e?.message || "network error"}`);
+      } finally {
+        if (!cancelled) setCloudSyncing(false);
+      }
+      try {
+        const { received } = await fetchInvites();
+        if (!cancelled) setReceivedInvites(received);
+      } catch { /* non-fatal — the invite banner just stays empty */ }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
+  // Accept/decline an invite someone sent *to* me. Accepting immediately
+  // pulls the newly-shared list(s) so they show up without a manual refresh.
+  async function respondToInvite(invite, accept) {
+    setRespondingInviteId(invite.id);
+    try {
+      if (accept) {
+        await acceptInvite(invite.id);
+        const { lists: cloudLists } = await fetchLists();
+        setLists((prev) => {
+          const localOnly = prev.filter((l) => !l.role);
+          const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime() }));
+          return [...cloudAsLocal, ...localOnly];
+        });
+        setItemsByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.items; return next; });
+        setCloudMembersByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.members; return next; });
+        cloudLists.forEach((cl) => joinListRoom(cl.id));
+        setNotice("Invite accepted — the list is now in your list switcher.");
+      } else {
+        await declineInvite(invite.id);
+      }
+      setReceivedInvites((prev) => prev.filter((i) => i.id !== invite.id));
+    } catch (e) {
+      setNotice(`Couldn't ${accept ? "accept" : "decline"} that invite: ${e?.message || "network error"}`);
+    } finally {
+      setRespondingInviteId(null);
+    }
+  }
+
+  // Live updates: keep every open device in sync while signed in. Socket
+  // connection itself is opened/closed by AuthContext on sign-in/out — this
+  // effect only (un)subscribes the listeners while it's live.
+  useEffect(() => {
+    if (!user) return;
+    const socket = getSocket();
+    if (!socket) return;
+
+    const onItemCreated = ({ listId, item }) =>
+      setItemsByList((prev) => (prev[listId]?.some((i) => i.id === item.id) ? prev : { ...prev, [listId]: [...(prev[listId] || []), item] }));
+    const onItemUpdated = ({ listId, item }) =>
+      setItemsByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).map((i) => (i.id === item.id ? item : i)) }));
+    const onItemDeleted = ({ listId, itemId }) =>
+      setItemsByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((i) => i.id !== itemId) }));
+    const onListUpdated = ({ listId, name }) =>
+      setLists((prev) => prev.map((l) => (l.id === listId ? { ...l, name } : l)));
+    const onListDeleted = ({ listId }) => {
+      setLists((prev) => prev.filter((l) => l.id !== listId));
+      setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+      setSelectedListId((cur) => (cur === listId ? null : cur));
+    };
+    const onMemberChange = () => {
+      // Cheapest correct way to keep member lists (roles, who's on the
+      // list) fresh after a join/leave/role-change without hand-rolling
+      // three separate partial-update shapes.
+      fetchLists().then(({ lists: cloudLists }) => {
+        setCloudMembersByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) next[cl.id] = cl.members;
+          return next;
+        });
+      }).catch(() => {});
+    };
+
+    socket.on("item:created", onItemCreated);
+    socket.on("item:updated", onItemUpdated);
+    socket.on("item:deleted", onItemDeleted);
+    socket.on("list:updated", onListUpdated);
+    socket.on("list:deleted", onListDeleted);
+    socket.on("list:memberJoined", onMemberChange);
+    socket.on("list:memberRemoved", onMemberChange);
+    socket.on("list:memberRoleChanged", onMemberChange);
+    const onInviteReceived = ({ invite }) => setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
+    socket.on("invite:received", onInviteReceived);
+
+    return () => {
+      socket.off("item:created", onItemCreated);
+      socket.off("item:updated", onItemUpdated);
+      socket.off("item:deleted", onItemDeleted);
+      socket.off("list:updated", onListUpdated);
+      socket.off("list:deleted", onListDeleted);
+      socket.off("list:memberJoined", onMemberChange);
+      socket.off("list:memberRemoved", onMemberChange);
+      socket.off("list:memberRoleChanged", onMemberChange);
+      socket.off("invite:received", onInviteReceived);
+    };
+  }, [user]);
+
   // Android 8+ silently drops scheduled notifications without a channel —
   // this only needs to run once, it's a no-op / ignored on iOS.
   useEffect(() => {
@@ -342,6 +495,13 @@ export default function DmartApp() {
     setSearch("");
     setDebouncedSearch("");
   }, [selectedListId]);
+
+  // Refresh pending invites for a list right when its Family tab is opened,
+  // rather than polling constantly in the background.
+  useEffect(() => {
+    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
+    // eslint-disable-next-line
+  }, [tab, selectedList?.id]);
 
   // clear any pending "undo delete" timer on unmount
   useEffect(() => {
@@ -447,18 +607,38 @@ export default function DmartApp() {
     setListNameError("");
     setNewListModalOpen(true);
   }
-  function addList() {
+  async function addList() {
     const err = validateListName(newListName, lists);
     setListNameError(err);
     if (err) return;
-    const id = makeId("list");
-    setLists((prev) => [...prev, { id, name: newListName.trim(), createdAt: Date.now(), lastActivityAt: Date.now() }]);
+    const name = newListName.trim();
+
+    // Signed in -> this list lives in Neon from the start, so it can be
+    // shared immediately. Signed out -> exactly the old local-only flow.
+    let id, role, createdAt;
+    if (user) {
+      try {
+        const { list } = await createListApi(name);
+        id = list.id; role = "OWNER"; createdAt = Date.now();
+      } catch (e) {
+        setListNameError(e?.message || "Couldn't create list in the cloud.");
+        return;
+      }
+    } else {
+      id = makeId("list"); createdAt = Date.now();
+    }
+
+    setLists((prev) => [...prev, { id, name, role, createdAt, lastActivityAt: Date.now() }]);
     setItemsByList((prev) => ({ ...prev, [id]: [] }));
+    if (role) {
+      setCloudMembersByList((prev) => ({ ...prev, [id]: [{ ...user, role: "OWNER" }] }));
+      joinListRoom(id);
+    }
     setSelectedListId(id);
     setNewListName("");
     setListNameError("");
     setNewListModalOpen(false);
-    if (reminderSettings.enabled) scheduleReminderForList({ id, name: newListName.trim() }, Number(reminderSettings.days) || 5);
+    if (reminderSettings.enabled) scheduleReminderForList({ id, name }, Number(reminderSettings.days) || 5);
   }
   function startRenameList(list) {
     setRenamingListId(list.id);
@@ -468,10 +648,15 @@ export default function DmartApp() {
   function commitRenameList() {
     const err = validateListName(renameDraft, lists, renamingListId);
     if (err) { setListNameError(err); return; }
-    setLists((prev) => prev.map((l) => (l.id === renamingListId ? { ...l, name: renameDraft.trim() } : l)));
+    const name = renameDraft.trim();
+    const target = lists.find((l) => l.id === renamingListId);
+    setLists((prev) => prev.map((l) => (l.id === renamingListId ? { ...l, name } : l)));
     setRenamingListId(null);
     setRenameDraft("");
     setListNameError("");
+    if (target?.role) {
+      renameListApi(renamingListId, name).catch((e) => setNotice(`Rename didn't save to the cloud: ${e?.message || "network error"}`));
+    }
   }
   function deleteList(listId) {
     if (lists.length <= 1) {
@@ -486,6 +671,81 @@ export default function DmartApp() {
     setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
     if (selectedListId === listId) setSelectedListId(remaining[0].id);
     setConfirmDeleteListId(null);
+    if (removed?.role) {
+      deleteListApi(listId).catch((e) => setNotice(`Delete didn't sync to the cloud: ${e?.message || "network error"}`));
+    }
+  }
+
+  // ---------- Family sharing ----------
+  // A local-only list has to move to the cloud before it can be shared —
+  // this creates it on the server, re-creates its items there, then swaps
+  // the local entry for the cloud one (same name, new ids under the hood).
+  async function makeListShareable(list) {
+    if (!user) { signIn(); return; }
+    try {
+      const { list: cloudList } = await createListApi(list.name);
+      const existing = itemsByList[list.id] || [];
+      const newItems = [];
+      for (const it of existing) {
+        const { item } = await createItemApi(cloudList.id, { name: it.name, category: it.category, unit: it.unit, price: it.price || null });
+        if (it.checked || it.skipped || it.qty || it.note) {
+          await updateItemApi(cloudList.id, item.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
+          newItems.push({ ...item, checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
+        } else {
+          newItems.push(item);
+        }
+      }
+      setLists((prev) => [{ id: cloudList.id, name: cloudList.name, role: "OWNER", createdAt: Date.now() }, ...prev.filter((l) => l.id !== list.id)]);
+      setItemsByList((prev) => { const next = { ...prev }; delete next[list.id]; next[cloudList.id] = newItems; return next; });
+      setCloudMembersByList((prev) => ({ ...prev, [cloudList.id]: [{ id: user.id, name: user.name, email: user.email, avatarUrl: user.avatarUrl, role: "OWNER" }] }));
+      setSelectedListId(cloudList.id);
+      joinListRoom(cloudList.id);
+      setNotice(`"${list.name}" is now shareable.`);
+    } catch (e) {
+      setNotice(`Couldn't move this list to the cloud: ${e?.message || "network error"}`);
+    }
+  }
+
+  async function refreshInvitesForList(listId) {
+    try {
+      const { sent } = await fetchInvites();
+      const mine = sent.filter((inv) => inv.status === "PENDING" && (inv.listId === listId || inv.inviteAllLists));
+      setPendingInvitesByList((prev) => ({ ...prev, [listId]: mine }));
+    } catch { /* best-effort — the members list still works without this */ }
+  }
+
+  // role: "READ" | "WRITE". allLists=true invites as a standing family
+  // member across every list the owner has (and will create) instead of
+  // just this one — the better option for an actual household, not just a
+  // one-off shared list.
+  async function inviteFamilyMember(list, { email, role, allLists }) {
+    try {
+      await sendInvite({ recipientEmail: email, role, listId: allLists ? undefined : list.id, allLists: !!allLists });
+      setNotice(allLists ? `Invited ${email} as a family member — they'll get every list you own.` : `Invited ${email} to "${list.name}".`);
+      refreshInvitesForList(list.id);
+    } catch (e) {
+      setNotice(`Invite failed: ${e?.message || "network error"}`);
+    }
+  }
+  async function revokeFamilyInvite(inviteId, listId) {
+    try { await revokeInvite(inviteId); refreshInvitesForList(listId); }
+    catch (e) { setNotice(`Couldn't revoke invite: ${e?.message || "network error"}`); }
+  }
+  async function changeFamilyMemberRole(listId, userId, role) {
+    try {
+      await changeMemberRoleApi(listId, userId, role);
+      setCloudMembersByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).map((m) => (m.id === userId ? { ...m, role } : m)) }));
+    } catch (e) {
+      setNotice(`Couldn't change that member's role: ${e?.message || "network error"}`);
+    }
+  }
+  async function removeFamilyMember(listId, userId) {
+    try {
+      await removeMemberApi(listId, userId);
+      setCloudMembersByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((m) => m.id !== userId) }));
+    } catch (e) {
+      setNotice(`Couldn't remove that member: ${e?.message || "network error"}`);
+    }
   }
   // Budget is stored per-list (like price, as the raw string from the
   // input) so an empty field just means "no budget set" rather than 0.
@@ -624,7 +884,7 @@ export default function DmartApp() {
   }
 
   // ---------- Item management ----------
-  function addItem() {
+  async function addItem() {
     if (!fName.trim()) return;
     const rawNames = fName.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 20);
     if (rawNames.length === 0) return;
@@ -649,20 +909,28 @@ export default function DmartApp() {
     }
     setItemNameError("");
 
-    const newItems = toAdd.map((name) => ({
-      id: makeId("item"),
-      name,
-      category,
-      qty: 0,
-      unit: fUnit,
-      price: fPrice || "",
-      checked: false,
-      skipped: false,
-      note: "",
-      createdAt: Date.now(),
-    }));
+    const isCloudList = !!selectedList?.role;
     animateListChange();
-    setListItems(selectedListId, (prev) => [...prev, ...newItems]);
+
+    if (isCloudList) {
+      // Awaited so the item carries its real server id from the start —
+      // simpler than reconciling a temp local id with the server's later.
+      for (const name of toAdd) {
+        try {
+          const { item } = await createItemApi(selectedListId, { name, category, unit: fUnit, price: fPrice || null });
+          setListItems(selectedListId, (prev) => [...prev, item]);
+        } catch (e) {
+          setNotice(`Couldn't add "${name}" to the cloud: ${e?.message || "network error"}`);
+        }
+      }
+    } else {
+      const newItems = toAdd.map((name) => ({
+        id: makeId("item"), name, category, qty: 0, unit: fUnit, price: fPrice || "",
+        checked: false, skipped: false, note: "", createdAt: Date.now(),
+      }));
+      setListItems(selectedListId, (prev) => [...prev, ...newItems]);
+    }
+
     setFName("");
     setFPrice("");
     setCategoryTouched(false);
@@ -676,14 +944,32 @@ export default function DmartApp() {
     if (patch.checked !== undefined || patch.skipped !== undefined) animateListChange();
     setListItems(selectedListId, (prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
     if (patch.checked !== undefined) bumpActivity(selectedListId);
+    if (selectedList?.role) {
+      // Optimistic: local state already updated above for a snappy UI;
+      // this just persists it. Other members see it live via the socket.
+      updateItemApi(selectedListId, id, patch).catch((e) =>
+        setNotice(`Change didn't save to the cloud: ${e?.message || "network error"}`)
+      );
+    }
   }
 
-  // optimistic delete with a 5s "Undo" window
+  // optimistic delete with a 5s "Undo" window. For cloud lists the actual
+  // server delete only fires once that window closes without an Undo —
+  // that's the real point of no return, so it doubles as the sync trigger.
   function deleteItem(item) {
-    if (pendingDelete) clearTimeout(pendingDelete.timer); 
+    if (pendingDelete) clearTimeout(pendingDelete.timer);
     animateListChange();
-    setListItems(selectedListId, (prev) => prev.filter((i) => i.id !== item.id));
-    const timer = setTimeout(() => setPendingDelete(null), 5000);
+    const listId = selectedListId;
+    const isCloudList = !!selectedList?.role;
+    setListItems(listId, (prev) => prev.filter((i) => i.id !== item.id));
+    const timer = setTimeout(() => {
+      setPendingDelete(null);
+      if (isCloudList) {
+        deleteItemApi(listId, item.id).catch((e) =>
+          setNotice(`Delete didn't sync to the cloud: ${e?.message || "network error"}`)
+        );
+      }
+    }, 5000);
     setPendingDelete({ item, timer });
   }
   function undoDelete() {
@@ -909,6 +1195,28 @@ function confirmStartNewTrip() {
         {notice ? (
           <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
         ) : null}
+
+        {receivedInvites.map((invite) => (
+          <View key={invite.id} style={[s.notice, { flexDirection: "row", alignItems: "center", gap: 10 }]}>
+            <Text style={{ color: t.text, fontSize: 12.5, flex: 1 }}>
+              <Text style={{ fontWeight: "800" }}>{invite.sender?.name || invite.sender?.email}</Text>
+              {invite.inviteAllLists ? " invited you as a family member" : ` invited you to "${invite.list?.name}"`}
+              {" "}({invite.role === "READ" ? "can view" : "can edit"})
+            </Text>
+            {respondingInviteId === invite.id ? (
+              <ActivityIndicator size="small" color={t.accent} />
+            ) : (
+              <>
+                <TouchableOpacity onPress={() => respondToInvite(invite, true)}>
+                  <Text style={{ color: t.accent, fontWeight: "800", fontSize: 12.5 }}>Accept</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => respondToInvite(invite, false)}>
+                  <Text style={{ color: t.muted, fontWeight: "700", fontSize: 12.5 }}>Decline</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+        ))}
 
         {pendingDelete ? (
           <View style={s.undoRow}>
@@ -1275,7 +1583,23 @@ function confirmStartNewTrip() {
           )}
 
           {tab === "family" && (
-            <FamilySyncScreen t={t} s={s} selectedList={selectedList} items={items} />
+            <FamilySyncScreen
+              t={t} s={s}
+              selectedList={selectedList}
+              items={items}
+              isSignedIn={!!user}
+              signingIn={signingIn}
+              isCloudList={!!selectedList?.role}
+              isOwner={selectedList?.role === "OWNER"}
+              members={cloudMembersByList[selectedList?.id] || []}
+              pendingInvites={pendingInvitesByList[selectedList?.id] || []}
+              onSignIn={signIn}
+              onMakeShareable={() => makeListShareable(selectedList)}
+              onInvite={(payload) => inviteFamilyMember(selectedList, payload)}
+              onRevokeInvite={(inviteId) => revokeFamilyInvite(inviteId, selectedList.id)}
+              onChangeRole={(userId, role) => changeFamilyMemberRole(selectedList.id, userId, role)}
+              onRemoveMember={(userId) => removeFamilyMember(selectedList.id, userId)}
+            />
           )}
 
           {tab === "profile" && (
@@ -1344,14 +1668,26 @@ function confirmStartNewTrip() {
                   </View>
                   {exportingPdf ? <ActivityIndicator size="small" color={t.accent} /> : <ChevronRight size={16} color={t.muted} />}
                 </TouchableOpacity>
-                <View style={s.settingsRow}>
+                <TouchableOpacity
+                  style={s.settingsRow}
+                  disabled={authLoading || signingIn}
+                  onPress={() => (user ? signOut() : signIn())}
+                >
                   <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Cloud size={16} color={t.accent2} /></View>
                   <View style={{ flex: 1 }}>
-                    <Text style={s.itemName}>Cloud Backup</Text>
-                    <Text style={s.itemUnit}>Not connected yet</Text>
+                    <Text style={s.itemName}>Cloud Sync & Sharing</Text>
+                    <Text style={s.itemUnit}>
+                      {user ? `Signed in as ${user.email}` : "Sign in with Google to sync & share lists"}
+                    </Text>
                   </View>
-                  <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "700" }}>Coming soon</Text>
-                </View>
+                  {authLoading || signingIn ? (
+                    <ActivityIndicator size="small" color={t.accent2} />
+                  ) : (
+                    <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
+                      {user ? "Sign out" : "Sign in"}
+                    </Text>
+                  )}
+                </TouchableOpacity>
               </View>
 
               <Text style={s.sectionLabel}>Support & Legal</Text>
@@ -2127,8 +2463,8 @@ function makeStyles(t) {
     smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10, backgroundColor: t.surface },
     smallBtnText: { color: t.text, fontSize: 12, fontWeight: "700" },
     tabBar: { flexDirection: "row", borderTopWidth: 1, borderColor: t.border, backgroundColor: t.surface, paddingTop: 6, paddingBottom: 4 },
-    tabBtn: { flex: 1, paddingVertical: 6, alignItems: "center", gap: 2 },
-    tabIconWrap: { width: 34, height: 34, borderRadius: RADIUS.pill, alignItems: "center", justifyContent: "center" },
+    tabBtn: { flex: 5, paddingVertical: 8, alignItems: "center", gap: 2 },
+    tabIconWrap: { width: 60, height: 40, borderRadius: 1000, alignItems: "center", justifyContent: "center" },
     tabIconWrapActive: { backgroundColor: t.accent },
     modalBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "flex-end" },
     modalBackdropCenter: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "center", alignItems: "center", padding: 20 },

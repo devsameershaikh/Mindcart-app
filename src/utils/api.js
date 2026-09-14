@@ -51,8 +51,8 @@ function resolveApiBaseUrl() {
     }
     return PROD_API_URL || "http://localhost:4000";
   }
-  if (DEV_LAN_IP) return `http://${DEV_LAN_IP}:4001`;
-  if (Platform.OS === "android") return "http://10.0.2.2:4001"; // Android emulator only
+  if (DEV_LAN_IP) return `http://${DEV_LAN_IP}:4000`;
+  if (Platform.OS === "android") return "http://10.0.2.2:4000"; // Android emulator only
   return "http://localhost:4000"; // iOS simulator only
 }
 

@@ -348,6 +348,7 @@ export default function DmartApp() {
   // right after sign-in. Cloud lists are merged in alongside any local-only
   // lists (kept exactly as they were, untouched) rather than replacing them.
   useEffect(() => {
+    console.log("Sign-in effect: user changed:", user);
     if (!user) return;
     let cancelled = false;
     (async () => {
@@ -356,35 +357,24 @@ export default function DmartApp() {
         const { lists: cloudLists } = await fetchLists();
         if (cancelled) return;
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
-        // Anything the server doesn't currently know about is kept EXACTLY
-        // as it is in local state — whether or not it already carries a
-        // `role` tag. A list can carry `role: "OWNER"` locally before the
-        // server has actually confirmed it (still queued offline, or a
-        // previous migration attempt that failed) — using "no role" as the
-        // signal for "still needs preserving" was the bug: the moment a
-        // list like that got refreshed against a cloudLists snapshot that
-        // didn't include it yet, it vanished from state entirely. Presence
-        // in `cloudIds` — not the role tag — is the only thing that means
-        // "the server has this."
+
         let legacyLocal = [];
         let lostAccessIds = [];
+        let staleSeedIds = [];
         setLists((prev) => {
           const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
-          // A list that was previously confirmed on the server but is now
-          // missing means access was actually revoked (removed, or an
-          // invite/list gone) — that's different from a list that simply
-          // hasn't finished migrating yet, and must never be re-promoted
-          // or re-created.
-          legacyLocal = notInCloud.filter((l) => !l.cloudConfirmed);
-          lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
+          const staleSeeds = cloudLists.length
+            ? notInCloud.filter((l) => l.isDefaultSeed && !l.cloudConfirmed)
+            : [];
+          staleSeedIds = staleSeeds.map((l) => l.id);
+          const keepable = notInCloud.filter((l) => !staleSeedIds.includes(l.id));
+  
+          legacyLocal = keepable.filter((l) => !l.cloudConfirmed);
+          lostAccessIds = keepable.filter((l) => l.cloudConfirmed).map((l) => l.id);
           const cloudAsLocal = cloudLists.map((cl) => ({
             id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
             createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
           }));
-          // Promote in place (same id, so nothing about the list's
-          // identity or its items changes) rather than waiting for the
-          // user to hit a manual "make shareable" button. Lists that
-          // already carry a role (still-queued migrations) keep it as-is.
           const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
           return [...cloudAsLocal, ...promoted];
         });
@@ -393,20 +383,13 @@ export default function DmartApp() {
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
         }
-        // Of the ones not yet on the server, only attempt migration for
-        // ones that have NEVER been handed to createListApi before (no
-        // role yet) — a list that already has a role is either mid-flight
-        // in the offline sync queue or failed last time and will be
-        // retried by the queue; re-submitting it here would just queue a
-        // redundant duplicate create.
+        if (staleSeedIds.length) {
+          setItemsByList((p) => { const n = { ...p }; staleSeedIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (staleSeedIds.includes(cur) ? null : cur));
+        }
+
         const neverMigrated = legacyLocal.filter((l) => !l.role);
-        // One-time migration for lists created before every list was
-        // cloud-first: push the list and its existing items to Neon under
-        // their current ids. This MUST create the list and wait for that
-        // to resolve (success or queued-offline, both fine) before
-        // touching its items — firing them in parallel let an item POST
-        // reach the server before its list's POST did, which the server
-        // correctly rejects with 404 since the list didn't exist yet.
+
         for (const l of neverMigrated) {
           let migrateResult;
           try {
@@ -415,9 +398,7 @@ export default function DmartApp() {
             setNotice(`Couldn't move "${l.name}" to the cloud: ${e?.message || "unknown error"}`);
             continue; // don't attempt its items against a list that never landed
           }
-          // Same as makeListShareable: only flip cloudConfirmed once the
-          // create actually reached the server, not just when it was
-          // handed to the offline queue.
+
           if (!migrateResult?.queued) {
             setLists((prev) => prev.map((pl) => (pl.id === l.id ? { ...pl, cloudConfirmed: true } : pl)));
           }
@@ -433,13 +414,7 @@ export default function DmartApp() {
             }
           }
         }
-        // Don't blindly overwrite a list's items with the server snapshot
-        // if that list still has a mutation sitting in the offline outbox
-        // — the server copy is stale by definition until that op lands, so
-        // clobbering local state here would silently undo an edit the user
-        // already made (a real "local vs cloud" mismatch, not just a
-        // theoretical one: it happens any time this effect re-runs while
-        // something is queued, e.g. after a reconnect).
+
         const pendingListIds = getPendingSyncListIds();
         setItemsByList((prev) => {
           const next = { ...prev };
@@ -821,6 +796,10 @@ export default function DmartApp() {
   const currency = profile.currency || DEFAULT_CURRENCY;
   const needsCurrencySetup = appLoaded && !profile.currency;
   const reminderSettings = profile.reminders || { enabled: false, days: 5 };
+  // Undefined (a profile saved before this setting existed) means "on" —
+  // only an explicit `false` hides the tab, so nobody's bottom nav
+  // silently changes shape on their next app update.
+  const showMasterTab = profile.showMasterTab !== false;
 
   // items/selectedList and the useMemo below must stay ABOVE the
   // `if (!appLoaded)` early return — hooks can't be called conditionally,
@@ -1150,6 +1129,14 @@ export default function DmartApp() {
       }
       setProfile((prev) => ({ ...prev, reminders: { ...(prev.reminders || {}), enabled: false } }));
     }
+  }
+  // ---------- Master tab visibility ----------
+  // Lets someone who doesn't use the quick-add "Master Items" shelf hide
+  // it from their bottom nav. Toggling it off while it's the active tab
+  // bounces back to Home so the app never leaves a hidden tab selected.
+  function toggleMasterTab(nextShown) {
+    setProfile((prev) => ({ ...prev, showMasterTab: nextShown }));
+    if (!nextShown && tab === "master") setTab("home");
   }
   async function updateReminderDays(value) {
     setProfile((prev) => ({ ...prev, reminders: { ...(prev.reminders || {}), enabled: prev.reminders?.enabled || false, days: value } }));
@@ -1604,10 +1591,13 @@ function confirmStartNewTrip() {
               <Text style={s.brand}>MindCart</Text>
             </View>
             <TouchableOpacity onPress={() => setListsModalOpen(true)} style={s.listSwitcher}>
-              <ListChecks size={12} color={t.accent} />
-              <Text style={s.listSwitcherText}>{selectedList ? selectedList.name : "Select list"}</Text>
-              <ChevronDown size={12} color={t.accent} />
-            </TouchableOpacity>
+            <ListChecks size={12} color={t.accent} />
+            <Text style={s.listSwitcherText}>
+              {selectedList ? selectedList.name : "Select list"}
+              {selectedList && !!selectedList.role && (cloudMembersByList[selectedList.id]?.length || 0) > 1 ? " · Shared" : ""}
+            </Text>
+            <ChevronDown size={12} color={t.accent} />
+          </TouchableOpacity>
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
             <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf}>
@@ -1845,16 +1835,30 @@ function confirmStartNewTrip() {
                               >
                                 <Text style={s.qtyBtnText}>+</Text>
                               </TouchableOpacity>
-                              <TextInput
-                                keyboardType="decimal-pad"
-                                placeholder={currency.symbol}
-                                placeholderTextColor={t.muted}
-                                value={priceValue(item)}
-                                editable={Number(item.qty) > 0}
-                                onChangeText={(v) => setPriceDrafts((prev) => ({ ...prev, [item.id]: v }))}
-                                onBlur={() => commitPrice(item)}
-                                style={s.priceInput}
-                              />
+                           <TextInput
+                            keyboardType="decimal-pad"
+                            placeholder={currency.symbol}
+                            placeholderTextColor={t.muted}
+                            value={priceValue(item)}
+                            editable={Number(item.qty) > 0}
+                            onChangeText={(v) => {
+                              const numericValue = v.replace(/[^0-9.]/g, "");
+
+                              // Allow only one decimal point
+                              const parts = numericValue.split(".");
+                              const cleanedValue =
+                                parts.length > 2
+                                  ? parts[0] + "." + parts.slice(1).join("")
+                                  : numericValue;
+
+                              setPriceDrafts((prev) => ({
+                                ...prev,
+                                [item.id]: cleanedValue,
+                              }));
+                            }}
+                            onBlur={() => commitPrice(item)}
+                            style={s.priceInput}
+                          />
                               {!item.checked && (
                                 <TouchableOpacity onPress={() => updateItem(item.id, { skipped: true })} style={{ padding: 2 }}>
                                   <EyeOff size={15} color={t.muted} />
@@ -2062,13 +2066,13 @@ function confirmStartNewTrip() {
             <View style={{ gap: 14 }}>
               <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
                 <View style={s.avatarCircleLg}>
-                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(profile.name || "U").slice(0, 1).toUpperCase()}</Text>
+                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(user.name || "U").slice(0, 1).toUpperCase()}</Text>
                 </View>
                 <View style={{ flex: 1, minWidth: 0 }}>
                   <TextInput
-                    value={profile.name}
+                    value={user.name}
                     onChangeText={(v) => setProfile((p) => ({ ...p, name: v }))}
-                    placeholder="Your name"
+                    placeholder={user?.name || "Enter your name"}                   
                     placeholderTextColor={t.muted}
                     style={{ color: t.text, fontWeight: "800", fontSize: 16, padding: 0 }}
                   />
@@ -2108,10 +2112,24 @@ function confirmStartNewTrip() {
                     <Text style={s.itemName}>Store Reminders</Text>
                     <Text style={s.itemUnit}>Nudge me if a list goes quiet</Text>
                   </View>
-                  <TouchableOpacity onPress={() => toggleReminders(!reminderSettings.enabled)} style={[s.toggleTrack, reminderSettings.enabled && s.toggleTrackOn]}>
+                  {/* <TouchableOpacity onPress={() => toggleReminders(!reminderSettings.enabled)} style={[s.toggleTrack, reminderSettings.enabled && s.toggleTrackOn]}>
                     <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
-                  </TouchableOpacity>
+                  </TouchableOpacity> */}
+                  <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
+                     Comming Soon
+                    </Text>
                 </View>
+
+                {/* <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Layers size={16} color={t.accent2} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Master Tab</Text>
+                    <Text style={s.itemUnit}>Show the Master Items shelf in the bottom nav</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => toggleMasterTab(!showMasterTab)} style={[s.toggleTrack, showMasterTab && s.toggleTrackOn]}>
+                    <View style={[s.toggleThumb, showMasterTab && s.toggleThumbOn]} />
+                  </TouchableOpacity>
+                </View> */}
               </View>
 
               <Text style={s.sectionLabel}>Data & Cloud</Text>
@@ -2133,7 +2151,7 @@ function confirmStartNewTrip() {
                   <View style={{ flex: 1 }}>
                     <Text style={s.itemName}>Cloud Sync & Sharing</Text>
                     <Text style={s.itemUnit}>
-                      {user ? `Signed in as ${user.email}` : "Sign in with Google to sync & share lists"}
+                      {user ? `Signed in as ${user.name}` : "Sign in with Google to sync & share lists"}
                     </Text>
                   </View>
                   {authLoading || signingIn ? (
@@ -2173,10 +2191,10 @@ function confirmStartNewTrip() {
           {[
             { id: "home", label: "Home", icon: Home },
             { id: "add", label: "Add", icon: ListPlus },
-            { id: "master", label: "Master", icon: Layers },
+            // showMasterTab && { id: "master", label: "Master", icon: Layers },
             { id: "family", label: "Family", icon: Users },
             { id: "profile", label: "Profile", icon: UserCircle2 },
-          ].map(({ id, label, icon: Icon }) => (
+          ].filter(Boolean).map(({ id, label, icon: Icon }) => (
             <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
               <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
                 <Icon size={18} color={tab === id ? "#fff" : t.muted} />
@@ -2212,8 +2230,16 @@ function confirmStartNewTrip() {
                 {lists.map((list) => (
                   <View key={list.id} style={[s.listRow, { borderColor: list.id === selectedListId ? t.accent : t.border }]}>
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
+                      {/* <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
                         <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
+                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
+                      </TouchableOpacity> */}
+                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
+                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>
+                          {list.name}
+                          {list.id === selectedListId ? "" : ""}
+                          {!!list.role && (cloudMembersByList[list.id]?.length || 0) > 1 ? "(Shared)" : ""}
+                        </Text>
                         <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
                       </TouchableOpacity>
                       <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
@@ -2486,34 +2512,8 @@ function confirmStartNewTrip() {
                   <Text style={{ color: t.text, fontSize: 13.5, fontWeight: "600" }}>App version</Text>
                   <Text style={{ color: t.muted, fontSize: 13 }}>{APP_VERSION}</Text>
                 </View>
-                {/* <View style={[s.listRow, { flexDirection: "row", justifyContent: "space-between", alignItems: "center" }]}>
-                  <Text style={{ color: t.text, fontSize: 13.5, fontWeight: "600" }}>Developer</Text>
-                  <Text style={{ color: t.muted, fontSize: 13 }}>{DEVELOPER_NAME}</Text>
-                </View> */}
               </View>
 
-              {/* Privacy policy & contact */}
-              {/* <View style={{ gap: 6, marginBottom: 16 }}>
-                <TouchableOpacity
-                  onPress={openPrivacyPolicy}
-                  style={[s.listRow, { flexDirection: "row", alignItems: "center", gap: 10 }]}
-                >
-                  <ShieldCheck size={16} color={t.accent} />
-                  <Text style={{ flex: 1, color: t.text, fontSize: 13.5, fontWeight: "600" }}>Privacy Policy</Text>
-                  <ChevronRight size={16} color={t.muted} />
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={openContactEmail}
-                  style={[s.listRow, { flexDirection: "row", alignItems: "center", gap: 10 }]}
-                >
-                  <Mail size={16} color={t.accent} />
-                  <Text style={{ flex: 1, color: t.text, fontSize: 13.5, fontWeight: "600" }}>Contact / Feedback</Text>
-                  <ChevronRight size={16} color={t.muted} />
-                </TouchableOpacity>
-              </View> */}
-              {/* <Text style={{ fontSize: 11, color: t.muted, textAlign: "center", marginTop: 10, marginBottom: 4 }}>
-                Each library is used under its own open-source license.
-              </Text> */}
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -2919,7 +2919,7 @@ function makeStyles(t) {
     tabBar: { flexDirection: "row", borderTopWidth: 1, borderColor: t.border, backgroundColor: t.surface, paddingTop: 6, paddingBottom: 4 },
     tabBtn: { flex: 5, paddingVertical: 8, alignItems: "center", gap: 2 },
     tabIconWrap: { width: 60, height: 40, borderRadius: 1000, alignItems: "center", justifyContent: "center" },
-    tabIconWrapActive: { backgroundColor: t.accent },
+    tabIconWrapActive: { backgroundColor: t.accent ,borderRadius: 20,},
     modalBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "flex-end" },
     modalBackdropCenter: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "center", alignItems: "center", padding: 20 },
     listsSheet: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl, padding: 20, maxHeight: "80%" },

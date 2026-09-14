@@ -48,6 +48,7 @@ import {
   createItem as createItemApi, updateItemApi, deleteItemApi,
   sendInvite, fetchInvites, acceptInvite, declineInvite, revokeInvite,
   changeMemberRole as changeMemberRoleApi, removeMember as removeMemberApi,
+  getPendingSyncListIds, onSyncDropped,
 } from "./src/utils/api";
 import { getSocket, joinListRoom } from "./src/utils/socket";
 
@@ -192,6 +193,27 @@ function arrayToItemMap(arr) {
   return map;
 }
 
+// Turns a dropped sync-queue op (one that failed for a real server reason,
+// not just connectivity — see syncQueue.js) into a human-readable sentence
+// fragment for the notice banner. The most common real-world case this
+// covers: you edited a list while offline, but were removed from it (or it
+// was deleted) before the edit could reach the server — without this, that
+// edit just silently vanishes with zero explanation.
+function describeDroppedOp(op, lists) {
+  const listId = op.payload?.listId || op.payload?.id;
+  const list = lists.find((l) => l.id === listId);
+  const listLabel = list ? `"${list.name}"` : "a list";
+  switch (op.type) {
+    case "createList": return `create the list "${op.payload?.name || ""}"`;
+    case "renameList": return `rename ${listLabel}`;
+    case "deleteList": return `delete ${listLabel}`;
+    case "createItem": return `add "${op.payload?.body?.name || "an item"}" to ${listLabel}`;
+    case "updateItem": return `save an item change in ${listLabel}`;
+    case "deleteItem": return `delete an item from ${listLabel}`;
+    default: return `sync a change to ${listLabel}`;
+  }
+}
+
 // A checkbox that gives a small satisfying "pop" (scale bounce) + a light
 // haptic tap whenever it's toggled, instead of just flipping state instantly.
 function AnimatedCheckbox({ checked, onPress, style }) {
@@ -238,6 +260,8 @@ export default function DmartApp() {
   const [dark, setDark] = useState(true);
 
   const [lists, setLists] = useState([]);
+  const listsRef = useRef(lists); // lets the sync-drop listener (registered once) read fresh list names without re-subscribing
+  useEffect(() => { listsRef.current = lists; }, [lists]);
   const [selectedListId, setSelectedListId] = useState(null);
   const [itemsByList, setItemsByList] = useState({});
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
@@ -316,6 +340,9 @@ export default function DmartApp() {
   const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
   const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
   const [respondingInviteId, setRespondingInviteId] = useState(null);
+  const [makingShareable, setMakingShareable] = useState(false);
+  const [revokingInviteId, setRevokingInviteId] = useState(null);
+  const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
 
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
@@ -329,19 +356,50 @@ export default function DmartApp() {
         const { lists: cloudLists } = await fetchLists();
         if (cancelled) return;
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+        // Anything the server doesn't currently know about is kept EXACTLY
+        // as it is in local state — whether or not it already carries a
+        // `role` tag. A list can carry `role: "OWNER"` locally before the
+        // server has actually confirmed it (still queued offline, or a
+        // previous migration attempt that failed) — using "no role" as the
+        // signal for "still needs preserving" was the bug: the moment a
+        // list like that got refreshed against a cloudLists snapshot that
+        // didn't include it yet, it vanished from state entirely. Presence
+        // in `cloudIds` — not the role tag — is the only thing that means
+        // "the server has this."
         let legacyLocal = [];
+        let lostAccessIds = [];
         setLists((prev) => {
-          legacyLocal = prev.filter((l) => !l.role && !cloudIds.has(l.id));
+          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+          // A list that was previously confirmed on the server but is now
+          // missing means access was actually revoked (removed, or an
+          // invite/list gone) — that's different from a list that simply
+          // hasn't finished migrating yet, and must never be re-promoted
+          // or re-created.
+          legacyLocal = notInCloud.filter((l) => !l.cloudConfirmed);
+          lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
           const cloudAsLocal = cloudLists.map((cl) => ({
             id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
-            createdAt: new Date(cl.createdAt).getTime(),
+            createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
           }));
           // Promote in place (same id, so nothing about the list's
           // identity or its items changes) rather than waiting for the
-          // user to hit a manual "make shareable" button.
-          const promoted = legacyLocal.map((l) => ({ ...l, role: "OWNER" }));
+          // user to hit a manual "make shareable" button. Lists that
+          // already carry a role (still-queued migrations) keep it as-is.
+          const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
           return [...cloudAsLocal, ...promoted];
         });
+        if (lostAccessIds.length) {
+          setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
+        }
+        // Of the ones not yet on the server, only attempt migration for
+        // ones that have NEVER been handed to createListApi before (no
+        // role yet) — a list that already has a role is either mid-flight
+        // in the offline sync queue or failed last time and will be
+        // retried by the queue; re-submitting it here would just queue a
+        // redundant duplicate create.
+        const neverMigrated = legacyLocal.filter((l) => !l.role);
         // One-time migration for lists created before every list was
         // cloud-first: push the list and its existing items to Neon under
         // their current ids. This MUST create the list and wait for that
@@ -349,12 +407,19 @@ export default function DmartApp() {
         // touching its items — firing them in parallel let an item POST
         // reach the server before its list's POST did, which the server
         // correctly rejects with 404 since the list didn't exist yet.
-        for (const l of legacyLocal) {
+        for (const l of neverMigrated) {
+          let migrateResult;
           try {
-            await createListApi(l.id, l.name);
+            migrateResult = await createListApi(l.id, l.name);
           } catch (e) {
             setNotice(`Couldn't move "${l.name}" to the cloud: ${e?.message || "unknown error"}`);
             continue; // don't attempt its items against a list that never landed
+          }
+          // Same as makeListShareable: only flip cloudConfirmed once the
+          // create actually reached the server, not just when it was
+          // handed to the offline queue.
+          if (!migrateResult?.queued) {
+            setLists((prev) => prev.map((pl) => (pl.id === l.id ? { ...pl, cloudConfirmed: true } : pl)));
           }
           const existingItems = Object.values(itemsByList[l.id] || {});
           for (const it of existingItems) {
@@ -368,9 +433,20 @@ export default function DmartApp() {
             }
           }
         }
+        // Don't blindly overwrite a list's items with the server snapshot
+        // if that list still has a mutation sitting in the offline outbox
+        // — the server copy is stale by definition until that op lands, so
+        // clobbering local state here would silently undo an edit the user
+        // already made (a real "local vs cloud" mismatch, not just a
+        // theoretical one: it happens any time this effect re-runs while
+        // something is queued, e.g. after a reconnect).
+        const pendingListIds = getPendingSyncListIds();
         setItemsByList((prev) => {
           const next = { ...prev };
-          for (const cl of cloudLists) next[cl.id] = arrayToItemMap(cl.items);
+          for (const cl of cloudLists) {
+            if (pendingListIds.has(cl.id)) continue;
+            next[cl.id] = arrayToItemMap(cl.items);
+          }
           return next;
         });
         setCloudMembersByList((prev) => {
@@ -404,12 +480,43 @@ export default function DmartApp() {
       if (accept) {
         await acceptInvite(invite.id);
         const { lists: cloudLists } = await fetchLists();
+        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+        // Same fix as the sign-in merge above: keep any list the server
+        // doesn't currently return, full stop — never key that decision
+        // off `.role`, since a list gets that tag optimistically before
+        // the server has necessarily confirmed it. This is the exact spot
+        // that was deleting the accepting user's OWN lists: their list
+        // already had `role: "OWNER"` from being created/migrated earlier,
+        // so it failed the old "keep if no role" check, and if it also
+        // hadn't finished syncing to the server yet it was missing from
+        // `cloudLists` too — so it matched neither bucket and disappeared.
+        let lostAccessIds = [];
         setLists((prev) => {
-          const localOnly = prev.filter((l) => !l.role);
-          const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime() }));
-          return [...cloudAsLocal, ...localOnly];
+          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+          const keepAsIs = notInCloud.filter((l) => !l.cloudConfirmed);
+          lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
+          const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true }));
+          return [...cloudAsLocal, ...keepAsIs];
         });
-        setItemsByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = arrayToItemMap(cl.items); return next; });
+        if (lostAccessIds.length) {
+          setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
+        }
+        // Avoid clobbering a DIFFERENT list's not-yet-synced local edits —
+        // accepting an invite refreshes every cloud list, not just the
+        // newly shared one, so without this guard an unrelated list with a
+        // pending offline change could get overwritten by a stale server
+        // snapshot the moment this fires.
+        const pendingListIds = getPendingSyncListIds();
+        setItemsByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) {
+            if (pendingListIds.has(cl.id)) continue;
+            next[cl.id] = arrayToItemMap(cl.items);
+          }
+          return next;
+        });
         setCloudMembersByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.members; return next; });
         cloudLists.forEach((cl) => joinListRoom(cl.id));
         setNotice("Invite accepted — the list is now in your list switcher.");
@@ -419,10 +526,30 @@ export default function DmartApp() {
       setReceivedInvites((prev) => prev.filter((i) => i.id !== invite.id));
     } catch (e) {
       setNotice(`Couldn't ${accept ? "accept" : "decline"} that invite: ${e?.message || "network error"}`);
+      if (e?.status === 404) {
+        // 404 here specifically means the invite can never be actioned
+        // again (already resolved elsewhere, revoked, or its list/owner is
+        // gone) — retrying is pointless, so don't leave a dead card that
+        // just keeps failing every time it's tapped.
+        setReceivedInvites((prev) => prev.filter((i) => i.id !== invite.id));
+      }
     } finally {
       setRespondingInviteId(null);
     }
   }
+
+  // Surface sync-queue drops (an offline edit that could never legally land
+  // — e.g. you were removed from the list, or it was deleted — as opposed
+  // to a normal connectivity retry, which stays silent by design). Without
+  // this, a dropped edit just disappeared with no explanation. Registered
+  // once; reads listsRef so it always has current list names without
+  // needing to re-subscribe every time `lists` changes.
+  useEffect(() => {
+    onSyncDropped((op, err) => {
+      const action = describeDroppedOp(op, listsRef.current);
+      setNotice(`Couldn't ${action} — you may no longer have access, or it was removed. (${err?.message || "sync failed"})`);
+    });
+  }, []);
 
   // Live updates: keep every open device in sync while signed in. Socket
   // connection itself is opened/closed by AuthContext on sign-in/out — this
@@ -451,11 +578,39 @@ export default function DmartApp() {
       // list) fresh after a join/leave/role-change without hand-rolling
       // three separate partial-update shapes.
       fetchLists().then(({ lists: cloudLists }) => {
+        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
         setCloudMembersByList((prev) => {
           const next = { ...prev };
           for (const cl of cloudLists) next[cl.id] = cl.members;
           return next;
         });
+        // A memberRemoved event can mean *you* were removed, and a
+        // memberRoleChanged event can mean *your own* role changed — this
+        // used to only refresh the members panel, so a list you'd just
+        // lost access to (or had downgraded to read-only) kept sitting in
+        // your switcher with its old role, letting you keep tapping "add
+        // item" into a wall of 404s. Only ever act on lists this effect
+        // itself confirmed as real cloud lists (`cloudConfirmed`) — a
+        // list still mid-migration and not yet in a cloudLists response
+        // for an unrelated reason must never get swept up in this.
+        let lostAccessTo = null;
+        setLists((prev) => {
+          const stillMine = [];
+          for (const l of prev) {
+            if (!l.cloudConfirmed) { stillMine.push(l); continue; }
+            const fresh = cloudLists.find((cl) => cl.id === l.id);
+            if (fresh) stillMine.push({ ...l, role: fresh.role, name: fresh.name });
+            else lostAccessTo = l.id; // was cloud-confirmed, now missing -> access revoked
+          }
+          return stillMine;
+        });
+        if (lostAccessTo) {
+          const removedId = lostAccessTo;
+          setItemsByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
+          setSelectedListId((cur) => (cur === removedId ? null : cur));
+          setNotice("You no longer have access to a list that was removed from your account.");
+        }
       }).catch(() => {});
     };
 
@@ -470,6 +625,68 @@ export default function DmartApp() {
     const onInviteReceived = ({ invite }) => setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
     socket.on("invite:received", onInviteReceived);
 
+    // Push accept/decline back to the SENDER's Pending Invites panel live,
+    // instead of only resolving the next time they open the Family tab.
+    // The event payload is just { inviteId } — pendingInvitesByList doesn't
+    // know its own scope per-entry, so just scrub the id out of every
+    // list's cached array; it's a no-op wherever it isn't present.
+    const onInviteAccepted = ({ inviteId }) => {
+      let matched = null;
+      setPendingInvitesByList((prev) => {
+        const next = {};
+        for (const [listId, invites] of Object.entries(prev)) {
+          const found = invites.find((inv) => inv.id === inviteId);
+          if (found) matched = found;
+          next[listId] = invites.filter((inv) => inv.id !== inviteId);
+        }
+        return next;
+      });
+      if (matched) setNotice(`${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+    };
+    const onInviteDeclined = ({ inviteId }) => {
+      let matched = null;
+      setPendingInvitesByList((prev) => {
+        const next = {};
+        for (const [listId, invites] of Object.entries(prev)) {
+          const found = invites.find((inv) => inv.id === inviteId);
+          if (found) matched = found;
+          next[listId] = invites.filter((inv) => inv.id !== inviteId);
+        }
+        return next;
+      });
+      if (matched) setNotice(`${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+    };
+    socket.on("invite:accepted", onInviteAccepted);
+    socket.on("invite:declined", onInviteDeclined);
+
+    // Push revoke back to the RECIPIENT live — previously they only found
+    // out by tapping Accept/Decline and getting a stale "not found".
+    const onInviteRevoked = ({ inviteId }) => {
+      let existed = false;
+      setReceivedInvites((prev) => {
+        existed = prev.some((i) => i.id === inviteId);
+        return prev.filter((i) => i.id !== inviteId);
+      });
+      if (existed) setNotice("An invitation was withdrawn by the sender.");
+    };
+    socket.on("invite:revoked", onInviteRevoked);
+
+    // A standing family member (accepted an "all my lists" invite) gets
+    // this the instant the owner creates a NEW list — no separate
+    // invite/accept round-trip needed for lists that come later.
+    const onListGranted = ({ list }) => {
+      setLists((prev) => {
+        if (prev.some((l) => l.id === list.id)) return prev; // already have it somehow — don't duplicate
+        return [...prev, { id: list.id, name: list.name, ownerId: list.ownerId, role: list.role, createdAt: new Date(list.createdAt).getTime(), cloudConfirmed: true }];
+      });
+      setItemsByList((prev) => (prev[list.id] ? prev : { ...prev, [list.id]: arrayToItemMap(list.items) }));
+      setCloudMembersByList((prev) => ({ ...prev, [list.id]: list.members }));
+      joinListRoom(list.id);
+      const ownerMember = list.members.find((m) => m.role === "OWNER");
+      setNotice(`${ownerMember?.name || ownerMember?.email || "A family member"} added you to "${list.name}".`);
+    };
+    socket.on("list:granted", onListGranted);
+
     return () => {
       socket.off("item:created", onItemCreated);
       socket.off("item:updated", onItemUpdated);
@@ -480,6 +697,10 @@ export default function DmartApp() {
       socket.off("list:memberRemoved", onMemberChange);
       socket.off("list:memberRoleChanged", onMemberChange);
       socket.off("invite:received", onInviteReceived);
+      socket.off("invite:accepted", onInviteAccepted);
+      socket.off("invite:declined", onInviteDeclined);
+      socket.off("invite:revoked", onInviteRevoked);
+      socket.off("list:granted", onListGranted);
     };
   }, [user]);
 
@@ -659,11 +880,18 @@ export default function DmartApp() {
 
   if (!appLoaded || authLoading) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
 
-  // OnboardingScreen IS the entry/sign-in screen now: shown whenever there's
-  // no signed-in user, with its "Continue with Google" button wired to the
-  // real signIn() from AuthContext. Nothing past this point renders until
-  // `user` is real, so there's no separate SignInScreen step anymore.
-  if (!user) return <OnboardingScreen t={t} dark={dark} onGetStarted={signIn} signingIn={signingIn} />;
+  // Sign-in is mandatory: no user, no app. This check re-runs on every
+  // render, so it also covers sign-out — the moment signOut() clears
+  // `user`, this becomes true again and the login screen comes back,
+  // without any extra "redirect" logic needed.
+  if (!user) {
+    return (
+      <OnboardingScreen
+        t={t} dark={dark} signingIn={signingIn}
+        onGetStarted={signIn}
+      />
+    );
+  }
 
   // setListItems' updater now receives/returns the { itemId: item } map for
   // this list, not an array. upsertItem/removeItemFromList/patchItem below
@@ -795,8 +1023,9 @@ export default function DmartApp() {
   // ids, which is also what makes it safe to retry if it's interrupted.
   async function makeListShareable(list) {
     if (!user) { signIn(); return; }
+    setMakingShareable(true);
     try {
-      await createListApi(list.id, list.name);
+      const result = await createListApi(list.id, list.name);
       const existing = Object.values(itemsByList[list.id] || {});
       for (const it of existing) {
         await createItemApi(list.id, { id: it.id, name: it.name, category: it.category, unit: it.unit, price: it.price || null });
@@ -804,12 +1033,20 @@ export default function DmartApp() {
           await updateItemApi(list.id, it.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
         }
       }
-      setLists((prev) => prev.map((l) => (l.id === list.id ? { ...l, role: "OWNER" } : l)));
+      // Only mark it cloudConfirmed if the create actually reached the
+      // server — if it got queued offline instead, the sign-in sync's
+      // cloudIds check (and the socket handlers' cloudConfirmed check)
+      // need to keep treating it as "not yet on the server" until the
+      // queue actually flushes it, or it'd risk being swept up by the
+      // member-change/accept-invite cleanup logic before it's really there.
+      setLists((prev) => prev.map((l) => (l.id === list.id ? { ...l, role: "OWNER", cloudConfirmed: !result?.queued } : l)));
       setCloudMembersByList((prev) => ({ ...prev, [list.id]: [{ id: user.id, name: user.name, email: user.email, avatarUrl: user.avatarUrl, role: "OWNER" }] }));
       joinListRoom(list.id);
       setNotice(`"${list.name}" is now shareable.`);
     } catch (e) {
       setNotice(`Couldn't move this list to the cloud: ${e?.message || "network error"}`);
+    } finally {
+      setMakingShareable(false);
     }
   }
 
@@ -835,23 +1072,31 @@ export default function DmartApp() {
     }
   }
   async function revokeFamilyInvite(inviteId, listId) {
+    setRevokingInviteId(inviteId);
     try { await revokeInvite(inviteId); refreshInvitesForList(listId); }
     catch (e) { setNotice(`Couldn't revoke invite: ${e?.message || "network error"}`); }
+    finally { setRevokingInviteId(null); }
   }
   async function changeFamilyMemberRole(listId, userId, role) {
+    setBusyMemberId(userId);
     try {
       await changeMemberRoleApi(listId, userId, role);
       setCloudMembersByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).map((m) => (m.id === userId ? { ...m, role } : m)) }));
     } catch (e) {
       setNotice(`Couldn't change that member's role: ${e?.message || "network error"}`);
+    } finally {
+      setBusyMemberId(null);
     }
   }
   async function removeFamilyMember(listId, userId) {
+    setBusyMemberId(userId);
     try {
       await removeMemberApi(listId, userId);
       setCloudMembersByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((m) => m.id !== userId) }));
     } catch (e) {
       setNotice(`Couldn't remove that member: ${e?.message || "network error"}`);
+    } finally {
+      setBusyMemberId(null);
     }
   }
   // Budget is stored per-list (like price, as the raw string from the
@@ -1382,27 +1627,49 @@ function confirmStartNewTrip() {
           <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
         ) : null}
 
-        {receivedInvites.map((invite) => (
-          <View key={invite.id} style={[s.notice, { flexDirection: "row", alignItems: "center", gap: 10 }]}>
-            <Text style={{ color: t.text, fontSize: 12.5, flex: 1 }}>
-              <Text style={{ fontWeight: "800" }}>{invite.sender?.name || invite.sender?.email}</Text>
-              {invite.inviteAllLists ? " invited you as a family member" : ` invited you to "${invite.list?.name}"`}
-              {" "}({invite.role === "READ" ? "can view" : "can edit"})
+        {receivedInvites.length > 0 && (
+          <View style={{ marginHorizontal: 18, marginTop: 12, gap: 8 }}>
+            <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.4 }}>
+              {receivedInvites.length === 1 ? "Pending invitation" : `Pending invitations (${receivedInvites.length})`}
             </Text>
-            {respondingInviteId === invite.id ? (
-              <ActivityIndicator size="small" color={t.accent} />
-            ) : (
-              <>
-                <TouchableOpacity onPress={() => respondToInvite(invite, true)}>
-                  <Text style={{ color: t.accent, fontWeight: "800", fontSize: 12.5 }}>Accept</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => respondToInvite(invite, false)}>
-                  <Text style={{ color: t.muted, fontWeight: "700", fontSize: 12.5 }}>Decline</Text>
-                </TouchableOpacity>
-              </>
-            )}
+            {receivedInvites.map((invite) => {
+              const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
+              const isResponding = respondingInviteId === invite.id;
+              return (
+                <View key={invite.id} style={[s.itemCard, { gap: 10 }]}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                    <View style={s.avatarCircle}>
+                      <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
+                    </View>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={s.itemName}>{senderLabel}</Text>
+                      <Text style={s.itemUnit}>
+                        {invite.inviteAllLists ? "Invited you as a family member" : `Invited you to "${invite.list?.name}"`}
+                        {"  ·  "}{invite.role === "READ" ? "Can view" : "Can edit"}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={{ flexDirection: "row", gap: 8 }}>
+                    <TouchableOpacity
+                      onPress={() => respondToInvite(invite, true)}
+                      disabled={isResponding}
+                      style={[s.addItemBtn, { flex: 1, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
+                    >
+                      {isResponding ? <ActivityIndicator color="#fff" /> : <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text>}
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => respondToInvite(invite, false)}
+                      disabled={isResponding}
+                      style={[s.smallBtn, { flex: 1, alignItems: "center", opacity: isResponding ? 0.6 : 1 }]}
+                    >
+                      <Text style={s.smallBtnText}>Decline</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
           </View>
-        ))}
+        )}
 
         {pendingDelete ? (
           <View style={s.undoRow}>
@@ -1779,6 +2046,9 @@ function confirmStartNewTrip() {
               isOwner={selectedList?.role === "OWNER"}
               members={cloudMembersByList[selectedList?.id] || []}
               pendingInvites={pendingInvitesByList[selectedList?.id] || []}
+              makingShareable={makingShareable}
+              revokingInviteId={revokingInviteId}
+              busyMemberId={busyMemberId}
               onSignIn={signIn}
               onMakeShareable={() => makeListShareable(selectedList)}
               onInvite={(payload) => inviteFamilyMember(selectedList, payload)}

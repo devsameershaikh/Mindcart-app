@@ -72,6 +72,21 @@ export function getPendingCount() {
   return queue.length;
 }
 
+// Which listIds currently have a not-yet-sent mutation sitting in the
+// outbox. Used by App.js to avoid overwriting a list's local (optimistic)
+// items/name with a server snapshot while a change to that same list is
+// still queued — otherwise a cloud refresh triggered by something
+// unrelated (e.g. accepting an invite) can silently erase an edit that
+// hasn't round-tripped yet.
+export function getPendingListIds() {
+  const ids = new Set();
+  for (const op of queue) {
+    const listId = op.payload?.listId || (op.type === "createList" || op.type === "renameList" || op.type === "deleteList" ? op.payload?.id || op.entityKey : null);
+    if (listId) ids.add(listId);
+  }
+  return ids;
+}
+
 // ---------- Enqueue, with collapsing ----------
 //
 // entityKey identifies "the same thing" across ops so we can collapse

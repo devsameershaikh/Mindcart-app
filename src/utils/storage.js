@@ -36,25 +36,64 @@ export const DEFAULT_CATEGORIES = [
 
 export const DEFAULT_LIST_ID = "list_groceries";
 
+// function makeId(prefix = "id") {
+//   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+// }
+// export { makeId };
+
+// function defaultState() {
+//   return {
+//     schemaVersion: SCHEMA_VERSION,
+//     profile: { name: "" }, // optional, local only — never required to use the app
+//     theme: "dark", // "dark" | "light"
+//     selectedListId: DEFAULT_LIST_ID,
+//     lists: [
+//       { id: DEFAULT_LIST_ID, name: "Groceries", createdAt: Date.now() },
+//     ],
+//     // items live per-list so each list is an independent, reusable master list
+//     itemsByList: {
+//       [DEFAULT_LIST_ID]: [],
+//     },
+//     categories: DEFAULT_CATEGORIES,
+//     preferences: {},
+//   };
+// }
 function makeId(prefix = "id") {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
 }
+
 export { makeId };
 
 function defaultState() {
+  const defaultListId = makeId("list");
+
   return {
     schemaVersion: SCHEMA_VERSION,
-    profile: { name: "" }, // optional, local only — never required to use the app
-    theme: "dark", // "dark" | "light"
-    selectedListId: DEFAULT_LIST_ID,
-    lists: [
-      { id: DEFAULT_LIST_ID, name: "Groceries", createdAt: Date.now() },
-    ],
-    // items live per-list so each list is an independent, reusable master list
-    itemsByList: {
-      [DEFAULT_LIST_ID]: [],
+
+    profile: {
+      name: "",
     },
+
+    theme: "dark",
+
+    selectedListId: defaultListId,
+
+    lists: [
+      {
+        id: defaultListId,
+        name: "Groceries",
+        createdAt: Date.now(),
+      },
+    ],
+
+    itemsByList: {
+      [defaultListId]: [],
+    },
+
     categories: DEFAULT_CATEGORIES,
+
     preferences: {},
   };
 }

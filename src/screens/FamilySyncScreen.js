@@ -19,6 +19,7 @@ export default function FamilySyncScreen({
   t, s, selectedList, items = [],
   isSignedIn, signingIn, isCloudList, isOwner,
   members = [], pendingInvites = [],
+  makingShareable = false, revokingInviteId = null, busyMemberId = null,
   onSignIn, onMakeShareable, onInvite, onRevokeInvite, onChangeRole, onRemoveMember,
 }) {
   const [inviteEmail, setInviteEmail] = useState("");
@@ -87,9 +88,17 @@ export default function FamilySyncScreen({
             Move it to the cloud to share it with family — its {items.length} current item{items.length === 1 ? "" : "s"} come with it.
           </Text>
         </View>
-        <TouchableOpacity onPress={onMakeShareable} style={[s.addItemBtn, { justifyContent: "center" }]}>
-          <UserPlus size={16} color="#fff" />
-          <Text style={{ color: "#fff", fontWeight: "700", fontSize: 14 }}>Make this list shareable</Text>
+        <TouchableOpacity
+          onPress={onMakeShareable}
+          disabled={makingShareable}
+          style={[s.addItemBtn, { justifyContent: "center", opacity: makingShareable ? 0.6 : 1 }]}
+        >
+          {makingShareable ? <ActivityIndicator color="#fff" /> : (
+            <>
+              <UserPlus size={16} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: "700", fontSize: 14 }}>Make this list shareable</Text>
+            </>
+          )}
         </TouchableOpacity>
       </View>
     );
@@ -189,9 +198,12 @@ export default function FamilySyncScreen({
                 <Text style={s.itemName}>{m.name || m.email}{m.role === "OWNER" ? "  ·  Owner" : ""}</Text>
                 <Text style={s.itemUnit}>{m.email || "—"}</Text>
               </View>
-              {isOwner && m.role !== "OWNER" ? (
+              {busyMemberId === m.id ? (
+                <ActivityIndicator size="small" color={t.accent} />
+              ) : isOwner && m.role !== "OWNER" ? (
                 <TouchableOpacity
                   onPress={() => onChangeRole(m.id, m.role === "READ" ? "WRITE" : "READ")}
+                  disabled={!!busyMemberId}
                   style={s.permBadge}
                 >
                   <Text style={{ color: t.accent, fontSize: 10.5, fontWeight: "700" }}>
@@ -205,8 +217,8 @@ export default function FamilySyncScreen({
                   </Text>
                 </View>
               )}
-              {isOwner && m.role !== "OWNER" && (
-                <TouchableOpacity onPress={() => onRemoveMember(m.id)} style={{ padding: 2 }}>
+              {isOwner && m.role !== "OWNER" && busyMemberId !== m.id && (
+                <TouchableOpacity onPress={() => onRemoveMember(m.id)} disabled={!!busyMemberId} style={{ padding: 2 }}>
                   <X size={15} color={t.muted} />
                 </TouchableOpacity>
               )}
@@ -227,9 +239,13 @@ export default function FamilySyncScreen({
                   <Text style={s.itemName}>{inv.recipientEmail}</Text>
                   <Text style={s.itemUnit}>{inv.inviteAllLists ? "Family member · all lists" : "This list"} · {inv.role === "READ" ? "View" : "Edit"} · Pending</Text>
                 </View>
-                <TouchableOpacity onPress={() => onRevokeInvite(inv.id)} style={{ padding: 2 }}>
-                  <X size={15} color={t.muted} />
-                </TouchableOpacity>
+                {revokingInviteId === inv.id ? (
+                  <ActivityIndicator size="small" color={t.muted} />
+                ) : (
+                  <TouchableOpacity onPress={() => onRevokeInvite(inv.id)} disabled={!!revokingInviteId} style={{ padding: 2 }}>
+                    <X size={15} color={t.muted} />
+                  </TouchableOpacity>
+                )}
               </View>
             ))}
           </View>

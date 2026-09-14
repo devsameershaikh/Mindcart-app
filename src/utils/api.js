@@ -17,7 +17,7 @@
 
 import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { registerExecutors, enqueue, startSync, subscribe, getPendingCount, setOnDropped } from "./syncQueue";
+import { registerExecutors, enqueue, startSync, subscribe, getPendingCount, getPendingListIds, setOnDropped } from "./syncQueue";
 
 // ============================================================
 // BACKEND URL — the #1 reason "nothing works" is this pointing
@@ -157,6 +157,7 @@ setOnDropped((op, err) => { if (dropListener) dropListener(op, err); });
 // like "3 changes pending" while offline.
 export const onSyncStatusChange = subscribe;
 export const getPendingSyncCount = getPendingCount;
+export const getPendingSyncListIds = getPendingListIds;
 
 // Call once (e.g. from App.js on mount) to start watching connectivity and
 // auto-flushing the outbox. Safe to call more than once — also called

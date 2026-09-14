@@ -51,6 +51,7 @@ import {
   getPendingSyncListIds, onSyncDropped,
 } from "./src/utils/api";
 import { getSocket, joinListRoom } from "./src/utils/socket";
+import { Share2 } from "lucide-react-native";
 
 // This app is local-first: everything lives in on-device storage (see
 // storage.js) by default, so it works fully offline with no account.
@@ -154,15 +155,15 @@ const DAILY_TEST_LOOKAHEAD_DAYS = 60;
 const DAILY_TEST_DEFAULT_HOUR = 20; // 8 PM, 24h device-local time
 const DAILY_TEST_DEFAULT_MINUTE = 0;
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: false,
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-  }),
-});
+// Notifications.setNotificationHandler({
+//   handleNotification: async () => ({
+//     shouldShowAlert: true,
+//     shouldPlaySound: false,
+//     shouldSetBadge: false,
+//     shouldShowBanner: true,
+//     shouldShowList: true,
+//   }),
+// });
 
 // Old-architecture Android needs this opt-in for LayoutAnimation to animate
 // list insert/remove/reorder; harmless no-op everywhere else (new
@@ -343,6 +344,7 @@ export default function DmartApp() {
   const [makingShareable, setMakingShareable] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
+  const showSearch = tab === "home"||tab === "add";
 
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
@@ -759,7 +761,7 @@ export default function DmartApp() {
     // eslint-disable-next-line
   }, [pendingDelete]);
 
-  const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
+  // const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
 
   // auto-clear inline notices after a few seconds
   useEffect(() => {
@@ -773,17 +775,17 @@ export default function DmartApp() {
   // sign of the tester actually being here. Must stay above the
   // `if (!appLoaded)` early return below, like every other hook in this
   // component — hooks can't be called conditionally.
-  useEffect(() => {
-    if (!appLoaded) return;
-    const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
-    const minute = Number(dailyTestSettings.minute) ?? DAILY_TEST_DEFAULT_MINUTE;
-    scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
-    const sub = AppState.addEventListener("change", (nextState) => {
-      if (nextState === "active") scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
-    });
-    return () => sub.remove();
-    // eslint-disable-next-line
-  }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
+  // useEffect(() => {
+  //   if (!appLoaded) return;
+  //   const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
+  //   const minute = Number(dailyTestSettings.minute) ?? DAILY_TEST_DEFAULT_MINUTE;
+  //   scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
+  //   const sub = AppState.addEventListener("change", (nextState) => {
+  //     if (nextState === "active") scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
+  //   });
+  //   return () => sub.remove();
+  //   // eslint-disable-next-line
+  // }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
 
   const t = getTheme(dark);
   const s = useMemo(() => makeStyles(t), [t]);
@@ -1159,32 +1161,32 @@ export default function DmartApp() {
   // daily users from ever seeing these — their "tomorrow" keeps getting
   // pushed forward. Requests notification permission on the fly since
   // there's no separate enable toggle to trigger the prompt.
-  async function scheduleDailyTestReminders(hour, minute, currentIds) {
-    let perm = await Notifications.getPermissionsAsync();
-    if (!perm.granted) {
-      try { perm = await Notifications.requestPermissionsAsync(); } catch {}
-    }
-    if (!perm.granted) return; // no permission — nothing to schedule yet, will retry next app open
-    await cancelDailyTestNotifications(currentIds);
-    const ids = [];
-    const now = new Date();
-    for (let dayOffset = 1; dayOffset <= DAILY_TEST_LOOKAHEAD_DAYS; dayOffset++) {
-      const fireDate = new Date(now);
-      fireDate.setDate(fireDate.getDate() + dayOffset);
-      fireDate.setHours(hour, minute, 0, 0);
-      const message = DAILY_TEST_MESSAGES[(dayOffset - 1) % DAILY_TEST_MESSAGES.length];
-      try {
-        const id = await Notifications.scheduleNotificationAsync({
-          content: { title: "MindCart", body: message },
-          trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: fireDate, channelId: "default" },
-        });
-        ids.push(id);
-      } catch {
-        // scheduling can fail without permission — safe to skip that day
-      }
-    }
-    setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute, notifIds: ids } }));
-  }
+  // async function scheduleDailyTestReminders(hour, minute, currentIds) {
+  //   let perm = await Notifications.getPermissionsAsync();
+  //   if (!perm.granted) {
+  //     try { perm = await Notifications.requestPermissionsAsync(); } catch {}
+  //   }
+  //   if (!perm.granted) return; // no permission — nothing to schedule yet, will retry next app open
+  //   await cancelDailyTestNotifications(currentIds);
+  //   const ids = [];
+  //   const now = new Date();
+  //   for (let dayOffset = 1; dayOffset <= DAILY_TEST_LOOKAHEAD_DAYS; dayOffset++) {
+  //     const fireDate = new Date(now);
+  //     fireDate.setDate(fireDate.getDate() + dayOffset);
+  //     fireDate.setHours(hour, minute, 0, 0);
+  //     const message = DAILY_TEST_MESSAGES[(dayOffset - 1) % DAILY_TEST_MESSAGES.length];
+  //     try {
+  //       const id = await Notifications.scheduleNotificationAsync({
+  //         content: { title: "MindCart", body: message },
+  //         trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: fireDate, channelId: "default" },
+  //       });
+  //       ids.push(id);
+  //     } catch {
+  //       // scheduling can fail without permission — safe to skip that day
+  //     }
+  //   }
+  //   setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute, notifIds: ids } }));
+  // }
   function updateDailyTestTime(hour, minute) {
     setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute } }));
   }
@@ -1604,12 +1606,12 @@ function confirmStartNewTrip() {
               {exportingPdf ? (
                 <ActivityIndicator size="small" color={t.text} />
               ) : (
-                <FileDown size={16} color={t.text} />
+                <Share2 size={16} color={t.text} />
               )}
             </TouchableOpacity>
-            <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
+            {/* <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
               <Menu size={16} color={t.text} />
-            </TouchableOpacity>
+            </TouchableOpacity> */}
           </View>
         </View>
 
@@ -1670,16 +1672,18 @@ function confirmStartNewTrip() {
           </View>
         ) : null}
 
-        <View style={s.searchWrap}>
-          <Search size={15} color={t.muted} style={s.searchIcon} />
-          <TextInput
-            value={search}
-            onChangeText={setSearch}
-            placeholder={`Search "${selectedList ? selectedList.name : ""}"...`}
-            placeholderTextColor={t.muted}
-            style={s.searchInput}
-          />
-        </View>
+          {showSearch && (
+            <View style={s.searchWrap}>
+              <Search size={15} color={t.muted} style={s.searchIcon} />
+              <TextInput
+                value={search}
+                onChangeText={setSearch}
+                placeholder={`Search "${selectedList ? selectedList.name : ""}"...`}
+                placeholderTextColor={t.muted}
+                style={s.searchInput}
+              />
+            </View>
+          )}
 
         <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
           {tab === "home" && (
@@ -2546,21 +2550,21 @@ function confirmStartNewTrip() {
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
             <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
               <Text style={s.sheetTitle}>Shopping reminders</Text>
-              <TouchableOpacity onPress={() => setReminderModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
+              {/* <TouchableOpacity onPress={() => setReminderModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity> */}
             </View>
             <Text style={{ fontSize: 12.5, color: t.muted, marginBottom: 14 }}>
               Get notified if a list has gone quiet for a while. Any activity on a list (adding, checking off, or starting a new trip) resets its countdown.
             </Text>
 
-            <TouchableOpacity
+            {/* <TouchableOpacity
               onPress={() => toggleReminders(!reminderSettings.enabled)}
               style={[s.listRow, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }]}
-            >
+            > 
               <Text style={{ color: t.text, fontWeight: "600", fontSize: 14 }}>Enable reminders</Text>
               <View style={{ width: 40, height: 22, borderRadius: 11, backgroundColor: reminderSettings.enabled ? t.accent : t.border, padding: 2, justifyContent: "center" }}>
                 <View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: "#fff", marginLeft: reminderSettings.enabled ? 18 : 0 }} />
               </View>
-            </TouchableOpacity>
+            </TouchableOpacity>*/}
 
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 14 }}>
               <Text style={{ color: t.text, fontSize: 14 }}>Remind me after</Text>
@@ -2573,7 +2577,7 @@ function confirmStartNewTrip() {
               <Text style={{ color: t.text, fontSize: 14 }}>days of no activity</Text>
             </View>
 
-            <View style={{ marginTop: 22, paddingTop: 16, borderTopWidth: 1, borderColor: t.border }}>
+            {/* <View style={{ marginTop: 22, paddingTop: 16, borderTopWidth: 1, borderColor: t.border }}>
               <Text style={{ color: t.text, fontWeight: "700", fontSize: 14, marginBottom: 4 }}>Daily testing reminder</Text>
 
               <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
@@ -2622,7 +2626,7 @@ function confirmStartNewTrip() {
                   )}
                 </View>
               )}
-            </View>
+            </View> */}
             </ScrollView>
           </Pressable>
         </Pressable>

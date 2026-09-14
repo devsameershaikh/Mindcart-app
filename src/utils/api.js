@@ -39,24 +39,33 @@ import { registerExecutors, enqueue, startSync, subscribe, getPendingCount, getP
 // loopback addresses below, which do NOT work on a real device:
 //   - Android emulator -> 10.0.2.2 (maps to your computer's localhost)
 //   - iOS simulator     -> localhost (shares your computer's network stack)
-const PROD_API_URL = ""; // e.g. "https://mindcart-backend.up.railway.app"
-const DEV_LAN_IP = ""; // e.g. "192.168.1.23" — required for a physical device
 
-function resolveApiBaseUrl() {
-  if (!__DEV__) {
-    if (!PROD_API_URL) {
-      console.warn(
-        "[api.js] PROD_API_URL is empty in a production build — every request will fail. Set it before publishing."
-      );
-    }
-    return PROD_API_URL || "http://localhost:4000";
+
+const DEV_LAN_IP = process.env.EXPO_PUBLIC_DEV_LAN_IP;
+const PROD_API_URL = process.env.EXPO_PUBLIC_PROD_API_URL;
+const ENV = process.env.EXPO_PUBLIC_ENV;
+
+
+export function resolveApiBaseUrl() {
+  if (ENV === "prod") {
+    console.log("[api.js] Environment: PROD");
+    console.log("[api.js] API:", PROD_API_URL);
+
+    return PROD_API_URL;
   }
-  if (DEV_LAN_IP) return `http://${DEV_LAN_IP}:4000`;
-  if (Platform.OS === "android") return "http://10.0.2.2:4000"; // Android emulator only
-  return "http://localhost:4000"; // iOS simulator only
+
+  if (ENV === "dev") {
+    console.log("[api.js] Environment: DEV");
+    console.log("[api.js] API:", DEV_LAN_IP);
+
+    return `http://${DEV_LAN_IP}:4000`;
+  }
+
+  throw new Error(`[api.js] Unknown environment: ${ENV}`);
 }
 
 export const API_BASE_URL = resolveApiBaseUrl();
+console.log(`[api.js] API_BASE_URL = ${API_BASE_URL}`);
 const TOKEN_KEY = "mindcart_session_token_v1";
 
 console.log(`[api.js] API_BASE_URL = ${API_BASE_URL}`);

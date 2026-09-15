@@ -19,26 +19,48 @@ import {
   Linking,
   ActivityIndicator,
   AppState,
+  LayoutAnimation,
+  UIManager,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
+console.log("Swipeable:", Swipeable);
+import * as Haptics from "expo-haptics";
 import {
   Plus, Trash2, Moon, SunMedium, Search, Settings, ChevronDown, Check,
   FileDown, Home, ListPlus, EyeOff, RotateCcw, Pencil, X, ListChecks,
   Barcode, Bell, Menu, BellRing, Info, Mail, ShieldCheck, FileText,
-  ChevronRight,
+  ChevronRight, Users, Layers, UserCircle2, Eye,
+  Cloud, Crown, Sparkles, LogOut, Palette, Wallet, BellDot,
+  Zap, ArrowRight, Star, ShoppingBag,
 } from "lucide-react-native";
 
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
-import { getTheme } from "./src/utils/theme";
+import { getTheme, RADIUS } from "./src/utils/theme";
 import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, clampQty, clampPrice } from "./src/utils/helpers";
 import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
 import SimpleSelect from "./src/components/Simpleselect";
+import FamilySyncScreen from "./src/screens/FamilySyncScreen";
+import { useAuth } from "./src/context/AuthContext";
+import {
+  fetchLists, createList as createListApi, renameList as renameListApi, deleteListApi,
+  createItem as createItemApi, updateItemApi, deleteItemApi,
+  sendInvite, fetchInvites, acceptInvite, declineInvite, revokeInvite,
+  changeMemberRole as changeMemberRoleApi, removeMember as removeMemberApi,
+  getPendingSyncListIds, onSyncDropped,
+} from "./src/utils/api";
+import { getSocket, joinListRoom } from "./src/utils/socket";
+import { Share2 } from "lucide-react-native";
 
 // This app is local-first: everything lives in on-device storage (see
-// storage.js). There is no login, no backend, and no network calls for
-// list/item data. storage.js is the single seam where cloud sync could be
-// added later without touching the rest of this file.
+// storage.js) by default, so it works fully offline with no account.
+// Signing in with Google (AuthContext) additionally syncs specific lists to
+// the MindCart backend (Neon Postgres via Prisma) so they can be shared with
+// family and stay live across devices. A list is a "cloud list" once it has
+// a `role` field on it (OWNER/WRITE/READ, set when it's fetched from or
+// created on the server) — local-only lists never get that field and are
+// never sent anywhere.
 
 // ---------- Currency ----------
 // Symbol-only: picking a currency just changes the label shown next to
@@ -133,18 +155,102 @@ const DAILY_TEST_LOOKAHEAD_DAYS = 60;
 const DAILY_TEST_DEFAULT_HOUR = 20; // 8 PM, 24h device-local time
 const DAILY_TEST_DEFAULT_MINUTE = 0;
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: false,
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-  }),
-});
+// Notifications.setNotificationHandler({
+//   handleNotification: async () => ({
+//     shouldShowAlert: true,
+//     shouldPlaySound: false,
+//     shouldSetBadge: false,
+//     shouldShowBanner: true,
+//     shouldShowList: true,
+//   }),
+// });
+
+// Old-architecture Android needs this opt-in for LayoutAnimation to animate
+// list insert/remove/reorder; harmless no-op everywhere else (new
+// architecture / iOS animate these automatically).
+if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
+// Small helper so every "this changes the shape of the list" action gets
+// the same gentle ease-in-ease-out slide/fade instead of an abrupt pop.
+function animateListChange() {
+  LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+}
+// Best-effort haptics — silently no-ops on web/unsupported devices.
+function tapHaptic(style) {
+  Haptics.impactAsync(style || Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+}
 
 function CurrencyGlyph({ symbol, color, size = 12 }) {
   return <Text style={{ color, fontSize: size, fontWeight: "800" }}>{symbol}</Text>;
+}
+
+// Converts an items array into the { itemId: item } map shape used by
+// itemsByList. Used for the local-storage migration and anywhere a batch
+// of items (e.g. from the server) needs folding into that map at once.
+function arrayToItemMap(arr) {
+  const map = {};
+  for (const it of arr) map[it.id] = it;
+  return map;
+}
+
+// Turns a dropped sync-queue op (one that failed for a real server reason,
+// not just connectivity — see syncQueue.js) into a human-readable sentence
+// fragment for the notice banner. The most common real-world case this
+// covers: you edited a list while offline, but were removed from it (or it
+// was deleted) before the edit could reach the server — without this, that
+// edit just silently vanishes with zero explanation.
+function describeDroppedOp(op, lists) {
+  const listId = op.payload?.listId || op.payload?.id;
+  const list = lists.find((l) => l.id === listId);
+  const listLabel = list ? `"${list.name}"` : "a list";
+  switch (op.type) {
+    case "createList": return `create the list "${op.payload?.name || ""}"`;
+    case "renameList": return `rename ${listLabel}`;
+    case "deleteList": return `delete ${listLabel}`;
+    case "createItem": return `add "${op.payload?.body?.name || "an item"}" to ${listLabel}`;
+    case "updateItem": return `save an item change in ${listLabel}`;
+    case "deleteItem": return `delete an item from ${listLabel}`;
+    default: return `sync a change to ${listLabel}`;
+  }
+}
+
+// A checkbox that gives a small satisfying "pop" (scale bounce) + a light
+// haptic tap whenever it's toggled, instead of just flipping state instantly.
+function AnimatedCheckbox({ checked, onPress, style }) {
+  const scale = useRef(new Animated.Value(1)).current;
+  function handlePress() {
+    tapHaptic(Haptics.ImpactFeedbackStyle.Medium);
+    Animated.sequence([
+      Animated.timing(scale, { toValue: 0.75, duration: 70, useNativeDriver: true }),
+      Animated.spring(scale, { toValue: 1, useNativeDriver: true, friction: 4, tension: 140 }),
+    ]).start();
+    onPress();
+  }
+  return (
+    <TouchableOpacity onPress={handlePress} activeOpacity={0.8}>
+      <Animated.View style={[style, { transform: [{ scale }] }]}>
+        {checked && <Check size={13} color="#fff" />}
+      </Animated.View>
+    </TouchableOpacity>
+  );
+}
+
+// Red "Delete" panel revealed by swiping an item row to the left —
+// used by <Swipeable renderRightActions={...}> below.
+function SwipeDeleteAction({ t, onDelete }) {
+  return (
+    <TouchableOpacity
+      onPress={() => { tapHaptic(Haptics.ImpactFeedbackStyle.Heavy); onDelete(); }}
+      style={{
+        backgroundColor: t.danger, justifyContent: "center", alignItems: "center",
+        width: 76, borderRadius: RADIUS.md, marginLeft: 8, gap: 3,
+      }}
+    >
+      <Trash2 size={17} color="#fff" />
+      <Text style={{ color: "#fff", fontSize: 10.5, fontWeight: "700" }}>Delete</Text>
+    </TouchableOpacity>
+  );
 }
 
 export default function DmartApp() {
@@ -155,11 +261,14 @@ export default function DmartApp() {
   const [dark, setDark] = useState(true);
 
   const [lists, setLists] = useState([]);
+  const listsRef = useRef(lists); // lets the sync-drop listener (registered once) read fresh list names without re-subscribing
+  useEffect(() => { listsRef.current = lists; }, [lists]);
   const [selectedListId, setSelectedListId] = useState(null);
   const [itemsByList, setItemsByList] = useState({});
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
 
   const [tab, setTab] = useState("home");
+  const [homeFilter, setHomeFilter] = useState("all"); // "all" | "pending" | "bought"
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
@@ -205,6 +314,18 @@ export default function DmartApp() {
   const editItemInputRef = useRef(null);
   const currencySearchInputRef = useRef(null);
 
+  // ---------- New sections (UI-only shells: Master Items) ----------
+  const MASTER_ITEMS = [
+    { name: "Basmati Rice", category: "Kitchen", unit: "kg" },
+    { name: "Milk", category: "Dairy", unit: "litre" },
+    { name: "Eggs", category: "Dairy", unit: "packet" },
+    { name: "Bread", category: "Bakery", unit: "loaf" },
+    { name: "Onions", category: "Produce", unit: "kg" },
+    { name: "Tomatoes", category: "Produce", unit: "kg" },
+    { name: "Cooking Oil", category: "Kitchen", unit: "litre" },
+    { name: "Sugar", category: "Kitchen", unit: "kg" },
+  ];
+
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
   const [dailyTestPickerOpen, setDailyTestPickerOpen] = useState(false);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
@@ -212,6 +333,353 @@ export default function DmartApp() {
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const [termsModalOpen, setTermsModalOpen] = useState(false);
   const [confirmNewTripOpen, setConfirmNewTripOpen] = useState(false);
+
+  // ---------- Cloud sync (Google sign-in + Neon backend) ----------
+  const { user, authLoading, signingIn, signIn, signOut } = useAuth();
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [cloudMembersByList, setCloudMembersByList] = useState({}); // listId -> members[] (from GET /lists)
+  const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
+  const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
+  const [respondingInviteId, setRespondingInviteId] = useState(null);
+  const [makingShareable, setMakingShareable] = useState(false);
+  const [revokingInviteId, setRevokingInviteId] = useState(null);
+  const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
+  const showSearch = tab === "home"||tab === "add";
+
+  // Pull down every list this account owns or has been shared into, once
+  // right after sign-in. Cloud lists are merged in alongside any local-only
+  // lists (kept exactly as they were, untouched) rather than replacing them.
+  useEffect(() => {
+    console.log("Sign-in effect: user changed:", user);
+    if (!user) return;
+    let cancelled = false;
+    (async () => {
+      setCloudSyncing(true);
+      try {
+        const { lists: cloudLists } = await fetchLists();
+        if (cancelled) return;
+        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+
+        let legacyLocal = [];
+        let lostAccessIds = [];
+        let staleSeedIds = [];
+        setLists((prev) => {
+          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+          const staleSeeds = cloudLists.length
+            ? notInCloud.filter((l) => l.isDefaultSeed && !l.cloudConfirmed)
+            : [];
+          staleSeedIds = staleSeeds.map((l) => l.id);
+          const keepable = notInCloud.filter((l) => !staleSeedIds.includes(l.id));
+  
+          legacyLocal = keepable.filter((l) => !l.cloudConfirmed);
+          lostAccessIds = keepable.filter((l) => l.cloudConfirmed).map((l) => l.id);
+          const cloudAsLocal = cloudLists.map((cl) => ({
+            id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
+            createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
+          }));
+          const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
+          return [...cloudAsLocal, ...promoted];
+        });
+        if (lostAccessIds.length) {
+          setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
+        }
+        if (staleSeedIds.length) {
+          setItemsByList((p) => { const n = { ...p }; staleSeedIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (staleSeedIds.includes(cur) ? null : cur));
+        }
+
+        const neverMigrated = legacyLocal.filter((l) => !l.role);
+
+        for (const l of neverMigrated) {
+          let migrateResult;
+          try {
+            migrateResult = await createListApi(l.id, l.name);
+          } catch (e) {
+            setNotice(`Couldn't move "${l.name}" to the cloud: ${e?.message || "unknown error"}`);
+            continue; // don't attempt its items against a list that never landed
+          }
+
+          if (!migrateResult?.queued) {
+            setLists((prev) => prev.map((pl) => (pl.id === l.id ? { ...pl, cloudConfirmed: true } : pl)));
+          }
+          const existingItems = Object.values(itemsByList[l.id] || {});
+          for (const it of existingItems) {
+            try {
+              await createItemApi(l.id, { id: it.id, name: it.name, category: it.category, unit: it.unit, price: it.price || null });
+              if (it.checked || it.skipped || it.qty || it.note) {
+                await updateItemApi(l.id, it.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
+              }
+            } catch (e) {
+              setNotice(`Couldn't sync "${it.name}" from "${l.name}": ${e?.message || "unknown error"}`);
+            }
+          }
+        }
+
+        const pendingListIds = getPendingSyncListIds();
+        setItemsByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) {
+            if (pendingListIds.has(cl.id)) continue;
+            next[cl.id] = arrayToItemMap(cl.items);
+          }
+          return next;
+        });
+        setCloudMembersByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) next[cl.id] = cl.members;
+          return next;
+        });
+        // If nothing is selected yet (or the only thing selected was the
+        // placeholder local default list) and cloud lists exist, land on one.
+        if (cloudLists.length) {
+          setSelectedListId((cur) => (cur ? cur : cloudLists[0].id));
+        }
+      } catch (e) {
+        setNotice(`Couldn't load your cloud lists: ${e?.message || "network error"}`);
+      } finally {
+        if (!cancelled) setCloudSyncing(false);
+      }
+      try {
+        const { received } = await fetchInvites();
+        if (!cancelled) setReceivedInvites(received);
+      } catch { /* non-fatal — the invite banner just stays empty */ }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
+  // Accept/decline an invite someone sent *to* me. Accepting immediately
+  // pulls the newly-shared list(s) so they show up without a manual refresh.
+  async function respondToInvite(invite, accept) {
+    setRespondingInviteId(invite.id);
+    try {
+      if (accept) {
+        await acceptInvite(invite.id);
+        const { lists: cloudLists } = await fetchLists();
+        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+        // Same fix as the sign-in merge above: keep any list the server
+        // doesn't currently return, full stop — never key that decision
+        // off `.role`, since a list gets that tag optimistically before
+        // the server has necessarily confirmed it. This is the exact spot
+        // that was deleting the accepting user's OWN lists: their list
+        // already had `role: "OWNER"` from being created/migrated earlier,
+        // so it failed the old "keep if no role" check, and if it also
+        // hadn't finished syncing to the server yet it was missing from
+        // `cloudLists` too — so it matched neither bucket and disappeared.
+        let lostAccessIds = [];
+        setLists((prev) => {
+          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+          const keepAsIs = notInCloud.filter((l) => !l.cloudConfirmed);
+          lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
+          const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true }));
+          return [...cloudAsLocal, ...keepAsIs];
+        });
+        if (lostAccessIds.length) {
+          setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
+        }
+        // Avoid clobbering a DIFFERENT list's not-yet-synced local edits —
+        // accepting an invite refreshes every cloud list, not just the
+        // newly shared one, so without this guard an unrelated list with a
+        // pending offline change could get overwritten by a stale server
+        // snapshot the moment this fires.
+        const pendingListIds = getPendingSyncListIds();
+        setItemsByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) {
+            if (pendingListIds.has(cl.id)) continue;
+            next[cl.id] = arrayToItemMap(cl.items);
+          }
+          return next;
+        });
+        setCloudMembersByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.members; return next; });
+        cloudLists.forEach((cl) => joinListRoom(cl.id));
+        setNotice("Invite accepted — the list is now in your list switcher.");
+      } else {
+        await declineInvite(invite.id);
+      }
+      setReceivedInvites((prev) => prev.filter((i) => i.id !== invite.id));
+    } catch (e) {
+      setNotice(`Couldn't ${accept ? "accept" : "decline"} that invite: ${e?.message || "network error"}`);
+      if (e?.status === 404) {
+        // 404 here specifically means the invite can never be actioned
+        // again (already resolved elsewhere, revoked, or its list/owner is
+        // gone) — retrying is pointless, so don't leave a dead card that
+        // just keeps failing every time it's tapped.
+        setReceivedInvites((prev) => prev.filter((i) => i.id !== invite.id));
+      }
+    } finally {
+      setRespondingInviteId(null);
+    }
+  }
+
+  // Surface sync-queue drops (an offline edit that could never legally land
+  // — e.g. you were removed from the list, or it was deleted — as opposed
+  // to a normal connectivity retry, which stays silent by design). Without
+  // this, a dropped edit just disappeared with no explanation. Registered
+  // once; reads listsRef so it always has current list names without
+  // needing to re-subscribe every time `lists` changes.
+  useEffect(() => {
+    onSyncDropped((op, err) => {
+      const action = describeDroppedOp(op, listsRef.current);
+      setNotice(`Couldn't ${action} — you may no longer have access, or it was removed. (${err?.message || "sync failed"})`);
+    });
+  }, []);
+
+  // Live updates: keep every open device in sync while signed in. Socket
+  // connection itself is opened/closed by AuthContext on sign-in/out — this
+  // effect only (un)subscribes the listeners while it's live.
+  useEffect(() => {
+    if (!user) return;
+    const socket = getSocket();
+    if (!socket) return;
+
+    // All three of these are id-keyed map operations now, so it doesn't
+    // matter whether this socket event arrives before or after the local
+    // optimistic update for the same change — upserting/removing by id is
+    // idempotent either way.
+    const onItemCreated = ({ listId, item }) => upsertItem(listId, item);
+    const onItemUpdated = ({ listId, item }) => upsertItem(listId, item);
+    const onItemDeleted = ({ listId, itemId }) => removeItemFromList(listId, itemId);
+    const onListUpdated = ({ listId, name }) =>
+      setLists((prev) => prev.map((l) => (l.id === listId ? { ...l, name } : l)));
+    const onListDeleted = ({ listId }) => {
+      setLists((prev) => prev.filter((l) => l.id !== listId));
+      setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+      setSelectedListId((cur) => (cur === listId ? null : cur));
+    };
+    const onMemberChange = () => {
+      // Cheapest correct way to keep member lists (roles, who's on the
+      // list) fresh after a join/leave/role-change without hand-rolling
+      // three separate partial-update shapes.
+      fetchLists().then(({ lists: cloudLists }) => {
+        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+        setCloudMembersByList((prev) => {
+          const next = { ...prev };
+          for (const cl of cloudLists) next[cl.id] = cl.members;
+          return next;
+        });
+        // A memberRemoved event can mean *you* were removed, and a
+        // memberRoleChanged event can mean *your own* role changed — this
+        // used to only refresh the members panel, so a list you'd just
+        // lost access to (or had downgraded to read-only) kept sitting in
+        // your switcher with its old role, letting you keep tapping "add
+        // item" into a wall of 404s. Only ever act on lists this effect
+        // itself confirmed as real cloud lists (`cloudConfirmed`) — a
+        // list still mid-migration and not yet in a cloudLists response
+        // for an unrelated reason must never get swept up in this.
+        let lostAccessTo = null;
+        setLists((prev) => {
+          const stillMine = [];
+          for (const l of prev) {
+            if (!l.cloudConfirmed) { stillMine.push(l); continue; }
+            const fresh = cloudLists.find((cl) => cl.id === l.id);
+            if (fresh) stillMine.push({ ...l, role: fresh.role, name: fresh.name });
+            else lostAccessTo = l.id; // was cloud-confirmed, now missing -> access revoked
+          }
+          return stillMine;
+        });
+        if (lostAccessTo) {
+          const removedId = lostAccessTo;
+          setItemsByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
+          setSelectedListId((cur) => (cur === removedId ? null : cur));
+          setNotice("You no longer have access to a list that was removed from your account.");
+        }
+      }).catch(() => {});
+    };
+
+    socket.on("item:created", onItemCreated);
+    socket.on("item:updated", onItemUpdated);
+    socket.on("item:deleted", onItemDeleted);
+    socket.on("list:updated", onListUpdated);
+    socket.on("list:deleted", onListDeleted);
+    socket.on("list:memberJoined", onMemberChange);
+    socket.on("list:memberRemoved", onMemberChange);
+    socket.on("list:memberRoleChanged", onMemberChange);
+    const onInviteReceived = ({ invite }) => setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
+    socket.on("invite:received", onInviteReceived);
+
+    // Push accept/decline back to the SENDER's Pending Invites panel live,
+    // instead of only resolving the next time they open the Family tab.
+    // The event payload is just { inviteId } — pendingInvitesByList doesn't
+    // know its own scope per-entry, so just scrub the id out of every
+    // list's cached array; it's a no-op wherever it isn't present.
+    const onInviteAccepted = ({ inviteId }) => {
+      let matched = null;
+      setPendingInvitesByList((prev) => {
+        const next = {};
+        for (const [listId, invites] of Object.entries(prev)) {
+          const found = invites.find((inv) => inv.id === inviteId);
+          if (found) matched = found;
+          next[listId] = invites.filter((inv) => inv.id !== inviteId);
+        }
+        return next;
+      });
+      if (matched) setNotice(`${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+    };
+    const onInviteDeclined = ({ inviteId }) => {
+      let matched = null;
+      setPendingInvitesByList((prev) => {
+        const next = {};
+        for (const [listId, invites] of Object.entries(prev)) {
+          const found = invites.find((inv) => inv.id === inviteId);
+          if (found) matched = found;
+          next[listId] = invites.filter((inv) => inv.id !== inviteId);
+        }
+        return next;
+      });
+      if (matched) setNotice(`${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+    };
+    socket.on("invite:accepted", onInviteAccepted);
+    socket.on("invite:declined", onInviteDeclined);
+
+    // Push revoke back to the RECIPIENT live — previously they only found
+    // out by tapping Accept/Decline and getting a stale "not found".
+    const onInviteRevoked = ({ inviteId }) => {
+      let existed = false;
+      setReceivedInvites((prev) => {
+        existed = prev.some((i) => i.id === inviteId);
+        return prev.filter((i) => i.id !== inviteId);
+      });
+      if (existed) setNotice("An invitation was withdrawn by the sender.");
+    };
+    socket.on("invite:revoked", onInviteRevoked);
+
+    // A standing family member (accepted an "all my lists" invite) gets
+    // this the instant the owner creates a NEW list — no separate
+    // invite/accept round-trip needed for lists that come later.
+    const onListGranted = ({ list }) => {
+      setLists((prev) => {
+        if (prev.some((l) => l.id === list.id)) return prev; // already have it somehow — don't duplicate
+        return [...prev, { id: list.id, name: list.name, ownerId: list.ownerId, role: list.role, createdAt: new Date(list.createdAt).getTime(), cloudConfirmed: true }];
+      });
+      setItemsByList((prev) => (prev[list.id] ? prev : { ...prev, [list.id]: arrayToItemMap(list.items) }));
+      setCloudMembersByList((prev) => ({ ...prev, [list.id]: list.members }));
+      joinListRoom(list.id);
+      const ownerMember = list.members.find((m) => m.role === "OWNER");
+      setNotice(`${ownerMember?.name || ownerMember?.email || "A family member"} added you to "${list.name}".`);
+    };
+    socket.on("list:granted", onListGranted);
+
+    return () => {
+      socket.off("item:created", onItemCreated);
+      socket.off("item:updated", onItemUpdated);
+      socket.off("item:deleted", onItemDeleted);
+      socket.off("list:updated", onListUpdated);
+      socket.off("list:deleted", onListDeleted);
+      socket.off("list:memberJoined", onMemberChange);
+      socket.off("list:memberRemoved", onMemberChange);
+      socket.off("list:memberRoleChanged", onMemberChange);
+      socket.off("invite:received", onInviteReceived);
+      socket.off("invite:accepted", onInviteAccepted);
+      socket.off("invite:declined", onInviteDeclined);
+      socket.off("invite:revoked", onInviteRevoked);
+      socket.off("list:granted", onListGranted);
+    };
+  }, [user]);
 
   // Android 8+ silently drops scheduled notifications without a channel —
   // this only needs to run once, it's a no-op / ignored on iOS.
@@ -232,7 +700,18 @@ export default function DmartApp() {
       setDark(state.theme !== "light");
       setLists(state.lists);
       setSelectedListId(state.selectedListId);
-      setItemsByList(state.itemsByList);
+      // One-time migration: itemsByList used to store `listId -> item[]`.
+      // It's now `listId -> { itemId: item }`. Anyone with existing local
+      // data would otherwise get `Object.values`/map ops on an array,
+      // which happens to work by accident for reads but breaks writes —
+      // so convert once on load and never touch this shape again.
+      const rawItemsByList = state.itemsByList || {};
+      const migrated = {};
+      for (const listId of Object.keys(rawItemsByList)) {
+        const value = rawItemsByList[listId];
+        migrated[listId] = Array.isArray(value) ? arrayToItemMap(value) : value;
+      }
+      setItemsByList(migrated);
       setCategories(state.categories);
       setAppLoaded(true);
     })();
@@ -251,7 +730,7 @@ export default function DmartApp() {
         itemsByList,
         categories,
         preferences: {},
-      });
+      })  
     }, 250);
     return () => clearTimeout(timer);
     // eslint-disable-next-line
@@ -269,13 +748,20 @@ export default function DmartApp() {
     setDebouncedSearch("");
   }, [selectedListId]);
 
+  // Refresh pending invites for a list right when its Family tab is opened,
+  // rather than polling constantly in the background.
+  useEffect(() => {
+    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
+    // eslint-disable-next-line
+  }, [tab, selectedList?.id]);
+
   // clear any pending "undo delete" timer on unmount
   useEffect(() => {
     return () => { if (pendingDelete) clearTimeout(pendingDelete.timer); };
     // eslint-disable-next-line
   }, [pendingDelete]);
 
-  const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
+  // const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
 
   // auto-clear inline notices after a few seconds
   useEffect(() => {
@@ -289,17 +775,17 @@ export default function DmartApp() {
   // sign of the tester actually being here. Must stay above the
   // `if (!appLoaded)` early return below, like every other hook in this
   // component — hooks can't be called conditionally.
-  useEffect(() => {
-    if (!appLoaded) return;
-    const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
-    const minute = Number(dailyTestSettings.minute) ?? DAILY_TEST_DEFAULT_MINUTE;
-    scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
-    const sub = AppState.addEventListener("change", (nextState) => {
-      if (nextState === "active") scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
-    });
-    return () => sub.remove();
-    // eslint-disable-next-line
-  }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
+  // useEffect(() => {
+  //   if (!appLoaded) return;
+  //   const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
+  //   const minute = Number(dailyTestSettings.minute) ?? DAILY_TEST_DEFAULT_MINUTE;
+  //   scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
+  //   const sub = AppState.addEventListener("change", (nextState) => {
+  //     if (nextState === "active") scheduleDailyTestReminders(hour, minute, dailyTestSettings.notifIds);
+  //   });
+  //   return () => sub.remove();
+  //   // eslint-disable-next-line
+  // }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
 
   const t = getTheme(dark);
   const s = useMemo(() => makeStyles(t), [t]);
@@ -312,13 +798,37 @@ export default function DmartApp() {
   const currency = profile.currency || DEFAULT_CURRENCY;
   const needsCurrencySetup = appLoaded && !profile.currency;
   const reminderSettings = profile.reminders || { enabled: false, days: 5 };
+  // Undefined (a profile saved before this setting existed) means "on" —
+  // only an explicit `false` hides the tab, so nobody's bottom nav
+  // silently changes shape on their next app update.
+  const showMasterTab = profile.showMasterTab !== false;
 
   // items/selectedList and the useMemo below must stay ABOVE the
   // `if (!appLoaded)` early return — hooks can't be called conditionally,
   // and useMemo is a hook, so it has to run on every render regardless of
   // whether the loader is about to be shown instead.
-  const items = itemsByList[selectedListId] || [];
+  //
+  // ---------- Items storage: a map keyed by id, per list ----------
+  // itemsByList[listId] is { [itemId]: item }, NOT an array. A map can't
+  // hold two entries under the same key, so "the same item got added
+  // twice" (from a REST response and a socket broadcast both trying to
+  // add it) becomes structurally impossible instead of something every
+  // call site has to remember to guard against.
+  // `items` (below) is the sorted array view used everywhere else in the
+  // component — nothing downstream of `items` needs to know storage is a
+  // map at all.
+  const items = useMemo(() => {
+    const map = itemsByList[selectedListId] || {};
+    return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }, [itemsByList, selectedListId]);
   const selectedList = lists.find((l) => l.id === selectedListId) || lists[0];
+  // A READ-only collaborator could otherwise tap every add/check/edit/delete
+  // control in the UI (none of them are currently disabled for that role) —
+  // the server would correctly reject the write, but only after the local
+  // state was already optimistically changed, leaving their screen showing
+  // something that silently never saved. Local-only lists have no role and
+  // are always writable.
+  const canWrite = !selectedList?.role || selectedList.role !== "READ";
 
   const derived = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
@@ -349,10 +859,59 @@ export default function DmartApp() {
     return i.checked || i.skipped || hasNote || hasPrice || Number(i.qty) !== 0;
   });
 
-  if (!appLoaded) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
+  if (!appLoaded || authLoading) return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
 
+  // Sign-in is mandatory: no user, no app. This check re-runs on every
+  // render, so it also covers sign-out — the moment signOut() clears
+  // `user`, this becomes true again and the login screen comes back,
+  // without any extra "redirect" logic needed.
+  if (!user) {
+    return (
+      <OnboardingScreen
+        t={t} dark={dark} signingIn={signingIn}
+        onGetStarted={signIn}
+      />
+    );
+  }
+
+  // setListItems' updater now receives/returns the { itemId: item } map for
+  // this list, not an array. upsertItem/removeItemFromList/patchItem below
+  // are the only primitives the rest of the component should need — every
+  // one of them is safe to call twice with the same item/id, which is the
+  // whole point (REST responses and socket broadcasts can both fire for
+  // the same change, in either order).
   function setListItems(listId, updater) {
-    setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || []) }));
+    setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || {}) }));
+  }
+  function upsertItem(listId, item) {
+    setListItems(listId, (map) => ({ ...map, [item.id]: item }));
+  }
+  function upsertItems(listId, itemsArr) {
+    setListItems(listId, (map) => ({ ...map, ...arrayToItemMap(itemsArr) }));
+  }
+  function removeItemFromList(listId, itemId) {
+    setListItems(listId, (map) => {
+      if (!(itemId in map)) return map;
+      const next = { ...map };
+      delete next[itemId];
+      return next;
+    });
+  }
+  function patchItem(listId, itemId, patch) {
+    setListItems(listId, (map) => (map[itemId] ? { ...map, [itemId]: { ...map[itemId], ...patch } } : map));
+  }
+  // Replaces a locally-generated optimistic id with the server's
+  // authoritative item once the create request resolves. If the backend
+  // happens to honor the client-supplied id, oldId === newItem.id and this
+  // is just a plain upsert; if the backend generates its own id instead,
+  // this still leaves exactly one copy of the item under the right key.
+  function reconcileOptimisticItem(listId, oldId, newItem) {
+    setListItems(listId, (map) => {
+      const next = { ...map };
+      delete next[oldId];
+      next[newItem.id] = newItem;
+      return next;
+    });
   }
 
   // ---------- List management ----------
@@ -361,18 +920,38 @@ export default function DmartApp() {
     setListNameError("");
     setNewListModalOpen(true);
   }
-  function addList() {
+  async function addList() {
     const err = validateListName(newListName, lists);
     setListNameError(err);
     if (err) return;
+    const name = newListName.trim();
+
+    // Every list is a cloud list from creation now, under a permanent
+    // client-generated id (see makeId/storage.js). createListApi tries
+    // the network immediately; if there's no connection it queues the
+    // create instead of failing, so this succeeds either way — the list
+    // just shows as `pending` until the queue flushes and the real
+    // server copy comes back over the socket.
     const id = makeId("list");
-    setLists((prev) => [...prev, { id, name: newListName.trim(), createdAt: Date.now(), lastActivityAt: Date.now() }]);
-    setItemsByList((prev) => ({ ...prev, [id]: [] }));
+    const createdAt = Date.now();
+    let queued = false;
+    try {
+      const result = await createListApi(id, name);
+      queued = !!result.queued;
+    } catch (e) {
+      setListNameError(e?.message || "Couldn't create this list.");
+      return;
+    }
+
+    setLists((prev) => [...prev, { id, name, role: "OWNER", createdAt, lastActivityAt: Date.now(), pending: queued }]);
+    setItemsByList((prev) => ({ ...prev, [id]: {} }));
+    setCloudMembersByList((prev) => ({ ...prev, [id]: [{ ...user, role: "OWNER" }] }));
+    joinListRoom(id);
     setSelectedListId(id);
     setNewListName("");
     setListNameError("");
     setNewListModalOpen(false);
-    if (reminderSettings.enabled) scheduleReminderForList({ id, name: newListName.trim() }, Number(reminderSettings.days) || 5);
+    if (reminderSettings.enabled) scheduleReminderForList({ id, name }, Number(reminderSettings.days) || 5);
   }
   function startRenameList(list) {
     setRenamingListId(list.id);
@@ -382,10 +961,21 @@ export default function DmartApp() {
   function commitRenameList() {
     const err = validateListName(renameDraft, lists, renamingListId);
     if (err) { setListNameError(err); return; }
-    setLists((prev) => prev.map((l) => (l.id === renamingListId ? { ...l, name: renameDraft.trim() } : l)));
+    const name = renameDraft.trim();
+    const target = lists.find((l) => l.id === renamingListId);
+    if (target?.role && target.role !== "OWNER" && target.role !== "WRITE") {
+      setNotice("You have view-only access to this list.");
+      setRenamingListId(null);
+      return;
+    }
+    setLists((prev) => prev.map((l) => (l.id === renamingListId ? { ...l, name } : l)));
     setRenamingListId(null);
     setRenameDraft("");
     setListNameError("");
+    renameListApi(renamingListId, name).catch((e) => {
+      setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
+      setNotice(`Rename didn't save, so it's been undone: ${e?.message || "network error"}`);
+    });
   }
   function deleteList(listId) {
     if (lists.length <= 1) {
@@ -400,6 +990,95 @@ export default function DmartApp() {
     setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
     if (selectedListId === listId) setSelectedListId(remaining[0].id);
     setConfirmDeleteListId(null);
+    deleteListApi(listId).catch((e) => setNotice(`Delete didn't sync: ${e?.message || "network error"}`));
+  }
+
+  // ---------- Family sharing ----------
+  // Every list gets created in the cloud from the start now (see addList),
+  // so in normal use this never has anything to do. It only matters for
+  // lists that predate this change and are still sitting around without a
+  // `role` (the mount-time migration below promotes those automatically,
+  // but this is a manual fallback for the same case). Since the list and
+  // its items already own their permanent ids, this just pushes the
+  // EXISTING ids to the server — no more re-creating everything under new
+  // ids, which is also what makes it safe to retry if it's interrupted.
+  async function makeListShareable(list) {
+    if (!user) { signIn(); return; }
+    setMakingShareable(true);
+    try {
+      const result = await createListApi(list.id, list.name);
+      const existing = Object.values(itemsByList[list.id] || {});
+      for (const it of existing) {
+        await createItemApi(list.id, { id: it.id, name: it.name, category: it.category, unit: it.unit, price: it.price || null });
+        if (it.checked || it.skipped || it.qty || it.note) {
+          await updateItemApi(list.id, it.id, { checked: it.checked, skipped: it.skipped, qty: it.qty, note: it.note });
+        }
+      }
+      // Only mark it cloudConfirmed if the create actually reached the
+      // server — if it got queued offline instead, the sign-in sync's
+      // cloudIds check (and the socket handlers' cloudConfirmed check)
+      // need to keep treating it as "not yet on the server" until the
+      // queue actually flushes it, or it'd risk being swept up by the
+      // member-change/accept-invite cleanup logic before it's really there.
+      setLists((prev) => prev.map((l) => (l.id === list.id ? { ...l, role: "OWNER", cloudConfirmed: !result?.queued } : l)));
+      setCloudMembersByList((prev) => ({ ...prev, [list.id]: [{ id: user.id, name: user.name, email: user.email, avatarUrl: user.avatarUrl, role: "OWNER" }] }));
+      joinListRoom(list.id);
+      setNotice(`"${list.name}" is now shareable.`);
+    } catch (e) {
+      setNotice(`Couldn't move this list to the cloud: ${e?.message || "network error"}`);
+    } finally {
+      setMakingShareable(false);
+    }
+  }
+
+  async function refreshInvitesForList(listId) {
+    try {
+      const { sent } = await fetchInvites();
+      const mine = sent.filter((inv) => inv.status === "PENDING" && (inv.listId === listId || inv.inviteAllLists));
+      setPendingInvitesByList((prev) => ({ ...prev, [listId]: mine }));
+    } catch { /* best-effort — the members list still works without this */ }
+  }
+
+  // role: "READ" | "WRITE". allLists=true invites as a standing family
+  // member across every list the owner has (and will create) instead of
+  // just this one — the better option for an actual household, not just a
+  // one-off shared list.
+  async function inviteFamilyMember(list, { email, role, allLists }) {
+    try {
+      await sendInvite({ recipientEmail: email, role, listId: allLists ? undefined : list.id, allLists: !!allLists });
+      setNotice(allLists ? `Invited ${email} as a family member — they'll get every list you own.` : `Invited ${email} to "${list.name}".`);
+      refreshInvitesForList(list.id);
+    } catch (e) {
+      setNotice(`Invite failed: ${e?.message || "network error"}`);
+    }
+  }
+  async function revokeFamilyInvite(inviteId, listId) {
+    setRevokingInviteId(inviteId);
+    try { await revokeInvite(inviteId); refreshInvitesForList(listId); }
+    catch (e) { setNotice(`Couldn't revoke invite: ${e?.message || "network error"}`); }
+    finally { setRevokingInviteId(null); }
+  }
+  async function changeFamilyMemberRole(listId, userId, role) {
+    setBusyMemberId(userId);
+    try {
+      await changeMemberRoleApi(listId, userId, role);
+      setCloudMembersByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).map((m) => (m.id === userId ? { ...m, role } : m)) }));
+    } catch (e) {
+      setNotice(`Couldn't change that member's role: ${e?.message || "network error"}`);
+    } finally {
+      setBusyMemberId(null);
+    }
+  }
+  async function removeFamilyMember(listId, userId) {
+    setBusyMemberId(userId);
+    try {
+      await removeMemberApi(listId, userId);
+      setCloudMembersByList((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((m) => m.id !== userId) }));
+    } catch (e) {
+      setNotice(`Couldn't remove that member: ${e?.message || "network error"}`);
+    } finally {
+      setBusyMemberId(null);
+    }
   }
   // Budget is stored per-list (like price, as the raw string from the
   // input) so an empty field just means "no budget set" rather than 0.
@@ -453,6 +1132,14 @@ export default function DmartApp() {
       setProfile((prev) => ({ ...prev, reminders: { ...(prev.reminders || {}), enabled: false } }));
     }
   }
+  // ---------- Master tab visibility ----------
+  // Lets someone who doesn't use the quick-add "Master Items" shelf hide
+  // it from their bottom nav. Toggling it off while it's the active tab
+  // bounces back to Home so the app never leaves a hidden tab selected.
+  function toggleMasterTab(nextShown) {
+    setProfile((prev) => ({ ...prev, showMasterTab: nextShown }));
+    if (!nextShown && tab === "master") setTab("home");
+  }
   async function updateReminderDays(value) {
     setProfile((prev) => ({ ...prev, reminders: { ...(prev.reminders || {}), enabled: prev.reminders?.enabled || false, days: value } }));
     if (reminderSettings.enabled) {
@@ -474,32 +1161,32 @@ export default function DmartApp() {
   // daily users from ever seeing these — their "tomorrow" keeps getting
   // pushed forward. Requests notification permission on the fly since
   // there's no separate enable toggle to trigger the prompt.
-  async function scheduleDailyTestReminders(hour, minute, currentIds) {
-    let perm = await Notifications.getPermissionsAsync();
-    if (!perm.granted) {
-      try { perm = await Notifications.requestPermissionsAsync(); } catch {}
-    }
-    if (!perm.granted) return; // no permission — nothing to schedule yet, will retry next app open
-    await cancelDailyTestNotifications(currentIds);
-    const ids = [];
-    const now = new Date();
-    for (let dayOffset = 1; dayOffset <= DAILY_TEST_LOOKAHEAD_DAYS; dayOffset++) {
-      const fireDate = new Date(now);
-      fireDate.setDate(fireDate.getDate() + dayOffset);
-      fireDate.setHours(hour, minute, 0, 0);
-      const message = DAILY_TEST_MESSAGES[(dayOffset - 1) % DAILY_TEST_MESSAGES.length];
-      try {
-        const id = await Notifications.scheduleNotificationAsync({
-          content: { title: "MindCart", body: message },
-          trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: fireDate, channelId: "default" },
-        });
-        ids.push(id);
-      } catch {
-        // scheduling can fail without permission — safe to skip that day
-      }
-    }
-    setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute, notifIds: ids } }));
-  }
+  // async function scheduleDailyTestReminders(hour, minute, currentIds) {
+  //   let perm = await Notifications.getPermissionsAsync();
+  //   if (!perm.granted) {
+  //     try { perm = await Notifications.requestPermissionsAsync(); } catch {}
+  //   }
+  //   if (!perm.granted) return; // no permission — nothing to schedule yet, will retry next app open
+  //   await cancelDailyTestNotifications(currentIds);
+  //   const ids = [];
+  //   const now = new Date();
+  //   for (let dayOffset = 1; dayOffset <= DAILY_TEST_LOOKAHEAD_DAYS; dayOffset++) {
+  //     const fireDate = new Date(now);
+  //     fireDate.setDate(fireDate.getDate() + dayOffset);
+  //     fireDate.setHours(hour, minute, 0, 0);
+  //     const message = DAILY_TEST_MESSAGES[(dayOffset - 1) % DAILY_TEST_MESSAGES.length];
+  //     try {
+  //       const id = await Notifications.scheduleNotificationAsync({
+  //         content: { title: "MindCart", body: message },
+  //         trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: fireDate, channelId: "default" },
+  //       });
+  //       ids.push(id);
+  //     } catch {
+  //       // scheduling can fail without permission — safe to skip that day
+  //     }
+  //   }
+  //   setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute, notifIds: ids } }));
+  // }
   function updateDailyTestTime(hour, minute) {
     setProfile((prev) => ({ ...prev, dailyTest: { ...(prev.dailyTest || {}), hour, minute } }));
   }
@@ -538,8 +1225,11 @@ export default function DmartApp() {
   }
 
   // ---------- Item management ----------
-  function addItem() {
+  async function addItem() {
+    console.log("Adding item:", fName, fCategory, fUnit, fPrice);
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (!fName.trim()) return;
+    console.log("Raw input:", fName);
     const rawNames = fName.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 20);
     if (rawNames.length === 0) return;
     const category = (fCategory || "Other").trim() || "Other";
@@ -555,6 +1245,7 @@ export default function DmartApp() {
       if (validationErr) { errors.push(validationErr); continue; }
       seenInBatch.push(capped);
       toAdd.push(capped);
+      console.log("Adding item:", capped);
     }
 
     if (toAdd.length === 0) {
@@ -563,19 +1254,53 @@ export default function DmartApp() {
     }
     setItemNameError("");
 
-    const newItems = toAdd.map((name) => ({
-      id: makeId("item"),
-      name,
-      category,
-      qty: 0,
-      unit: fUnit,
-      price: fPrice || "",
-      checked: false,
-      skipped: false,
-      note: "",
-      createdAt: Date.now(),
-    }));
-    setListItems(selectedListId, (prev) => [...prev, ...newItems]);
+    animateListChange();
+
+    // Optimistic: show the item immediately under its permanent,
+    // client-generated id (this is the SAME id the server will store it
+    // under, online or not — see makeId/storage.js). createItemApi tries
+    // the network right away; if that fails only because there's no
+    // connection, it queues the write and resolves anyway (queued: true)
+    // instead of throwing, so the item just stays on screen marked
+    // `pending` until the real server copy arrives over the socket once
+    // the queue flushes. A genuine failure (bad request, no permission)
+    // still throws and gets rolled back below.
+    for (const name of toAdd) {
+      const id = makeId("item");
+      upsertItem(selectedListId, {
+        id, name, category, qty: 0, unit: fUnit, price: fPrice || "",
+        checked: false, skipped: false, note: "", createdAt: Date.now(), pending: true,
+      });
+      try {
+        const { item, queued } = await createItemApi(selectedListId, { id, name, category, unit: fUnit, price: fPrice || null });
+        // reconcileOptimisticItem (not upsertItem): if the server ever
+        // returns a different id than the one we optimistically rendered
+        // under, this removes the stale local-id copy instead of leaving
+        // two entries on screen for one saved row.
+        if (!queued) reconcileOptimisticItem(selectedListId, id, item); // clears pending; if queued it stays pending until the socket confirms it later
+      } catch (e) {
+        if (e?.status === 404) {
+          // The list looks synced locally (it has a role) but doesn't
+          // actually exist on the server — most likely an earlier create
+          // for the list itself never landed. Recreating is a safe no-op
+          // if it already exists (the backend treats a repeat id as
+          // success), so just retry once instead of dropping the item.
+          try {
+            await createListApi(selectedListId, selectedList.name);
+            const { item, queued } = await createItemApi(selectedListId, { id, name, category, unit: fUnit, price: fPrice || null });
+            if (!queued) reconcileOptimisticItem(selectedListId, id, item);
+            continue;
+          } catch (e2) {
+            removeItemFromList(selectedListId, id);
+            setNotice(`Couldn't add "${name}": ${e2?.message || "something went wrong"}`);
+            continue;
+          }
+        }
+        removeItemFromList(selectedListId, id);
+        setNotice(`Couldn't add "${name}": ${e?.message || "something went wrong"}`);
+      }
+    }
+
     setFName("");
     setFPrice("");
     setCategoryTouched(false);
@@ -584,25 +1309,56 @@ export default function DmartApp() {
   }
 
   function updateItem(id, patch) {
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (patch.qty !== undefined) patch = { ...patch, qty: clampQty(patch.qty) };
     if (patch.price !== undefined) patch = { ...patch, price: clampPrice(patch.price) };
-    setListItems(selectedListId, (prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
-    if (patch.checked !== undefined) bumpActivity(selectedListId);
+    if (patch.checked !== undefined || patch.skipped !== undefined) animateListChange();
+    const listId = selectedListId;
+    const previous = items.find((i) => i.id === id);
+    patchItem(listId, id, patch);
+    if (patch.checked !== undefined) bumpActivity(listId);
+    // Optimistic: local state already updated above for a snappy UI; this
+    // just persists it. Other members see it live via the socket once it
+    // actually reaches the server. If offline, api.js queues this instead
+    // of rejecting — nothing to undo. A real failure (not a connectivity
+    // one) still undoes the local change so this device doesn't silently
+    // drift from what's actually saved.
+    updateItemApi(listId, id, patch).catch((e) => {
+      if (previous) upsertItem(listId, previous);
+      setNotice(`Change didn't save, so it's been undone: ${e?.message || "network error"}`);
+    });
   }
 
-  // optimistic delete with a 5s "Undo" window
+  // optimistic delete with a 5s "Undo" window. For cloud lists the actual
+  // server delete only fires once that window closes without an Undo —
+  // that's the real point of no return, so it doubles as the sync trigger.
   function deleteItem(item) {
-    if (pendingDelete) clearTimeout(pendingDelete.timer); 
-    setListItems(selectedListId, (prev) => prev.filter((i) => i.id !== item.id));
-    const timer = setTimeout(() => setPendingDelete(null), 5000);
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
+    if (pendingDelete) clearTimeout(pendingDelete.timer);
+    animateListChange();
+    const listId = selectedListId;
+    removeItemFromList(listId, item.id);
+    const timer = setTimeout(() => {
+      setPendingDelete(null);
+      deleteItemApi(listId, item.id).catch((e) => {
+        // A real (non-connectivity) failure — the item never actually
+        // left the server, so don't let it silently vanish forever from
+        // just this one device. An offline delete queues instead of
+        // rejecting, so this branch is only for genuine errors.
+        upsertItem(listId, item);
+        setNotice(`Delete didn't sync, so "${item.name}" is back: ${e?.message || "network error"}`);
+      });
+    }, 5000);
     setPendingDelete({ item, timer });
   }
   function undoDelete() {
     if (!pendingDelete) return;
     clearTimeout(pendingDelete.timer);
-    setListItems(selectedListId, (prev) => [...prev, pendingDelete.item]);
+    animateListChange();
+    upsertItem(selectedListId, pendingDelete.item);
     setPendingDelete(null);
   }
+
 
   function toggleCollapse(cat) { setCollapsed((p) => ({ ...p, [cat]: !p[cat] })); }
 
@@ -695,13 +1451,28 @@ export default function DmartApp() {
   }
 
 function startNewTrip() {
-  setListItems(selectedListId, (prev) =>
-    prev.map((i) => ({ ...i, checked: false, skipped: false, note: "", qty: 0, price: "" }))
-  );
+  if (!canWrite) { setNotice("You have view-only access to this list."); return; }
+  const listId = selectedListId;
+  const isCloudList = !!selectedList?.role;
+  const resetItems = items.map((i) => ({ ...i, checked: false, skipped: false, note: "", qty: 0, price: "" }));
+  setListItems(listId, () => arrayToItemMap(resetItems));
   setNoteDrafts({});
   setPriceDrafts({});
   setNotice(`Started a new trip for "${selectedList.name}".`);
-  bumpActivity(selectedListId);
+  bumpActivity(listId);
+  if (isCloudList) {
+    // This previously only reset local state — on a shared list, every
+    // other member (and this device, on its next refresh) would still see
+    // the old checked/qty/price/note values, since the server was never
+    // told anything changed.
+    Promise.allSettled(
+      resetItems.map((i) => updateItemApi(listId, i.id, { checked: false, skipped: false, note: "", qty: 0, price: "" }))
+    ).then((results) => {
+      if (results.some((r) => r.status === "rejected")) {
+        setNotice(`"${selectedList.name}" reset locally, but some items didn't sync to the cloud.`);
+      }
+    });
+  }
 }
 // Called from the button — only ever opens the confirmation popup when
 // there's actually something to reset (button is disabled otherwise).
@@ -720,6 +1491,44 @@ function confirmStartNewTrip() {
     if (!trimmed) return;
     setCategories((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
   }
+
+  // ---------- Master items: quick-add a common item straight into the current list ----------
+  async function addMasterItem(mi) {
+    if (!canWrite) { setNotice("You have view-only access to this list."); return; }
+    const dup = items.some((i) => i.name.toLowerCase() === mi.name.toLowerCase());
+    if (dup) { setNotice(`"${mi.name}" is already on this list.`); return; }
+    animateListChange();
+    const listId = selectedListId;
+    const id = makeId("item");
+    upsertItem(listId, {
+      id, name: mi.name, category: mi.category, qty: 0, unit: mi.unit,
+      price: "", checked: false, skipped: false, note: "", createdAt: Date.now(), pending: true,
+    });
+    try {
+      const { item, queued } = await createItemApi(listId, { id, name: mi.name, category: mi.category, unit: mi.unit, price: null });
+      if (!queued) reconcileOptimisticItem(listId, id, item);
+    } catch (e) {
+      if (e?.status === 404) {
+        try {
+          await createListApi(listId, selectedList.name);
+          const { item, queued } = await createItemApi(listId, { id, name: mi.name, category: mi.category, unit: mi.unit, price: null });
+          if (!queued) reconcileOptimisticItem(listId, id, item);
+          setNotice(`Added "${mi.name}" to ${selectedList ? selectedList.name : "your list"}.`);
+          return;
+        } catch (e2) {
+          removeItemFromList(listId, id);
+          setNotice(`Couldn't add "${mi.name}": ${e2?.message || "something went wrong"}`);
+          return;
+        }
+      }
+      removeItemFromList(listId, id);
+      setNotice(`Couldn't add "${mi.name}": ${e?.message || "something went wrong"}`);
+      return;
+    }
+    setNotice(`Added "${mi.name}" to ${selectedList ? selectedList.name : "your list"}.`);
+    bumpActivity(listId);
+  }
+
 
   // ---------- Edit item ----------
   function startEditItem(item) {
@@ -769,6 +1578,7 @@ function confirmStartNewTrip() {
   });
 
   return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
     <View style={{ flex: 1, backgroundColor: t.bg }}>
     <SafeAreaView style={[s.screen, { backgroundColor: t.bg }]}>
       <StatusBar barStyle={dark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
@@ -776,34 +1586,82 @@ function confirmStartNewTrip() {
         {/* ===== Header ===== */}
         <View style={s.headerRow}>
           <View>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <Image source={require("./src/assets/icon.png")} style={{ width: 25, height: 25 }} />
-
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <View style={{ width: 30, height: 30, borderRadius: RADIUS.sm, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+                <Image source={require("./src/assets/icon.png")} style={{ width: 22, height: 22 }} />
+              </View>
               <Text style={s.brand}>MindCart</Text>
             </View>
             <TouchableOpacity onPress={() => setListsModalOpen(true)} style={s.listSwitcher}>
-              <ListChecks size={13} color={t.accent} />
-              <Text style={s.listSwitcherText}>{selectedList ? selectedList.name : "Select list"}</Text>
-              <ChevronDown size={13} color={t.accent} />
-            </TouchableOpacity>
+            <ListChecks size={12} color={t.accent} />
+            <Text style={s.listSwitcherText}>
+              {selectedList ? selectedList.name : "Select list"}
+              {selectedList && !!selectedList.role && (cloudMembersByList[selectedList.id]?.length || 0) > 1 ? " · Shared" : ""}
+            </Text>
+            <ChevronDown size={12} color={t.accent} />
+          </TouchableOpacity>
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
             <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf}>
               {exportingPdf ? (
                 <ActivityIndicator size="small" color={t.text} />
               ) : (
-                <FileDown size={16} color={t.text} />
+                <Share2 size={16} color={t.text} />
               )}
             </TouchableOpacity>
-            <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
+            {/* <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
               <Menu size={16} color={t.text} />
-            </TouchableOpacity>
+            </TouchableOpacity> */}
           </View>
         </View>
 
         {notice ? (
           <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
         ) : null}
+
+        {receivedInvites.length > 0 && (
+          <View style={{ marginHorizontal: 18, marginTop: 12, gap: 8 }}>
+            <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.4 }}>
+              {receivedInvites.length === 1 ? "Pending invitation" : `Pending invitations (${receivedInvites.length})`}
+            </Text>
+            {receivedInvites.map((invite) => {
+              const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
+              const isResponding = respondingInviteId === invite.id;
+              return (
+                <View key={invite.id} style={[s.itemCard, { gap: 10 }]}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                    <View style={s.avatarCircle}>
+                      <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
+                    </View>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={s.itemName}>{senderLabel}</Text>
+                      <Text style={s.itemUnit}>
+                        {invite.inviteAllLists ? "Invited you as a family member" : `Invited you to "${invite.list?.name}"`}
+                        {"  ·  "}{invite.role === "READ" ? "Can view" : "Can edit"}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={{ flexDirection: "row", gap: 8 }}>
+                    <TouchableOpacity
+                      onPress={() => respondToInvite(invite, true)}
+                      disabled={isResponding}
+                      style={[s.addItemBtn, { flex: 1, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
+                    >
+                      {isResponding ? <ActivityIndicator color="#fff" /> : <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text>}
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => respondToInvite(invite, false)}
+                      disabled={isResponding}
+                      style={[s.smallBtn, { flex: 1, alignItems: "center", opacity: isResponding ? 0.6 : 1 }]}
+                    >
+                      <Text style={s.smallBtnText}>Decline</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
 
         {pendingDelete ? (
           <View style={s.undoRow}>
@@ -814,16 +1672,18 @@ function confirmStartNewTrip() {
           </View>
         ) : null}
 
-        <View style={s.searchWrap}>
-          <Search size={15} color={t.muted} style={s.searchIcon} />
-          <TextInput
-            value={search}
-            onChangeText={setSearch}
-            placeholder={`Search "${selectedList ? selectedList.name : ""}"...`}
-            placeholderTextColor={t.muted}
-            style={s.searchInput}
-          />
-        </View>
+          {showSearch && (
+            <View style={s.searchWrap}>
+              <Search size={15} color={t.muted} style={s.searchIcon} />
+              <TextInput
+                value={search}
+                onChangeText={setSearch}
+                placeholder={`Search "${selectedList ? selectedList.name : ""}"...`}
+                placeholderTextColor={t.muted}
+                style={s.searchInput}
+              />
+            </View>
+          )}
 
         <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
           {tab === "home" && (
@@ -882,45 +1742,84 @@ function confirmStartNewTrip() {
                 </TouchableOpacity>
               </View>
 
+              {/* ===== Segmented filter: All / Pending / Bought ===== */}
+              <View style={s.segmentWrap}>
+                {[
+                  { id: "all", label: `All (${items.length})` },
+                  { id: "pending", label: `Pending (${pendingItems.length})` },
+                  { id: "bought", label: `Bought (${boughtItems.length})` },
+                ].map((seg) => (
+                  <TouchableOpacity
+                    key={seg.id}
+                    onPress={() => { animateListChange(); setHomeFilter(seg.id); }}
+                    style={[s.segmentBtn, homeFilter === seg.id && s.segmentBtnActive]}
+                  >
+                    <Text style={[s.segmentText, homeFilter === seg.id && s.segmentTextActive]}>{seg.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
               {items.length === 0 && (
-                <Text style={s.emptyText}>"{selectedList ? selectedList.name : ""}" is empty — add items from the "Add" tab first.</Text>
+                <View style={s.emptyStateWrap}>
+                  <View style={s.emptyStateIconWrap}>
+                    <ShoppingBag size={28} color={t.accent} />
+                  </View>
+                  <Text style={s.emptyStateTitle}>"{selectedList ? selectedList.name : "This list"}" is empty</Text>
+                  <Text style={s.emptyStateSub}>Nothing here yet — add your first item and MindCart will remember it for next time.</Text>
+                  <TouchableOpacity onPress={() => setTab("add")} style={s.emptyStateBtn}>
+                    <Plus size={16} color="#fff" />
+                    <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13.5 }}>Add your first item</Text>
+                  </TouchableOpacity>
+                </View>
               )}
               {items.length > 0 && noSearchResults && (
-                <Text style={s.emptyText}>No items match "{debouncedSearch}" in this list.</Text>
+                <View style={s.emptyStateWrap}>
+                  <View style={s.emptyStateIconWrap}><Search size={26} color={t.accent} /></View>
+                  <Text style={s.emptyStateTitle}>No matches for "{debouncedSearch}"</Text>
+                  <Text style={s.emptyStateSub}>Try a different search, or clear it to see everything on this list.</Text>
+                </View>
               )}
 
               {itemCategories.map((cat) => {
-                const catItems = filtered.filter((i) => i.category === cat && !i.skipped);
+                const catItems = filtered.filter((i) => {
+                  if (i.category !== cat || i.skipped) return false;
+                  if (homeFilter === "pending") return !i.checked;
+                  if (homeFilter === "bought") return i.checked;
+                  return true;
+                });
                 if (catItems.length === 0) return null;
                 const isCollapsed = collapsed[cat];
                 return (
                   <View key={cat} style={{ marginTop: 14 }}>
-                    <TouchableOpacity onPress={() => toggleCollapse(cat)} style={s.catHeader}>
+                    <TouchableOpacity onPress={() => { animateListChange(); toggleCollapse(cat); }} style={s.catHeader}>
                       <Text style={s.catHeaderText}>{cat}</Text>
                       <ChevronDown size={15} color={t.muted} style={{ transform: [{ rotate: isCollapsed ? "-90deg" : "0deg" }] }} />
                     </TouchableOpacity>
                     {!isCollapsed && (
                       <View style={{ gap: 8, marginTop: 6 }}>
                         {catItems.map((item) => (
-                          <View key={item.id} style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
+                          <Swipeable
+                            key={item.id}
+                            overshootRight={false}
+                            renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                          >
+                          <View style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
                             <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                              <TouchableOpacity
+                              <AnimatedCheckbox
+                                checked={item.checked}
                                 onPress={() => updateItem(item.id, { checked: !item.checked })}
                                 style={[s.checkbox, { borderColor: item.checked ? t.accent : t.border, backgroundColor: item.checked ? t.accent : "transparent" }]}
-                              >
-                                {item.checked && <Check size={13} color="#fff" />}
-                              </TouchableOpacity>
+                              />
                               <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
                               <View style={{ flex: 1, minWidth: 0 }}>
                                 <Text style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
                                 <Text style={s.itemUnit}>{item.unit}</Text>
                               </View>
                              <TouchableOpacity
-                              onPress={() =>
-                                updateItem(item.id, {
-                                     qty: Math.max(0, Number(item.qty) - 1)
-                                     })
-                                   }
+                              onPress={() => {
+                                    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                    updateItem(item.id, { qty: Math.max(0, Number(item.qty) - 1) });
+                                   }}
                                   disabled={Number(item.qty) <= 0}
                                   style={[
                                     s.qtyBtn,
@@ -931,22 +1830,39 @@ function confirmStartNewTrip() {
                               </TouchableOpacity>
                               <Text style={s.qtyValue}>{item.qty}</Text>
                               <TouchableOpacity
-                                onPress={() => updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) })}
+                                onPress={() => {
+                                  tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                  updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) });
+                                }}
                                 disabled={Number(item.qty) >= 999}
                                 style={[s.qtyBtn, Number(item.qty) >= 999 && { opacity: 0.5 }]}
                               >
                                 <Text style={s.qtyBtnText}>+</Text>
                               </TouchableOpacity>
-                              <TextInput
-                                keyboardType="decimal-pad"
-                                placeholder={currency.symbol}
-                                placeholderTextColor={t.muted}
-                                value={priceValue(item)}
-                                editable={Number(item.qty) > 0}
-                                onChangeText={(v) => setPriceDrafts((prev) => ({ ...prev, [item.id]: v }))}
-                                onBlur={() => commitPrice(item)}
-                                style={s.priceInput}
-                              />
+                           <TextInput
+                            keyboardType="decimal-pad"
+                            placeholder={currency.symbol}
+                            placeholderTextColor={t.muted}
+                            value={priceValue(item)}
+                            editable={Number(item.qty) > 0}
+                            onChangeText={(v) => {
+                              const numericValue = v.replace(/[^0-9.]/g, "");
+
+                              // Allow only one decimal point
+                              const parts = numericValue.split(".");
+                              const cleanedValue =
+                                parts.length > 2
+                                  ? parts[0] + "." + parts.slice(1).join("")
+                                  : numericValue;
+
+                              setPriceDrafts((prev) => ({
+                                ...prev,
+                                [item.id]: cleanedValue,
+                              }));
+                            }}
+                            onBlur={() => commitPrice(item)}
+                            style={s.priceInput}
+                          />
                               {!item.checked && (
                                 <TouchableOpacity onPress={() => updateItem(item.id, { skipped: true })} style={{ padding: 2 }}>
                                   <EyeOff size={15} color={t.muted} />
@@ -963,6 +1879,7 @@ function confirmStartNewTrip() {
                               style={s.noteInput}
                             />
                           </View>
+                          </Swipeable>
                         ))}
                       </View>
                     )}
@@ -970,7 +1887,7 @@ function confirmStartNewTrip() {
                 );
               })}
 
-              {skippedItems.length > 0 && (
+              {skippedItems.length > 0 && homeFilter !== "bought" && (
                 <View style={{ marginTop: 10 }}>
                   <TouchableOpacity onPress={() => toggleCollapse("__skipped__")} style={s.catHeader}>
                     <Text style={[s.catHeaderText, { color: t.muted }]}>Not buying this time ({skippedItems.length})</Text>
@@ -979,7 +1896,12 @@ function confirmStartNewTrip() {
                   {!collapsed["__skipped__"] && (
                     <View style={{ gap: 8, marginTop: 6 }}>
                       {skippedItems.map((item) => (
-                        <View key={item.id} style={[s.itemCard, { flexDirection: "row", alignItems: "center", gap: 10, opacity: 0.6 }]}>
+                        <Swipeable
+                          key={item.id}
+                          overshootRight={false}
+                          renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                        >
+                        <View style={[s.itemCard, { flexDirection: "row", alignItems: "center", gap: 10, opacity: 0.6 }]}>
                           <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
                           <View style={{ flex: 1, minWidth: 0 }}>
                             <Text style={s.itemName}>{item.name}</Text>
@@ -989,6 +1911,7 @@ function confirmStartNewTrip() {
                             <Text style={{ color: t.accent, fontWeight: "600", fontSize: 11.5 }}>Add back</Text>
                           </TouchableOpacity>
                         </View>
+                        </Swipeable>
                       ))}
                     </View>
                   )}
@@ -1050,10 +1973,25 @@ function confirmStartNewTrip() {
 
               <View style={{ marginTop: 16, gap: 8 }}>
                 {filtered.length === 0 && (
-                  <Text style={s.emptyText}>{items.length === 0 ? "No items yet." : `No items match "${debouncedSearch}".`}</Text>
+                  <View style={s.emptyStateWrap}>
+                    <View style={s.emptyStateIconWrap}>
+                      {items.length === 0 ? <ListPlus size={26} color={t.accent} /> : <Search size={26} color={t.accent} />}
+                    </View>
+                    <Text style={s.emptyStateTitle}>{items.length === 0 ? "No items yet" : `No items match "${debouncedSearch}"`}</Text>
+                    <Text style={s.emptyStateSub}>
+                      {items.length === 0
+                        ? "Type a name above and tap Add to build out this list."
+                        : "Try a different search or add it as a brand-new item."}
+                    </Text>
+                  </View>
                 )}
                 {filtered.map((item) => (
-                  <View key={item.id} style={s.itemCard}>
+                  <Swipeable
+                    key={item.id}
+                    overshootRight={false}
+                    renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                  >
+                  <View style={s.itemCard}>
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
                       <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
                       <View style={{ flex: 1, minWidth: 0 }}>
@@ -1063,24 +2001,209 @@ function confirmStartNewTrip() {
                         </Text>
                       </View>
                       <TouchableOpacity onPress={() => startEditItem(item)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
-                      <TouchableOpacity onPress={() => deleteItem(item)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
                     </View>
                   </View>
+                  </Swipeable>
                 ))}
               </View>
             </>
+          )}
+
+          {tab === "master" && (
+            <View style={{ gap: 10 }}>
+              <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
+                <View style={[s.tabIconWrap, s.tabIconWrapActive, { width: 44, height: 44 }]}>
+                  <Layers size={20} color="#fff" />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ color: t.text, fontWeight: "800", fontSize: 15 }}>Master Items</Text>
+                  <Text style={{ color: t.muted, fontSize: 12, marginTop: 2 }}>Your household's frequently bought items — tap + to drop one into "{selectedList ? selectedList.name : "this list"}".</Text>
+                </View>
+              </View>
+
+              {MASTER_ITEMS.map((mi) => {
+                const already = items.some((i) => i.name.toLowerCase() === mi.name.toLowerCase());
+                return (
+                  <View key={mi.name} style={[s.itemCard, { flexDirection: "row", alignItems: "center", gap: 10 }]}>
+                    <Text style={{ fontSize: 18 }}>{getIcon(mi.name)}</Text>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={s.itemName}>{mi.name}</Text>
+                      <Text style={s.itemUnit}>{mi.category} · {mi.unit} · Master Item</Text>
+                    </View>
+                    <TouchableOpacity
+                      onPress={() => addMasterItem(mi)}
+                      disabled={already}
+                      style={[s.masterAddBtn, already && { opacity: 0.4 }]}
+                    >
+                      {already ? <Check size={16} color={t.accent2} /> : <Plus size={16} color="#fff" />}
+                    </TouchableOpacity>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+
+          {tab === "family" && (
+            <FamilySyncScreen
+              t={t} s={s}
+              selectedList={selectedList}
+              items={items}
+              isSignedIn={!!user}
+              signingIn={signingIn}
+              isCloudList={!!selectedList?.role}
+              isOwner={selectedList?.role === "OWNER"}
+              members={cloudMembersByList[selectedList?.id] || []}
+              pendingInvites={pendingInvitesByList[selectedList?.id] || []}
+              makingShareable={makingShareable}
+              revokingInviteId={revokingInviteId}
+              busyMemberId={busyMemberId}
+              onSignIn={signIn}
+              onMakeShareable={() => makeListShareable(selectedList)}
+              onInvite={(payload) => inviteFamilyMember(selectedList, payload)}
+              onRevokeInvite={(inviteId) => revokeFamilyInvite(inviteId, selectedList.id)}
+              onChangeRole={(userId, role) => changeFamilyMemberRole(selectedList.id, userId, role)}
+              onRemoveMember={(userId) => removeFamilyMember(selectedList.id, userId)}
+            />
+          )}
+
+          {tab === "profile" && (
+            <View style={{ gap: 14 }}>
+              <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
+                <View style={s.avatarCircleLg}>
+                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(user.name || "U").slice(0, 1).toUpperCase()}</Text>
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <TextInput
+                    value={user.name}
+                    onChangeText={(v) => setProfile((p) => ({ ...p, name: v }))}
+                    placeholder={user?.name || "Enter your name"}                   
+                    placeholderTextColor={t.muted}
+                    style={{ color: t.text, fontWeight: "800", fontSize: 16, padding: 0 }}
+                  />
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 }}>
+                    <Crown size={12} color={t.accent2} />
+                    <Text style={{ color: t.accent2, fontSize: 11.5, fontWeight: "700" }}>Family Plan Manager</Text>
+                  </View>
+                </View>
+              </View>
+
+              <Text style={s.sectionLabel}>Preferences</Text>
+              <View style={{ gap: 8 }}>
+                <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><Palette size={16} color={t.accent} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Dark Mode</Text>
+                    <Text style={s.itemUnit}>Switch light and dark theme</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => setDark((d) => !d)} style={[s.toggleTrack, dark && s.toggleTrackOn]}>
+                    <View style={[s.toggleThumb, dark && s.toggleThumbOn]} />
+                  </TouchableOpacity>
+                </View>
+
+                <TouchableOpacity style={s.settingsRow} onPress={() => setCurrencyModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Wallet size={16} color={t.accent2} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Currency</Text>
+                    <Text style={s.itemUnit}>List total calculations</Text>
+                  </View>
+                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "700", marginRight: 4 }}>{currency.code}</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+
+                <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><BellDot size={16} color={t.accent} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Store Reminders</Text>
+                    <Text style={s.itemUnit}>Nudge me if a list goes quiet</Text>
+                  </View>
+                  {/* <TouchableOpacity onPress={() => toggleReminders(!reminderSettings.enabled)} style={[s.toggleTrack, reminderSettings.enabled && s.toggleTrackOn]}>
+                    <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
+                  </TouchableOpacity> */}
+                  <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
+                     Comming Soon
+                    </Text>
+                </View>
+
+                {/* <View style={s.settingsRow}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Layers size={16} color={t.accent2} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Master Tab</Text>
+                    <Text style={s.itemUnit}>Show the Master Items shelf in the bottom nav</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => toggleMasterTab(!showMasterTab)} style={[s.toggleTrack, showMasterTab && s.toggleTrackOn]}>
+                    <View style={[s.toggleThumb, showMasterTab && s.toggleThumbOn]} />
+                  </TouchableOpacity>
+                </View> */}
+              </View>
+
+              <Text style={s.sectionLabel}>Data & Cloud</Text>
+              <View style={{ gap: 8 }}>
+                <TouchableOpacity style={s.settingsRow} onPress={exportPDF} disabled={exportingPdf}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><FileDown size={16} color={t.accent} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Export Shopping Data</Text>
+                    <Text style={s.itemUnit}>Download this list as a PDF</Text>
+                  </View>
+                  {exportingPdf ? <ActivityIndicator size="small" color={t.accent} /> : <ChevronRight size={16} color={t.muted} />}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={s.settingsRow}
+                  disabled={authLoading || signingIn}
+                  onPress={() => (user ? signOut() : signIn())}
+                >
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.accent2Soft }]}><Cloud size={16} color={t.accent2} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.itemName}>Cloud Sync & Sharing</Text>
+                    <Text style={s.itemUnit}>
+                      {user ? `Signed in as ${user.name}` : "Sign in with Google to sync & share lists"}
+                    </Text>
+                  </View>
+                  {authLoading || signingIn ? (
+                    <ActivityIndicator size="small" color={t.accent2} />
+                  ) : (
+                    <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
+                      {user ? "Sign out" : "Sign in"}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+
+              <Text style={s.sectionLabel}>Support & Legal</Text>
+              <View style={{ gap: 8 }}>
+                <TouchableOpacity style={s.settingsRow} onPress={() => setPrivacyModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.surface2 }]}><ShieldCheck size={16} color={t.text} /></View>
+                  <Text style={[s.itemName, { flex: 1 }]}>Privacy Policy</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+                <TouchableOpacity style={s.settingsRow} onPress={() => setTermsModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.surface2 }]}><FileText size={16} color={t.text} /></View>
+                  <Text style={[s.itemName, { flex: 1 }]}>Terms of Use</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+                <TouchableOpacity style={s.settingsRow} onPress={() => setAboutModalOpen(true)}>
+                  <View style={[s.settingsIconWrap, { backgroundColor: t.surface2 }]}><Info size={16} color={t.text} /></View>
+                  <Text style={[s.itemName, { flex: 1 }]}>About MindCart</Text>
+                  <ChevronRight size={16} color={t.muted} />
+                </TouchableOpacity>
+              </View>
+            </View>
           )}
         </ScrollView>
 
         {/* ===== Bottom tab bar ===== */}
         <View style={s.tabBar}>
           {[
-            { id: "home", label: "Home / Buy", icon: Home },
-            { id: "add", label: "Add / Manage", icon: ListPlus },
-          ].map(({ id, label, icon: Icon }) => (
+            { id: "home", label: "Home", icon: Home },
+            { id: "add", label: "Add", icon: ListPlus },
+            // showMasterTab && { id: "master", label: "Master", icon: Layers },
+            { id: "family", label: "Family", icon: Users },
+            { id: "profile", label: "Profile", icon: UserCircle2 },
+          ].filter(Boolean).map(({ id, label, icon: Icon }) => (
             <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
-              <Icon size={19} color={tab === id ? t.accent : t.muted} />
-              <Text style={{ fontSize: 11.5, fontWeight: "600", color: tab === id ? t.accent : t.muted }}>{label}</Text>
+              <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
+                <Icon size={18} color={tab === id ? "#fff" : t.muted} />
+              </View>
+              <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
             </TouchableOpacity>
           ))}
         </View>
@@ -1111,9 +2234,17 @@ function confirmStartNewTrip() {
                 {lists.map((list) => (
                   <View key={list.id} style={[s.listRow, { borderColor: list.id === selectedListId ? t.accent : t.border }]}>
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
+                      {/* <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
                         <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
-                        <Text style={{ fontSize: 11.5, color: t.muted }}>{(itemsByList[list.id] || []).length} items</Text>
+                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
+                      </TouchableOpacity> */}
+                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
+                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>
+                          {list.name}
+                          {list.id === selectedListId ? "" : ""}
+                          {!!list.role && (cloudMembersByList[list.id]?.length || 0) > 1 ? "(Shared)" : ""}
+                        </Text>
+                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
                       </TouchableOpacity>
                       <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
                       <TouchableOpacity onPress={() => setConfirmDeleteListId(list.id)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
@@ -1385,34 +2516,8 @@ function confirmStartNewTrip() {
                   <Text style={{ color: t.text, fontSize: 13.5, fontWeight: "600" }}>App version</Text>
                   <Text style={{ color: t.muted, fontSize: 13 }}>{APP_VERSION}</Text>
                 </View>
-                {/* <View style={[s.listRow, { flexDirection: "row", justifyContent: "space-between", alignItems: "center" }]}>
-                  <Text style={{ color: t.text, fontSize: 13.5, fontWeight: "600" }}>Developer</Text>
-                  <Text style={{ color: t.muted, fontSize: 13 }}>{DEVELOPER_NAME}</Text>
-                </View> */}
               </View>
 
-              {/* Privacy policy & contact */}
-              {/* <View style={{ gap: 6, marginBottom: 16 }}>
-                <TouchableOpacity
-                  onPress={openPrivacyPolicy}
-                  style={[s.listRow, { flexDirection: "row", alignItems: "center", gap: 10 }]}
-                >
-                  <ShieldCheck size={16} color={t.accent} />
-                  <Text style={{ flex: 1, color: t.text, fontSize: 13.5, fontWeight: "600" }}>Privacy Policy</Text>
-                  <ChevronRight size={16} color={t.muted} />
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={openContactEmail}
-                  style={[s.listRow, { flexDirection: "row", alignItems: "center", gap: 10 }]}
-                >
-                  <Mail size={16} color={t.accent} />
-                  <Text style={{ flex: 1, color: t.text, fontSize: 13.5, fontWeight: "600" }}>Contact / Feedback</Text>
-                  <ChevronRight size={16} color={t.muted} />
-                </TouchableOpacity>
-              </View> */}
-              {/* <Text style={{ fontSize: 11, color: t.muted, textAlign: "center", marginTop: 10, marginBottom: 4 }}>
-                Each library is used under its own open-source license.
-              </Text> */}
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -1445,21 +2550,21 @@ function confirmStartNewTrip() {
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
             <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
               <Text style={s.sheetTitle}>Shopping reminders</Text>
-              <TouchableOpacity onPress={() => setReminderModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
+              {/* <TouchableOpacity onPress={() => setReminderModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity> */}
             </View>
             <Text style={{ fontSize: 12.5, color: t.muted, marginBottom: 14 }}>
               Get notified if a list has gone quiet for a while. Any activity on a list (adding, checking off, or starting a new trip) resets its countdown.
             </Text>
 
-            <TouchableOpacity
+            {/* <TouchableOpacity
               onPress={() => toggleReminders(!reminderSettings.enabled)}
               style={[s.listRow, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }]}
-            >
+            > 
               <Text style={{ color: t.text, fontWeight: "600", fontSize: 14 }}>Enable reminders</Text>
               <View style={{ width: 40, height: 22, borderRadius: 11, backgroundColor: reminderSettings.enabled ? t.accent : t.border, padding: 2, justifyContent: "center" }}>
                 <View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: "#fff", marginLeft: reminderSettings.enabled ? 18 : 0 }} />
               </View>
-            </TouchableOpacity>
+            </TouchableOpacity>*/}
 
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 14 }}>
               <Text style={{ color: t.text, fontSize: 14 }}>Remind me after</Text>
@@ -1472,7 +2577,7 @@ function confirmStartNewTrip() {
               <Text style={{ color: t.text, fontSize: 14 }}>days of no activity</Text>
             </View>
 
-            <View style={{ marginTop: 22, paddingTop: 16, borderTopWidth: 1, borderColor: t.border }}>
+            {/* <View style={{ marginTop: 22, paddingTop: 16, borderTopWidth: 1, borderColor: t.border }}>
               <Text style={{ color: t.text, fontWeight: "700", fontSize: 14, marginBottom: 4 }}>Daily testing reminder</Text>
 
               <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
@@ -1521,7 +2626,7 @@ function confirmStartNewTrip() {
                   )}
                 </View>
               )}
-            </View>
+            </View> */}
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -1635,6 +2740,97 @@ function confirmStartNewTrip() {
       </Pressable>
     )}
     </View>
+    </GestureHandlerRootView>
+  );
+}
+
+// ---------- First-run onboarding ----------
+// Marketing copy below is placeholder — edit the description and feature
+// chips to match your actual app before publishing.
+function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
+  const features = [
+    { icon: Zap, label: "1-Handed Fast", note: "Quick tap shopping" },
+    { icon: Users, label: "Family Sync", note: "Live permissions" },
+    { icon: Layers, label: "Master Pantry", note: "Reusable items" },
+  ];
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: t.bg }}>
+      <StatusBar barStyle={dark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
+      <ScrollView
+        contentContainerStyle={{ flexGrow: 1, paddingHorizontal: 26, paddingTop: 20, paddingBottom: 24 }}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <View style={{ width: 34, height: 34, borderRadius: RADIUS.sm, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+              <Image source={require("./src/assets/icon.png")} style={{ width: 24, height: 24 }} />
+            </View>
+            <Text style={{ fontSize: 19, fontWeight: "800", color: t.text }}>Mind<Text style={{ color: t.accent }}>Cart</Text></Text>
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: t.accent2Soft, paddingHorizontal: 10, paddingVertical: 5, borderRadius: RADIUS.pill }}>
+            <Users size={12} color={t.accent2} />
+            <Text style={{ fontSize: 11, fontWeight: "700", color: t.accent2 }}>Family Ready</Text>
+          </View>
+        </View>
+
+        <View style={{ alignItems: "center", marginTop: 36, marginBottom: 30 }}>
+          <View style={{
+            width: 108, height: 108, borderRadius: RADIUS.xl, backgroundColor: t.accentSoft,
+            alignItems: "center", justifyContent: "center",
+          }}>
+            <ShoppingBag size={48} color={t.accent} />
+          </View>
+        </View>
+
+        <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
+          Remember what to buy.
+        </Text>
+        <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
+          Shop smarter. Together.
+        </Text>
+        <Text style={{ fontSize: 14, color: t.muted, lineHeight: 21 }}>
+          Effortless collaborative lists with real-time family syncing, smart units, and instant budget tracking.
+        </Text>
+
+        <View style={{ flexDirection: "row", gap: 10, marginTop: 26 }}>
+          {features.map(({ icon: Icon, label, note }) => (
+            <View key={label} style={{
+              flex: 1, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border,
+              borderRadius: RADIUS.md, padding: 12, alignItems: "flex-start", gap: 6,
+            }}>
+              <Icon size={17} color={t.accent} />
+              <Text style={{ fontSize: 11.5, fontWeight: "800", color: t.text }}>{label}</Text>
+              <Text style={{ fontSize: 10, color: t.muted }}>{note}</Text>
+            </View>
+          ))}
+        </View>
+
+        <View style={{ flex: 1 }} />
+
+        <TouchableOpacity
+          onPress={onGetStarted}
+          disabled={signingIn}
+          style={{
+            marginTop: 30, backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 15,
+            flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8,
+            opacity: signingIn ? 0.7 : 1,
+          }}
+        >
+          {signingIn ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <Image source={{ uri: "https://developers.google.com/identity/images/g-logo.png" }} style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: "#fff" }} />
+              <Text style={{ color: "#fff", fontWeight: "800", fontSize: 15 }}>Continue with Google</Text>
+            </>
+          )}
+        </TouchableOpacity>
+        <View style={{ flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 4, marginTop: 16 }}>
+          <Star size={12} color={t.accent2} fill={t.accent2} />
+          <Text style={{ fontSize: 11.5, color: t.muted, fontWeight: "600" }}>Synced securely with your Google account</Text>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -1681,56 +2877,88 @@ function Loader({ t }) {
 }
 
 function makeStyles(t) {
+  const cardShadow = { shadowColor: t.shadow, shadowOpacity: 1, shadowRadius: 14, shadowOffset: { width: 0, height: 6 }, elevation: 3 };
   return StyleSheet.create({
     screen: { flex: 1 },
-    headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingHorizontal: 16, paddingTop: 12 },
-    brand: { fontSize: 22, fontWeight: "800", color: t.text },
-    listSwitcher: { marginTop: 4, flexDirection: "row", alignItems: "center", gap: 4 },
-    listSwitcherText: { color: t.accent, fontSize: 13, fontWeight: "700" },
-    iconBtn: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 999, width: 38, height: 38, alignItems: "center", justifyContent: "center" },
-    notice: { marginHorizontal: 16, marginTop: 12, backgroundColor: `${t.accent2}22`, borderWidth: 1, borderColor: `${t.accent2}55`, borderRadius: 10, padding: 10 },
-    undoRow: { marginHorizontal: 16, marginTop: 12, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, padding: 10, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-    searchWrap: { marginHorizontal: 16, marginTop: 16, marginBottom: 8, position: "relative", justifyContent: "center" },
-    searchIcon: { position: "absolute", left: 12, zIndex: 1 },
-    searchInput: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, paddingVertical: 9, paddingLeft: 34, paddingRight: 12, color: t.text, fontSize: 14 },
-    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 16, padding: 16, marginTop: 4 },
-    newTripBtn: { marginTop: 12, borderWidth: 1, borderColor: t.accent, borderRadius: 10, padding: 8, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
-    emptyText: { textAlign: "center", color: t.muted, fontSize: 13, paddingVertical: 20 },
-    catHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 4, paddingHorizontal: 2 },
-    catHeaderText: { fontSize: 15, fontWeight: "700", color: t.accent },
-    itemCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, padding: 10 },
-    checkbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, alignItems: "center", justifyContent: "center" },
-    itemName: { fontSize: 14, fontWeight: "600", color: t.text },
-    itemUnit: { fontSize: 11.5, color: t.muted },
-    qtyBtn: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 6, width: 24, height: 24, alignItems: "center", justifyContent: "center" },
+    headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingHorizontal: 18, paddingTop: 12 },
+    brand: { fontSize: 21, fontWeight: "800", color: t.text, letterSpacing: -0.3 },
+    listSwitcher: { marginTop: 5, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: t.accentSoft, alignSelf: "flex-start", paddingHorizontal: 9, paddingVertical: 4, borderRadius: RADIUS.pill },
+    listSwitcherText: { color: t.accent, fontSize: 12.5, fontWeight: "700" },
+    iconBtn: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.pill, width: 40, height: 40, alignItems: "center", justifyContent: "center", ...cardShadow },
+    notice: { marginHorizontal: 18, marginTop: 12, backgroundColor: t.accent2Soft, borderWidth: 1, borderColor: `${t.accent2}45`, borderRadius: RADIUS.md, padding: 12 },
+    undoRow: { marginHorizontal: 18, marginTop: 12, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 12, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+    searchWrap: { marginHorizontal: 18, marginTop: 16, marginBottom: 8, position: "relative", justifyContent: "center" },
+    searchIcon: { position: "absolute", left: 14, zIndex: 1 },
+    searchInput: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 11, paddingLeft: 38, paddingRight: 12, color: t.text, fontSize: 14 },
+    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 18, marginTop: 4, ...cardShadow },
+    newTripBtn: { marginTop: 14, backgroundColor: t.accentSoft, borderRadius: RADIUS.md, padding: 10, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+    emptyText: { textAlign: "center", color: t.muted, fontSize: 13, paddingVertical: 24 },
+    catHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6, paddingHorizontal: 2 },
+    catHeaderText: { fontSize: 14.5, fontWeight: "800", color: t.accent, textTransform: "uppercase", letterSpacing: 0.3 },
+    itemCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+    checkbox: { width: 22, height: 22, borderRadius: 7, borderWidth: 2, alignItems: "center", justifyContent: "center" },
+    itemName: { fontSize: 14, fontWeight: "700", color: t.text },
+    itemUnit: { fontSize: 11.5, color: t.muted, marginTop: 1 },
+    qtyBtn: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 8, width: 24, height: 24, alignItems: "center", justifyContent: "center" },
     qtyBtnText: { color: t.text, fontSize: 15, fontWeight: "700" },
-    qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "600", color: t.text },
+    qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "700", color: t.text },
 
-    priceInput: { width: 56, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 10, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
+    priceInput: { width: 58, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
     menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "transparent", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },
     overlayFill: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0 },
-    headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 12, paddingVertical: 6, minWidth: 180, elevation: 6, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 6 } },
+    headerMenuCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 6, minWidth: 180, elevation: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 14, shadowOffset: { width: 0, height: 8 } },
     headerMenuTitleRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 8, paddingHorizontal: 14, borderBottomWidth: 1, borderBottomColor: t.border, marginBottom: 2 },
     headerMenuTitle: { fontSize: 12.5, fontWeight: "700", color: t.muted, textTransform: "uppercase", letterSpacing: 0.4 },
     headerMenuRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, paddingHorizontal: 14 },
     headerMenuText: { color: t.text, fontSize: 13.5, fontWeight: "600" },
-    noteInput: { marginTop: 6, marginLeft: 32, borderBottomWidth: 1, borderColor: t.border, borderStyle: "dashed", color: t.muted, fontSize: 12, fontStyle: "italic", paddingVertical: 3 },
-    addBackBtn: { borderWidth: 1, borderColor: t.accent, borderRadius: 8, paddingVertical: 5, paddingHorizontal: 10 },
-    addCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: 16, padding: 16, marginTop: 14 },
+    noteInput: { marginTop: 8, marginLeft: 32, borderBottomWidth: 1, borderColor: t.border, borderStyle: "dashed", color: t.muted, fontSize: 12, fontStyle: "italic", paddingVertical: 3 },
+    addBackBtn: { borderWidth: 1, borderColor: t.accent, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10 },
+    addCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 18, marginTop: 14, ...cardShadow },
     addHint: { fontSize: 13, color: t.muted, fontWeight: "600", marginBottom: 10 },
-    input: { backgroundColor: t.surface2, borderWidth: 1, borderRadius: 10, paddingVertical: 9, paddingHorizontal: 12, color: t.text, fontSize: 14 },
+    input: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 12, color: t.text, fontSize: 14 },
     errorText: { color: t.danger, fontSize: 11.5, marginTop: 4 },
-    addItemBtn: { marginLeft: "auto", backgroundColor: t.accent, borderRadius: 10, paddingVertical: 9, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 6 },
-    smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: 8, paddingVertical: 5, paddingHorizontal: 10 },
-    smallBtnText: { color: t.text, fontSize: 12, fontWeight: "600" },
-    tabBar: { flexDirection: "row", borderTopWidth: 1, borderColor: t.border, backgroundColor: t.surface },
-    tabBtn: { flex: 1, paddingVertical: 10, alignItems: "center", gap: 3 },
-    modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
-    modalBackdropCenter: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "center", alignItems: "center", padding: 20 },
-    listsSheet: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: 18, maxHeight: "80%" },
-    popupCard: { width: "100%", maxWidth: 420, backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: 18, padding: 18 },
+    addItemBtn: { marginLeft: "auto", backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", gap: 6 },
+    smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10, backgroundColor: t.surface },
+    smallBtnText: { color: t.text, fontSize: 12, fontWeight: "700" },
+    tabBar: { flexDirection: "row", borderTopWidth: 1, borderColor: t.border, backgroundColor: t.surface, paddingTop: 6, paddingBottom: 4 },
+    tabBtn: { flex: 5, paddingVertical: 8, alignItems: "center", gap: 2 },
+    tabIconWrap: { width: 60, height: 40, borderRadius: 1000, alignItems: "center", justifyContent: "center" },
+    tabIconWrapActive: { backgroundColor: t.accent ,borderRadius: 20,},
+    modalBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "flex-end" },
+    modalBackdropCenter: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", justifyContent: "center", alignItems: "center", padding: 20 },
+    listsSheet: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl, padding: 20, maxHeight: "80%" },
+    popupCard: { width: "100%", maxWidth: 420, backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 20 },
     sheetTitle: { fontSize: 18, fontWeight: "800", color: t.text },
-    listRow: { backgroundColor: t.surface, borderWidth: 1, borderRadius: 12, padding: 12 },
-    confirmDeleteBox: { marginTop: 8, padding: 8, backgroundColor: `${t.danger}18`, borderWidth: 1, borderColor: `${t.danger}55`, borderRadius: 8 },
+    listRow: { backgroundColor: t.surface, borderWidth: 1, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+    confirmDeleteBox: { marginTop: 8, padding: 10, backgroundColor: t.dangerSoft, borderWidth: 1, borderColor: `${t.danger}55`, borderRadius: RADIUS.sm },
+
+    // ---- New sections: Master Items / Family / Profile ----
+    masterAddBtn: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.accent2, alignItems: "center", justifyContent: "center" },
+    permChip: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 9, backgroundColor: t.surface2 },
+    permChipActive: { borderColor: t.accent, backgroundColor: t.accentSoft },
+    permBadge: { backgroundColor: t.accentSoft, borderRadius: RADIUS.pill, paddingHorizontal: 10, paddingVertical: 5, marginRight: 4 },
+    avatarCircle: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    avatarCircleLg: { width: 54, height: 54, borderRadius: RADIUS.pill, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    sectionLabel: { color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.5, marginTop: 6, marginBottom: 2 },
+    settingsRow: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+    settingsIconWrap: { width: 34, height: 34, borderRadius: RADIUS.sm, alignItems: "center", justifyContent: "center" },
+    toggleTrack: { width: 42, height: 24, borderRadius: RADIUS.pill, backgroundColor: t.border, padding: 2, justifyContent: "center" },
+    toggleTrackOn: { backgroundColor: t.accent },
+    toggleThumb: { width: 20, height: 20, borderRadius: RADIUS.pill, backgroundColor: "#fff" },
+    toggleThumbOn: { transform: [{ translateX: 18 }] },
+
+    // ---- Segmented filter (Home: All / Pending / Bought) ----
+    segmentWrap: { flexDirection: "row", backgroundColor: t.surface2, borderRadius: RADIUS.pill, padding: 3, marginTop: 14, gap: 2 },
+    segmentBtn: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 8, borderRadius: RADIUS.pill },
+    segmentBtnActive: { backgroundColor: t.accent, ...cardShadow },
+    segmentText: { fontSize: 12, fontWeight: "700", color: t.muted },
+    segmentTextActive: { color: "#fff" },
+
+    // ---- Empty states ----
+    emptyStateWrap: { alignItems: "center", paddingVertical: 36, paddingHorizontal: 20, gap: 10 },
+    emptyStateIconWrap: { width: 64, height: 64, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center", marginBottom: 4 },
+    emptyStateTitle: { color: t.text, fontSize: 15, fontWeight: "800", textAlign: "center" },
+    emptyStateSub: { color: t.muted, fontSize: 12.5, textAlign: "center", lineHeight: 18 },
+    emptyStateBtn: { marginTop: 6, backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 11, paddingHorizontal: 20, flexDirection: "row", alignItems: "center", gap: 6 },
   });
 }

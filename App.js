@@ -1532,8 +1532,7 @@ function confirmStartNewTrip() {
 
   // ---------- Edit item ----------
   function startEditItem(item) {
-    console.log("Editing item:", item);
-    setEditingItemId(item.id);
+      setEditingItemId(item.id);
     setEName(item.name);
     setECategory(item.category);
     setEUnit(item.unit);

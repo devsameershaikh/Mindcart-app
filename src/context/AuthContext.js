@@ -124,7 +124,7 @@ export function AuthProvider({ children }) {
       // dead connection never logs someone out.
       try {
         const { user } = await fetchMe();
-        console.log("Restored user:", user);
+        console.log("Restoring user:");
         setUser(user);
         await setCachedUser(user);
       } catch (error) {
@@ -162,9 +162,6 @@ export function AuthProvider({ children }) {
       // Open native Google account picker
       const result = await GoogleSignin.signIn();
     
-
-      console.log("Google Sign-In result:", result);
-
       // New versions of the library return user data inside `data`
       const idToken = result?.data?.idToken;
 

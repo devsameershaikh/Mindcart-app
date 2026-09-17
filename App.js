@@ -350,7 +350,7 @@ export default function DmartApp() {
   // right after sign-in. Cloud lists are merged in alongside any local-only
   // lists (kept exactly as they were, untouched) rather than replacing them.
   useEffect(() => {
-    console.log("Sign-in effect: user changed:", user);
+
     if (!user) return;
     let cancelled = false;
     (async () => {
@@ -1532,8 +1532,7 @@ function confirmStartNewTrip() {
 
   // ---------- Edit item ----------
   function startEditItem(item) {
-    console.log("Editing item:", item);
-    setEditingItemId(item.id);
+      setEditingItemId(item.id);
     setEName(item.name);
     setECategory(item.category);
     setEUnit(item.unit);
@@ -2189,25 +2188,26 @@ function confirmStartNewTrip() {
             </View>
           )}
         </ScrollView>
-
-        {/* ===== Bottom tab bar ===== */}
-        <View style={s.tabBar}>
-          {[
-            { id: "home", label: "Home", icon: Home },
-            { id: "add", label: "Add", icon: ListPlus },
-            // showMasterTab && { id: "master", label: "Master", icon: Layers },
-            { id: "family", label: "Family", icon: Users },
-            { id: "profile", label: "Profile", icon: UserCircle2 },
-          ].filter(Boolean).map(({ id, label, icon: Icon }) => (
-            <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
-              <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
-                <Icon size={18} color={tab === id ? "#fff" : t.muted} />
-              </View>
-              <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
       </KeyboardAvoidingView>
+
+      {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
+          pinned to the bottom of the screen, not the top of the keyboard) ===== */}
+      <View style={s.tabBar}>
+        {[
+          { id: "home", label: "Home", icon: Home },
+          { id: "add", label: "Add", icon: ListPlus },
+          // showMasterTab && { id: "master", label: "Master", icon: Layers },
+          { id: "family", label: "Family", icon: Users },
+          { id: "profile", label: "Profile", icon: UserCircle2 },
+        ].filter(Boolean).map(({ id, label, icon: Icon }) => (
+          <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
+            <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
+              <Icon size={18} color={tab === id ? "#fff" : t.muted} />
+            </View>
+            <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
 
       {/* ===== Lists modal (create / rename / delete / switch) =====
           In-tree overlay instead of RN's <Modal> — see the header-menu

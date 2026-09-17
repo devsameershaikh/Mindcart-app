@@ -83,8 +83,7 @@ export async function setToken(token) {
 }
 
 async function request(path, { method = "GET", body, auth = true } = {}) {
-  console.log(`API request: ${method} ${path}`);
-  console.log(`API request body: ${body ? JSON.stringify(body) : "(none)"}`);
+  // console.log(`API request: ${method} ${path}`);
   const headers = { "Content-Type": "application/json" };
   if (auth) {
     const token = await getToken();
@@ -97,7 +96,6 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    console.log(`API response: ${method} ${path} -> ${res.status}`);
   } catch (networkError) {
     // RN's fetch throws a generic "Network request failed" for anything
     // from "server not running" to "wrong IP for this device" to "phone
@@ -110,8 +108,6 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     err.isOffline = true;
     throw err;
   }
-  console.log(`API response body: ${res.status} ${res.statusText}`);
-  console.log(await res.clone().text().catch(() => "(not JSON)"));
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {

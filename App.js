@@ -52,6 +52,8 @@ import {
 } from "./src/utils/api";
 import { getSocket, joinListRoom } from "./src/utils/socket";
 import { Share2 } from "lucide-react-native";
+import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
+
 
 // This app is local-first: everything lives in on-device storage (see
 // storage.js) by default, so it works fully offline with no account.
@@ -253,6 +255,36 @@ function SwipeDeleteAction({ t, onDelete }) {
   );
 }
 
+const ROLE_RANK = { OWNER: 0, WRITE: 1, READ: 2 };
+
+// Decide which list should be selected after cloud lists are merged in.
+// Order of preference:
+//   1. the current selection, if it still exists
+//   2. a cloud list you own
+//   3. one of your own local-only lists
+//   4. a list shared with you (WRITE before READ)
+//   5. null (nothing available)
+function pickListId(cur, cloudLists, localLists, excludedIds = []) {
+  const excluded = new Set(excludedIds);
+  const cloudIds = new Set(cloudLists.map((l) => l.id));
+  const localKept = localLists.filter((l) => !cloudIds.has(l.id) && !excluded.has(l.id));
+  const validIds = new Set([...cloudIds, ...localKept.map((l) => l.id)]);
+
+  // Keep the selection only if it still points at a real list.
+  if (cur && validIds.has(cur)) return cur;
+
+  // Array.sort is stable, so ties keep the server's order.
+  const rankedCloud = [...cloudLists].sort(
+    (a, b) => (ROLE_RANK[a.role] ?? 3) - (ROLE_RANK[b.role] ?? 3)
+  );
+  const ownedCloud = rankedCloud.find((l) => l.role === "OWNER");
+
+  if (ownedCloud) return ownedCloud.id;
+  if (localKept.length) return localKept[0].id;
+  if (rankedCloud.length) return rankedCloud[0].id;
+  return null;
+}
+
 export default function DmartApp() {
   const [appLoaded, setAppLoaded] = useState(false);
   const hydrated = useRef(false); // guards the very first save-effect run
@@ -351,7 +383,7 @@ export default function DmartApp() {
   // lists (kept exactly as they were, untouched) rather than replacing them.
   useEffect(() => {
 
-    if (!user) return;
+    if (!user || !appLoaded) return;
     let cancelled = false;
     (async () => {
       setCloudSyncing(true);
@@ -433,9 +465,9 @@ export default function DmartApp() {
         });
         // If nothing is selected yet (or the only thing selected was the
         // placeholder local default list) and cloud lists exist, land on one.
-        if (cloudLists.length) {
-          setSelectedListId((cur) => (cur ? cur : cloudLists[0].id));
-        }
+      setSelectedListId((cur) =>
+        pickListId(cur, cloudLists, listsRef.current, [...lostAccessIds, ...staleSeedIds])
+      );
       } catch (e) {
         setNotice(`Couldn't load your cloud lists: ${e?.message || "network error"}`);
       } finally {
@@ -447,7 +479,7 @@ export default function DmartApp() {
       } catch { /* non-fatal — the invite banner just stays empty */ }
     })();
     return () => { cancelled = true; };
-  }, [user]);
+  }, [user, appLoaded]);
 
   // Accept/decline an invite someone sent *to* me. Accepting immediately
   // pulls the newly-shared list(s) so they show up without a manual refresh.
@@ -681,16 +713,38 @@ export default function DmartApp() {
     };
   }, [user]);
 
-  // Android 8+ silently drops scheduled notifications without a channel —
-  // this only needs to run once, it's a no-op / ignored on iOS.
-  useEffect(() => {
-    if (Platform.OS === "android") {
-      Notifications.setNotificationChannelAsync("default", {
-        name: "Shopping reminders",
-        importance: Notifications.AndroidImportance.DEFAULT,
-      }).catch(() => {});
-    }
-  }, []);
+      useEffect(() => {
+    if (!user) return;
+
+    const handle = ({ type, data }) => {
+      switch (type) {
+        case PUSH_TYPES.INVITE_RECEIVED:
+          // Refresh from the server rather than trusting the payload —
+          // the invite may already have been revoked since it was sent.
+          fetchInvites()
+            .then(({ received }) => setReceivedInvites(received || []))
+            .catch(() => {});
+          setShowFamilySync(true);
+          break;
+
+        case PUSH_TYPES.INVITE_ACCEPTED:
+        case PUSH_TYPES.INVITE_DECLINED:
+          setShowFamilySync(true);
+          break;
+
+        case PUSH_TYPES.LIST_GRANTED:
+          if (data?.listId) setSelectedListId(data.listId);
+          break;
+
+        default:
+          break;
+      }
+    };
+
+    const unsubscribe = notificationService.onTap(handle);
+    notificationService.getInitialTap().then((tap) => { if (tap) handle(tap); });
+    return unsubscribe;
+  }, [user]);
 
   // ---------- Load everything from local storage once, on mount ----------
   useEffect(() => {
@@ -1362,45 +1416,6 @@ export default function DmartApp() {
 
   function toggleCollapse(cat) { setCollapsed((p) => ({ ...p, [cat]: !p[cat] })); }
 
-  // ---------- Barcode scanning ----------
-  // async function openScanner() {
-  //   if (!cameraPermission?.granted) {
-  //     const res = await requestCameraPermission();
-  //     if (!res.granted) { setNotice("Camera permission is needed to scan barcodes."); return; }
-  //   }
-  //   scanLockRef.current = false;
-  //   setScannerOpen(true);
-  // }
-  // function onBarcodeScanned(result) {
-  //   if (scanLockRef.current) return;
-  //   scanLockRef.current = true;
-  //   setScannerOpen(false);
-  //   // lookupBarcode(result.data);
-  // }
-  // Uses UPCitemdb's free lookup endpoint — no API key needed, but it's a
-  // trial/rate-limited endpoint, so failures (unknown code, rate limit,
-  // offline) are expected sometimes; the user can still type the name in.
-  // async function lookupBarcode(code) {
-  //   setScanLoading(true);
-  //   try {
-  //     const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(code)}`);
-  //     const data = await res.json();
-  //     const item = data?.items?.[0];
-  //     if (item?.title) {
-  //       setFName(item.title.length > 40 ? item.title.slice(0, 40) : item.title);
-  //       const price = item.lowest_recorded_price || item.highest_recorded_price || item.offers?.[0]?.price;
-  //       if (price) setFPrice(String(Math.round(Number(price))));
-  //       setNotice(`Found "${item.title}" — check the details before adding.`);
-  //     } else {
-  //       setNotice("No product found for that barcode — you can still type the name in.");
-  //     }
-  //   } catch(e) {
-  //     console.log("Barcode lookup error:", e);
-  //     setNotice("Couldn't look up that barcode — check your connection and try again.");
-  //   } finally {
-  //     setScanLoading(false);
-  //   }
-  // }
 
   async function exportPDF() {
     if (exportingPdf) return; // guard against double taps while one export is in flight
@@ -1618,8 +1633,8 @@ function confirmStartNewTrip() {
           <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
         ) : null}
 
-        {receivedInvites.length > 0 && (
-          <View style={{ marginHorizontal: 18, marginTop: 12, gap: 8 }}>
+            {receivedInvites?.length > 0 && (             
+              <View style={{ marginHorizontal: 18, marginTop: 12, gap: 8 }}>
             <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.4 }}>
               {receivedInvites.length === 1 ? "Pending invitation" : `Pending invitations (${receivedInvites.length})`}
             </Text>
@@ -1635,7 +1650,7 @@ function confirmStartNewTrip() {
                     <View style={{ flex: 1, minWidth: 0 }}>
                       <Text style={s.itemName}>{senderLabel}</Text>
                       <Text style={s.itemUnit}>
-                        {invite.inviteAllLists ? "Invited you as a family member" : `Invited you to "${invite.list?.name}"`}
+                        {invite.inviteAllLists ? "Invited you as a family member" : `Invited you to "${invite.listName}"`}
                         {"  ·  "}{invite.role === "READ" ? "Can view" : "Can edit"}
                       </Text>
                     </View>

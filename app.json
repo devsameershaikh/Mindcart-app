@@ -12,11 +12,16 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.samappstudio.mindcart"
+      "bundleIdentifier": "com.samappstudio.mindcart",
+      "infoPlist": {
+        "UIBackgroundModes": ["remote-notification"]
+      }
     },
     "android": {
       "package": "com.samappstudio.mindcart",
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": ["POST_NOTIFICATIONS"],
+      "googleServicesFile": "./google-services.json"
     },
     "extra": {
       "eas": {
@@ -24,8 +29,22 @@
       }
     },
     "owner": "sameer.shaikh.dev",
-    "plugins": [
-      "@react-native-community/datetimepicker"
+   "plugins": [
+      "@react-native-community/datetimepicker",
+      [
+        "expo-notifications",
+        {
+          "icon": "./src/assets/icon.png",
+          "color": "#ffffff"
+        }
+      ],
+      [
+        "@sentry/react-native/expo",
+        {
+          "organization": "YOUR_SENTRY_ORG_SLUG",
+          "project": "mindcart-app"
+        }
+      ]
     ]
   }
 }

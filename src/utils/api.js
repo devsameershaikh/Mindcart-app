@@ -250,3 +250,15 @@ export const changeMemberRole = (listId, userId, role) =>
   request(`/sharing/lists/${listId}/members/${userId}`, { method: "PATCH", body: { role } });
 export const removeMember = (listId, userId) =>
   request(`/sharing/lists/${listId}/members/${userId}`, { method: "DELETE" });
+
+// ---------- Devices / push ----------
+// Not offline-queued: a push token is only useful while online anyway, and
+// notificationService re-registers on the next successful launch.
+export const registerPushToken = ({ token, platform, deviceName, appVersion }) =>
+  request("/devices/push-token", {
+    method: "POST",
+    body: { token, platform, deviceName, appVersion },
+  });
+
+export const unregisterPushToken = (token) =>
+  request(`/devices/push-token/${encodeURIComponent(token)}`, { method: "DELETE" });

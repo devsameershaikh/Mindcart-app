@@ -64,6 +64,16 @@ import notificationService, { PUSH_TYPES } from "./src/service/notificationServi
 // created on the server) — local-only lists never get that field and are
 // never sent anywhere.
 
+// "just now" / "5m ago" / "3h ago" / "2d ago"
+function timeAgo(ts) {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 // ---------- Currency ----------
 // Symbol-only: picking a currency just changes the label shown next to
 // prices everywhere in the app. There's no conversion or exchange rate
@@ -373,10 +383,16 @@ export default function DmartApp() {
   const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
   const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
   const [respondingInviteId, setRespondingInviteId] = useState(null);
+  const [notifOpen, setNotifOpen] = useState(false); // notifications panel (header bell + Family tab both open it)
+  const [activity, setActivity] = useState([]); // non-actionable notifications: { id, kind, text, at, read }
+  const notifAnim = useRef(new Animated.Value(0)).current;
+  const [invitesOpen, setInvitesOpen] = useState(false); // "Pending invitations" popup (Family tab row)
+  const invitesAnim = useRef(new Animated.Value(0)).current;
   const [makingShareable, setMakingShareable] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
   const showSearch = tab === "home"||tab === "add";
+  const badgeCount = receivedInvites.length + activity.filter((a) => !a.read).length;
 
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
@@ -480,6 +496,90 @@ export default function DmartApp() {
     })();
     return () => { cancelled = true; };
   }, [user, appLoaded]);
+
+  // One invitation card (avatar, who/what, permission chip, Decline / Accept).
+  // Shared by the bell's notification panel and the Family tab's invitations popup.
+  function renderInviteCard(invite) {
+                    const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
+                    const isResponding = respondingInviteId === invite.id;
+                    const canEdit = invite.role !== "READ";
+                    return (
+                      <View key={invite.id} style={[s.itemCard, { gap: 12 }]}>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                          <View style={s.avatarCircle}>
+                            <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
+                          </View>
+                          <View style={{ flex: 1, minWidth: 0 }}>
+                            <Text style={s.itemName} numberOfLines={1}>{senderLabel}</Text>
+                            <Text style={s.itemUnit} numberOfLines={2}>
+                              {invite.inviteAllLists ? "invited you to join their family" : `invited you to "${invite.listName}"`}
+                            </Text>
+                          </View>
+                          <View style={[s.permBadge, { marginRight: 0, flexDirection: "row", alignItems: "center", gap: 4 }]}>
+                            {canEdit ? <Pencil size={11} color={t.accent} /> : <Eye size={11} color={t.accent} />}
+                            <Text style={{ color: t.accent, fontSize: 11, fontWeight: "700" }}>{canEdit ? "Can edit" : "Can view"}</Text>
+                          </View>
+                        </View>
+                        <View style={{ flexDirection: "row", gap: 8 }}>
+                          <TouchableOpacity
+                            onPress={() => respondToInvite(invite, false)}
+                            disabled={isResponding}
+                            style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 11, opacity: isResponding ? 0.5 : 1 }]}
+                          >
+                            <Text style={s.smallBtnText}>Decline</Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            onPress={() => respondToInvite(invite, true)}
+                            disabled={isResponding}
+                            style={[s.addItemBtn, { flex: 2, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
+                          >
+                            {isResponding ? <ActivityIndicator color="#fff" /> : (<><Check size={15} color="#fff" /><Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text></>)}
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    );
+  }
+
+  // Adds a non-actionable entry to the notification panel (newest first).
+  // kind: "accepted" | "declined" | "revoked" | "info". Any part of the app
+  // can call this to surface a notification — it only touches a state setter.
+  function pushActivity(kind, text) {
+    setActivity((prev) => [{ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, kind, text, at: Date.now(), read: false }, ...prev].slice(0, 30));
+  }
+
+  // Family tab's "Pending invitations" popup — a separate centred dialog that
+  // only handles invites (the bell's panel is the general notification centre).
+  function openInvites() {
+    invitesAnim.setValue(0);
+    setInvitesOpen(true);
+    Animated.timing(invitesAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+    fetchInvites()
+      .then(({ received }) => setReceivedInvites(received || []))
+      .catch(() => {});
+  }
+  function closeInvites() { setInvitesOpen(false); }
+
+  // Once the last pending invite is answered there's nothing left to show.
+  useEffect(() => {
+    if (invitesOpen && receivedInvites.length === 0) setInvitesOpen(false);
+  }, [invitesOpen, receivedInvites.length]);
+
+  function closeNotifications() {
+    setNotifOpen(false);
+    setActivity((prev) => (prev.some((a) => !a.read) ? prev.map((a) => (a.read ? a : { ...a, read: true })) : prev));
+  }
+
+  // Opens the notifications panel (drops down from the top) and quietly
+  // re-syncs invites from the server so the list is never stale (an invite
+  // may have been revoked since it arrived).
+  function openNotifications() {
+    notifAnim.setValue(0);
+    setNotifOpen(true);
+    Animated.timing(notifAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+    fetchInvites()
+      .then(({ received }) => setReceivedInvites(received || []))
+      .catch(() => {});
+  }
 
   // Accept/decline an invite someone sent *to* me. Accepting immediately
   // pulls the newly-shared list(s) so they show up without a manual refresh.
@@ -631,7 +731,11 @@ export default function DmartApp() {
     socket.on("list:memberJoined", onMemberChange);
     socket.on("list:memberRemoved", onMemberChange);
     socket.on("list:memberRoleChanged", onMemberChange);
-    const onInviteReceived = ({ invite }) => setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
+    const onInviteReceived = ({ invite }) => {
+      setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      setNotice(`${invite.sender?.name || invite.sender?.email || "Someone"} sent you an invitation — tap the bell.`);
+    };
     socket.on("invite:received", onInviteReceived);
 
     // Push accept/decline back to the SENDER's Pending Invites panel live,
@@ -650,7 +754,11 @@ export default function DmartApp() {
         }
         return next;
       });
-      if (matched) setNotice(`${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+      if (matched) {
+        const msg = `${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`;
+        setNotice(msg);
+        pushActivity("accepted", msg);
+      }
     };
     const onInviteDeclined = ({ inviteId }) => {
       let matched = null;
@@ -663,7 +771,11 @@ export default function DmartApp() {
         }
         return next;
       });
-      if (matched) setNotice(`${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+      if (matched) {
+        const msg = `${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`;
+        setNotice(msg);
+        pushActivity("declined", msg);
+      }
     };
     socket.on("invite:accepted", onInviteAccepted);
     socket.on("invite:declined", onInviteDeclined);
@@ -676,7 +788,10 @@ export default function DmartApp() {
         existed = prev.some((i) => i.id === inviteId);
         return prev.filter((i) => i.id !== inviteId);
       });
-      if (existed) setNotice("An invitation was withdrawn by the sender.");
+      if (existed) {
+        setNotice("An invitation was withdrawn by the sender.");
+        pushActivity("revoked", "An invitation was withdrawn by the sender.");
+      }
     };
     socket.on("invite:revoked", onInviteRevoked);
 
@@ -692,7 +807,9 @@ export default function DmartApp() {
       setCloudMembersByList((prev) => ({ ...prev, [list.id]: list.members }));
       joinListRoom(list.id);
       const ownerMember = list.members.find((m) => m.role === "OWNER");
-      setNotice(`${ownerMember?.name || ownerMember?.email || "A family member"} added you to "${list.name}".`);
+      const grantedMsg = `${ownerMember?.name || ownerMember?.email || "A family member"} added you to "${list.name}".`;
+      setNotice(grantedMsg);
+      pushActivity("info", grantedMsg);
     };
     socket.on("list:granted", onListGranted);
 
@@ -724,12 +841,12 @@ export default function DmartApp() {
           fetchInvites()
             .then(({ received }) => setReceivedInvites(received || []))
             .catch(() => {});
-          setShowFamilySync(true);
+          openInvites();
           break;
 
         case PUSH_TYPES.INVITE_ACCEPTED:
         case PUSH_TYPES.INVITE_DECLINED:
-          setShowFamilySync(true);
+          setTab("family");
           break;
 
         case PUSH_TYPES.LIST_GRANTED:
@@ -1616,6 +1733,16 @@ function confirmStartNewTrip() {
           </TouchableOpacity>
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
+            {!!user && (
+              <TouchableOpacity onPress={openNotifications} style={s.iconBtn} accessibilityLabel="Notifications">
+                {badgeCount > 0 ? <BellRing size={17} color={t.accent} /> : <Bell size={17} color={t.text} />}
+                {badgeCount > 0 && (
+                  <View style={s.bellBadge}>
+                    <Text style={s.bellBadgeText}>{badgeCount > 9 ? "9+" : badgeCount}</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+            )}
             <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf}>
               {exportingPdf ? (
                 <ActivityIndicator size="small" color={t.text} />
@@ -1632,50 +1759,6 @@ function confirmStartNewTrip() {
         {notice ? (
           <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
         ) : null}
-
-            {receivedInvites?.length > 0 && (             
-              <View style={{ marginHorizontal: 18, marginTop: 12, gap: 8 }}>
-            <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.4 }}>
-              {receivedInvites.length === 1 ? "Pending invitation" : `Pending invitations (${receivedInvites.length})`}
-            </Text>
-            {receivedInvites.map((invite) => {
-              const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
-              const isResponding = respondingInviteId === invite.id;
-              return (
-                <View key={invite.id} style={[s.itemCard, { gap: 10 }]}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                    <View style={s.avatarCircle}>
-                      <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
-                    </View>
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={s.itemName}>{senderLabel}</Text>
-                      <Text style={s.itemUnit}>
-                        {invite.inviteAllLists ? "Invited you as a family member" : `Invited you to "${invite.listName}"`}
-                        {"  ·  "}{invite.role === "READ" ? "Can view" : "Can edit"}
-                      </Text>
-                    </View>
-                  </View>
-                  <View style={{ flexDirection: "row", gap: 8 }}>
-                    <TouchableOpacity
-                      onPress={() => respondToInvite(invite, true)}
-                      disabled={isResponding}
-                      style={[s.addItemBtn, { flex: 1, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
-                    >
-                      {isResponding ? <ActivityIndicator color="#fff" /> : <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text>}
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      onPress={() => respondToInvite(invite, false)}
-                      disabled={isResponding}
-                      style={[s.smallBtn, { flex: 1, alignItems: "center", opacity: isResponding ? 0.6 : 1 }]}
-                    >
-                      <Text style={s.smallBtnText}>Decline</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              );
-            })}
-          </View>
-        )}
 
         {pendingDelete ? (
           <View style={s.undoRow}>
@@ -2058,6 +2141,24 @@ function confirmStartNewTrip() {
           )}
 
           {tab === "family" && (
+            <>
+            {receivedInvites.length > 0 && (
+              <TouchableOpacity onPress={openInvites} activeOpacity={0.85} style={[s.inviteEntry, { marginBottom: 14 }]}>
+                <View style={s.inviteEntryIcon}>
+                  <Mail size={18} color="#fff" />
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={s.itemName}>Pending invitations</Text>
+                  <Text style={s.itemUnit}>
+                    {receivedInvites.length === 1
+                      ? `${receivedInvites[0].sender?.name || receivedInvites[0].sender?.email || "Someone"} is waiting for your reply`
+                      : `${receivedInvites.length} people are waiting for your reply`}
+                  </Text>
+                </View>
+                <View style={s.countPill}><Text style={s.countPillText}>{receivedInvites.length}</Text></View>
+                <ChevronRight size={18} color={t.muted} />
+              </TouchableOpacity>
+            )}
             <FamilySyncScreen
               t={t} s={s}
               selectedList={selectedList}
@@ -2078,6 +2179,7 @@ function confirmStartNewTrip() {
               onChangeRole={(userId, role) => changeFamilyMemberRole(selectedList.id, userId, role)}
               onRemoveMember={(userId) => removeFamilyMember(selectedList.id, userId)}
             />
+            </>
           )}
 
           {tab === "profile" && (
@@ -2218,6 +2320,7 @@ function confirmStartNewTrip() {
           <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
             <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
               <Icon size={18} color={tab === id ? "#fff" : t.muted} />
+              {id === "family" && receivedInvites.length > 0 && tab !== "family" && <View style={s.tabDot} />}
             </View>
             <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
           </TouchableOpacity>
@@ -2402,6 +2505,103 @@ function confirmStartNewTrip() {
       )}
 
       {/* ===== Confirm "Start new trip" popup ===== */}
+      {/* ===== Pending invitations popup — centred dialog opened from the Family tab row.
+          Invites only (the header bell opens the full Notifications panel instead). ===== */}
+      {invitesOpen && (
+        <View style={[s.overlayFill, { zIndex: 46, elevation: 26 }]}>
+          <Pressable style={s.modalBackdropCenter} onPress={closeInvites}>
+            <Animated.View style={{ width: "100%", alignItems: "center", opacity: invitesAnim, transform: [{ scale: invitesAnim.interpolate({ inputRange: [0, 1], outputRange: [0.94, 1] }) }] }}>
+              <Pressable style={s.popupCard} onPress={() => {}}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 14 }}>
+                  <View style={s.inviteEntryIcon}><Mail size={18} color="#fff" /></View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={s.sheetTitle}>Pending invitations</Text>
+                    <Text style={{ color: t.muted, fontSize: 12.5, marginTop: 1 }}>
+                      {receivedInvites.length === 1 ? "1 person is waiting for your reply" : `${receivedInvites.length} people are waiting for your reply`}
+                    </Text>
+                  </View>
+                  <TouchableOpacity onPress={closeInvites} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                    <X size={18} color={t.muted} />
+                  </TouchableOpacity>
+                </View>
+                <ScrollView style={{ maxHeight: 420 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: 10 }}>
+                  {receivedInvites.map(renderInviteCard)}
+                </ScrollView>
+                <TouchableOpacity onPress={closeInvites} style={{ alignSelf: "center", marginTop: 14, paddingVertical: 4, paddingHorizontal: 10 }}>
+                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "700" }}>Decide later</Text>
+                </TouchableOpacity>
+              </Pressable>
+            </Animated.View>
+          </Pressable>
+        </View>
+      )}
+
+      {/* ===== Notifications panel — drops down from the top, right under the header bell.
+          Opened by the bell and by the Family tab's "Pending invitations" row.
+          In-tree overlay (not <Modal>) like the other popups, to avoid the Android flicker. ===== */}
+      {notifOpen && (
+        <View style={[s.overlayFill, { zIndex: 45, elevation: 25 }]}>
+          <Pressable style={s.notifBackdrop} onPress={closeNotifications}>
+            <Animated.View style={{ opacity: notifAnim, transform: [{ translateY: notifAnim.interpolate({ inputRange: [0, 1], outputRange: [-16, 0] }) }] }}>
+              <Pressable style={s.notifPanel} onPress={() => {}}>
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <Text style={s.sheetTitle}>Notifications</Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 16 }}>
+                    {activity.length > 0 && (
+                      <TouchableOpacity onPress={() => setActivity([])} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                        <Text style={{ color: t.accent, fontSize: 12.5, fontWeight: "700" }}>Clear</Text>
+                      </TouchableOpacity>
+                    )}
+                    <TouchableOpacity onPress={closeNotifications} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                      <X size={18} color={t.muted} />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                <ScrollView style={{ maxHeight: 460 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: 10 }}>
+                  {receivedInvites.length === 0 && activity.length === 0 && (
+                    <View style={s.emptyStateWrap}>
+                      <View style={s.emptyStateIconWrap}><Bell size={26} color={t.accent} /></View>
+                      <Text style={s.emptyStateTitle}>You're all caught up</Text>
+                      <Text style={s.emptyStateSub}>Invitations and updates from your family lists will show up here.</Text>
+                    </View>
+                  )}
+
+                  {receivedInvites.length > 0 && (
+                    <Text style={s.sectionLabel}>Invitations · {receivedInvites.length}</Text>
+                  )}
+                  {receivedInvites.map(renderInviteCard)}
+
+                  {activity.length > 0 && (
+                    <Text style={[s.sectionLabel, receivedInvites.length > 0 && { marginTop: 10 }]}>Recent activity</Text>
+                  )}
+                  {activity.map((a) => {
+                    const good = a.kind === "accepted";
+                    const bad = a.kind === "declined" || a.kind === "revoked";
+                    const Icon = good ? Check : bad ? X : Bell;
+                    const tint = good ? t.accent2 : bad ? t.danger : t.accent;
+                    const tintBg = good ? t.accent2Soft : bad ? t.dangerSoft : t.accentSoft;
+                    return (
+                      <View key={a.id} style={s.activityRow}>
+                        <View style={[s.activityIcon, { backgroundColor: tintBg }]}><Icon size={15} color={tint} /></View>
+                        <View style={{ flex: 1, minWidth: 0 }}>
+                          <Text style={{ color: t.text, fontSize: 13, fontWeight: a.read ? "500" : "700", lineHeight: 18 }}>{a.text}</Text>
+                          <Text style={s.itemUnit}>{timeAgo(a.at)}</Text>
+                        </View>
+                        {!a.read && <View style={s.unreadDot} />}
+                        <TouchableOpacity onPress={() => setActivity((prev) => prev.filter((x) => x.id !== a.id))} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                          <X size={14} color={t.muted} />
+                        </TouchableOpacity>
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+              </Pressable>
+            </Animated.View>
+          </Pressable>
+        </View>
+      )}
+
       {confirmNewTripOpen && (
         <View style={[s.overlayFill, { zIndex: 44, elevation: 24 }]}>
         <Pressable style={s.modalBackdropCenter} onPress={() => setConfirmNewTripOpen(false)}>
@@ -2968,6 +3168,20 @@ function makeStyles(t) {
     segmentBtnActive: { backgroundColor: t.accent, ...cardShadow },
     segmentText: { fontSize: 12, fontWeight: "700", color: t.muted },
     segmentTextActive: { color: "#fff" },
+
+    // ---- Invitations (bell, sheet, Family entry) ----
+    bellBadge: { position: "absolute", top: -3, right: -3, minWidth: 17, height: 17, paddingHorizontal: 4, borderRadius: 9, backgroundColor: t.danger, alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: t.bg },
+    bellBadgeText: { color: "#fff", fontSize: 9.5, fontWeight: "800" },
+    tabDot: { position: "absolute", top: 6, right: 17, width: 9, height: 9, borderRadius: 5, backgroundColor: t.danger, borderWidth: 1.5, borderColor: t.surface },
+    notifBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.45)", paddingTop: 60, paddingHorizontal: 14 },
+    notifPanel: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 16, elevation: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 14, shadowOffset: { width: 0, height: 8 } },
+    activityRow: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 11 },
+    activityIcon: { width: 30, height: 30, borderRadius: RADIUS.pill, alignItems: "center", justifyContent: "center" },
+    unreadDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: t.accent },
+    inviteEntry: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: t.accentSoft, borderWidth: 1, borderColor: `${t.accent}40`, borderRadius: RADIUS.lg, padding: 14 },
+    inviteEntryIcon: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    countPill: { minWidth: 24, height: 24, paddingHorizontal: 7, borderRadius: 12, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    countPillText: { color: "#fff", fontSize: 12, fontWeight: "800" },
 
     // ---- Empty states ----
     emptyStateWrap: { alignItems: "center", paddingVertical: 36, paddingHorizontal: 20, gap: 10 },

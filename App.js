@@ -1829,9 +1829,9 @@ function confirmStartNewTrip() {
             </View>
           )}
 
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
-          {tab === "home" && (
-            <>
+        {/* ===== Pinned header (does NOT scroll): summary + All/Pending/Bought ===== */}
+        {tab === "home" && (
+          <View style={{ paddingHorizontal: 16 }}>
               <View style={s.summaryCard}>
                 <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 18, alignItems: "center" }}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
@@ -1885,8 +1885,7 @@ function confirmStartNewTrip() {
                   <Text style={{ color: tripDirty ? t.accent : t.muted, fontWeight: "600", fontSize: 12.5 }}>Start new trip</Text>
                 </TouchableOpacity>
               </View>
-
-              {/* ===== Segmented filter: All / Pending / Bought ===== */}
+            <View style={s.stickyFilterWrap}>
               <View style={s.segmentWrap}>
                 {[
                   { id: "all", label: `All (${items.length})` },
@@ -1902,7 +1901,67 @@ function confirmStartNewTrip() {
                   </TouchableOpacity>
                 ))}
               </View>
+            </View>
+          </View>
+        )}
 
+        {/* ===== Pinned "Add item" card (does NOT scroll) ===== */}
+        {tab === "add" && (
+          <View style={{ paddingHorizontal: 16, paddingBottom: 8, zIndex: 10 }}>
+              {debouncedSearch.trim() ? (
+                <Text style={{ marginTop: 10, fontSize: 12.5, color: searchMatch ? t.accent : t.muted }}>
+                  {searchMatch
+                    ? `✅ "${searchMatch.name}" is already on your list (qty: ${searchMatch.qty} ${searchMatch.unit})`
+                    : `"${debouncedSearch}" is not on your list yet — add it below.`}
+                </Text>
+              ) : null}
+
+              <View style={s.addCard}>
+                <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <TextInput
+                    value={fName}
+                    maxLength={200}
+                    onChangeText={(val) => {
+                      setFName(val);
+                      if (itemNameError) setItemNameError("");
+                      if (!categoryTouched && !val.includes(",")) {
+                        const guess = suggestCategory(val);
+                        if (guess) setFCategory(guess);
+                      }
+                    }}
+                    onSubmitEditing={addItem}
+                    placeholder="Item name"
+                    placeholderTextColor={t.muted}
+                    style={[s.input, { flex: 1, minWidth: 140, borderColor: itemNameError ? t.danger : t.border }]}
+                  />
+                  {/* <TouchableOpacity onPress={openScanner} style={s.iconBtn} disabled={scanLoading}>
+                    <Barcode size={16} color={scanLoading ? t.muted : t.text} />
+                  </TouchableOpacity> */}
+                  <CategorySelect
+                    value={fCategory}
+                    categories={categories}
+                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
+                    onAddCategory={addCategory}
+                    t={t}
+                    style={{ flex: 1, minWidth: 100 }}
+                  />
+                </View>
+                {itemNameError ? <Text style={s.errorText}>{itemNameError}</Text> : null}
+                <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
+                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
+                  <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
+                    <Plus size={15} color="#fff" />
+                    <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+          </View>
+        )}
+
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
+          {tab === "home" && (
+            <>
               {items.length === 0 && (
                 <View style={s.emptyStateWrap}>
                   <View style={s.emptyStateIconWrap}>
@@ -2066,56 +2125,7 @@ function confirmStartNewTrip() {
 
           {tab === "add" && (
             <>
-              {debouncedSearch.trim() ? (
-                <Text style={{ marginTop: 10, fontSize: 12.5, color: searchMatch ? t.accent : t.muted }}>
-                  {searchMatch
-                    ? `✅ "${searchMatch.name}" is already on your list (qty: ${searchMatch.qty} ${searchMatch.unit})`
-                    : `"${debouncedSearch}" is not on your list yet — add it below.`}
-                </Text>
-              ) : null}
-
-              <View style={s.addCard}>
-                <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <TextInput
-                    value={fName}
-                    maxLength={200}
-                    onChangeText={(val) => {
-                      setFName(val);
-                      if (itemNameError) setItemNameError("");
-                      if (!categoryTouched && !val.includes(",")) {
-                        const guess = suggestCategory(val);
-                        if (guess) setFCategory(guess);
-                      }
-                    }}
-                    onSubmitEditing={addItem}
-                    placeholder="Item name"
-                    placeholderTextColor={t.muted}
-                    style={[s.input, { flex: 1, minWidth: 140, borderColor: itemNameError ? t.danger : t.border }]}
-                  />
-                  {/* <TouchableOpacity onPress={openScanner} style={s.iconBtn} disabled={scanLoading}>
-                    <Barcode size={16} color={scanLoading ? t.muted : t.text} />
-                  </TouchableOpacity> */}
-                  <CategorySelect
-                    value={fCategory}
-                    categories={categories}
-                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
-                    onAddCategory={addCategory}
-                    t={t}
-                    style={{ flex: 1, minWidth: 100 }}
-                  />
-                </View>
-                {itemNameError ? <Text style={s.errorText}>{itemNameError}</Text> : null}
-                <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
-                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
-                  <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
-                    <Plus size={15} color="#fff" />
-                    <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              <View style={{ marginTop: 16, gap: 8 }}>
+              <View style={{ marginTop: 4, gap: 8 }}>
                 {filtered.length === 0 && (
                   <View style={s.emptyStateWrap}>
                     <View style={s.emptyStateIconWrap}>
@@ -3206,7 +3216,8 @@ function makeStyles(t) {
     toggleThumbOn: { transform: [{ translateX: 18 }] },
 
     // ---- Segmented filter (Home: All / Pending / Bought) ----
-    segmentWrap: { flexDirection: "row", backgroundColor: t.surface2, borderRadius: RADIUS.pill, padding: 3, marginTop: 14, gap: 2 },
+    stickyFilterWrap: { backgroundColor: t.bg, marginHorizontal: -16, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: t.border },
+    segmentWrap: { flexDirection: "row", backgroundColor: t.surface2, borderRadius: RADIUS.pill, padding: 3, gap: 2 },
     segmentBtn: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 8, borderRadius: RADIUS.pill },
     segmentBtnActive: { backgroundColor: t.accent, ...cardShadow },
     segmentText: { fontSize: 12, fontWeight: "700", color: t.muted },

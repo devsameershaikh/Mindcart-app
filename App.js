@@ -31,7 +31,7 @@ import {
   Barcode, Bell, Menu, BellRing, Info, Mail, ShieldCheck, FileText,
   ChevronRight, Users, Layers, UserCircle2, Eye,
   Cloud, Crown, Sparkles, LogOut, Palette, Wallet, BellDot,
-  Zap, ArrowRight, Star, ShoppingBag,
+  Zap, ArrowRight, Star, ShoppingBag, AlertCircle,
 } from "lucide-react-native";
 
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
@@ -71,6 +71,26 @@ function timeAgo(ts) {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
+}
+
+// Toast helpers: setNotice(msg) stays the single entry point everywhere in
+// the app; the type (error / success / info) and on-screen time are derived
+// from the message so no call site has to change.
+function noticeKind(msg) {
+  if (/couldn't|didn't|can't|failed|no longer|only the owner|view-only|at least one/i.test(msg)) return "error";
+  if (/^(added|invited|invite accepted|started a new trip|test notification sent)|is now shareable/i.test(msg)) return "success";
+  return "info";
+}
+function noticeDuration(msg, kind) {
+  const base = kind === "error" ? 5000 : kind === "success" ? 2500 : 3500;
+  return Math.min(9000, base + Math.max(0, msg.length - 40) * 40); // longer text stays longer
+}
+
+// Collapse several validation messages into one short line.
+function summarizeItemErrors(errors) {
+  const uniq = [...new Set(errors)];
+  const shown = uniq.slice(0, 2).join(" · ");
+  return uniq.length > 2 ? `${shown} (+${uniq.length - 2} more)` : shown;
 }
 
 // ---------- Currency ----------
@@ -912,10 +932,21 @@ export default function DmartApp() {
 
   // const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
 
-  // auto-clear inline notices after a few seconds
+  // Floating toast driven by `notice`: fades in, auto-dismisses (errors stay
+  // longest), tap to dismiss, and never shifts the layout.
+  const [toast, setToast] = useState(null); // { msg, kind } — kept during fade-out
+  const toastAnim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 4000);
+    if (!notice) {
+      Animated.timing(toastAnim, { toValue: 0, duration: 160, useNativeDriver: true })
+        .start(({ finished }) => { if (finished) setToast(null); });
+      return;
+    }
+    const kind = noticeKind(notice);
+    setToast({ msg: notice, kind });
+    if (kind === "error") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+    Animated.timing(toastAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+    const timer = setTimeout(() => setNotice(""), noticeDuration(notice, kind));
     return () => clearTimeout(timer);
   }, [notice]);
 
@@ -1438,7 +1469,11 @@ export default function DmartApp() {
   // ---------- Item management ----------
   async function addItem() {
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
-    if (!fName.trim()) return;
+    if (!fName.trim()) {
+      tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+      setItemNameError("Type an item name first.");
+      return;
+    }
     const rawNames = fName.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 20);
     if (rawNames.length === 0) return;
     const category = (fCategory || "Other").trim() || "Other";
@@ -1457,7 +1492,8 @@ export default function DmartApp() {
     }
 
     if (toAdd.length === 0) {
-      setItemNameError(errors[0] || "Enter a valid item name.");
+      tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+      setItemNameError(summarizeItemErrors(errors) || "Enter a valid item name.");
       return;
     }
     setItemNameError("");
@@ -1512,7 +1548,7 @@ export default function DmartApp() {
     setFName("");
     setFPrice("");
     setCategoryTouched(false);
-    if (errors.length) setNotice(errors[0]);
+    if (errors.length) setItemNameError(`Added ${toAdd.length}, skipped ${errors.length}: ${summarizeItemErrors(errors)}`);
     bumpActivity(selectedListId);
   }
 
@@ -1803,10 +1839,6 @@ function confirmStartNewTrip() {
           </View>
         </View>
 
-        {notice ? (
-          <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
-        ) : null}
-
         {pendingDelete ? (
           <View style={s.undoRow}>
             <Text style={{ color: t.text, fontSize: 12.5 }}>Deleted "{pendingDelete.item.name}"</Text>
@@ -1947,7 +1979,12 @@ function confirmStartNewTrip() {
                     style={{ flex: 1, minWidth: 100 }}
                   />
                 </View>
-                {itemNameError ? <Text style={s.errorText}>{itemNameError}</Text> : null}
+                {itemNameError ? (
+                  <View style={s.inlineError} accessibilityLiveRegion="polite">
+                    <AlertCircle size={14} color={t.danger} style={{ marginTop: 1 }} />
+                    <Text style={s.inlineErrorText}>{itemNameError}</Text>
+                  </View>
+                ) : null}
                 <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
                   <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
                   <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
@@ -2358,6 +2395,31 @@ function confirmStartNewTrip() {
             </View>
           )}
         </ScrollView>
+
+        {/* ===== Floating toast (overlays, never pushes content) ===== */}
+        {toast ? (() => {
+          const tone = toast.kind === "error" ? t.danger : toast.kind === "success" ? t.accent : t.accent2;
+          const Icon = toast.kind === "error" ? AlertCircle : toast.kind === "success" ? Check : Info;
+          return (
+            <Animated.View
+              pointerEvents="box-none"
+              style={[s.toastWrap, { opacity: toastAnim, transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-12, 0] }) }] }]}
+            >
+              <Pressable
+                onPress={() => setNotice("")}
+                accessibilityRole="alert"
+                accessibilityLiveRegion="polite"
+                style={[s.toast, { borderColor: `${tone}66` }]}
+              >
+                <View style={[s.toastIcon, { backgroundColor: `${tone}22` }]}>
+                  <Icon size={15} color={tone} />
+                </View>
+                <Text style={s.toastText}>{toast.msg}</Text>
+                <X size={14} color={t.muted} />
+              </Pressable>
+            </Animated.View>
+          );
+        })() : null}
       </KeyboardAvoidingView>
 
       {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
@@ -3185,6 +3247,12 @@ function makeStyles(t) {
     addHint: { fontSize: 13, color: t.muted, fontWeight: "600", marginBottom: 10 },
     input: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 12, color: t.text, fontSize: 14 },
     errorText: { color: t.danger, fontSize: 11.5, marginTop: 4 },
+    toastWrap: { position: "absolute", top: 70, left: 16, right: 16, zIndex: 100, elevation: 12 },
+    toast: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: t.surface, borderWidth: 1, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 12, shadowColor: "#000", shadowOpacity: 0.2, shadowRadius: 12, shadowOffset: { width: 0, height: 6 } },
+    toastIcon: { width: 26, height: 26, borderRadius: RADIUS.pill, alignItems: "center", justifyContent: "center" },
+    toastText: { flex: 1, color: t.text, fontSize: 13, lineHeight: 18, fontWeight: "600" },
+    inlineError: { flexDirection: "row", alignItems: "flex-start", gap: 6, marginTop: 8 },
+    inlineErrorText: { flex: 1, color: t.danger, fontSize: 12.5, lineHeight: 17, fontWeight: "600" },
     addItemBtn: { marginLeft: "auto", backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", gap: 6 },
     smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10, backgroundColor: t.surface },
     smallBtnText: { color: t.text, fontSize: 12, fontWeight: "700" },

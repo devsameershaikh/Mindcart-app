@@ -24,7 +24,6 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
-console.log("Swipeable:", Swipeable);
 import * as Haptics from "expo-haptics";
 import {
   Plus, Trash2, Moon, SunMedium, Search, Settings, ChevronDown, Check,
@@ -121,13 +120,16 @@ const PRIVACY_POLICY_URL = "https://example.com/privacy-policy";
 const CONTACT_EMAIL = "support@example.com";
 // Short, plain-language Privacy Policy shown in-app (condensed from the
 // full policy). Edit this if your data practices change.
-const PRIVACY_POLICY_TEXT = `MindCart does not collect, store, or transmit your personal information to any server. You can use the app without an account.
+const PRIVACY_POLICY_TEXT = `MindCart uses your Google account to sign you in. Here is what the app handles:
 
-All your lists, items, quantities, prices, and notes stay stored locally on your device. We don't see or receive this information.
+Account: when you sign in with Google we receive your name, email address and profile picture, and use them to identify you and to let people you invite find you.
 
-We do not sell, rent, or share your data with third parties. If any third-party service (analytics, cloud backup, etc.) is added in the future, this policy will be updated first.
+Your lists: your lists, items, quantities, prices, notes and categories are stored on your device and synced to our servers so they are available on your devices and can be shared. People you invite can see the lists you share with them (an "all my lists" family invite shares every list you own).
+Notifications: if you allow notifications, your device's push token is stored so we can send you invitations and updates.
 
-Since your data lives on your device, keeping your device secure keeps your data secure.
+We do not sell your data or use it for advertising. Our hosting providers process it on our behalf only to run the app.
+
+You can sign out at any time. To have your account and data deleted, contact us at the support email shown in the app.
 
 Not intended for children under 13.`;
 // Short, plain-language Terms of Use shown in-app. Edit this to match your
@@ -135,7 +137,7 @@ Not intended for children under 13.`;
 // for proper legal text if your app needs one.
 const TERMS_OF_USE_TEXT = `By using MindCart, you agree to use the app for personal, lawful purposes only.
 
-All your lists and data are stored locally on your device — we don't collect or store it on any server. The app is provided "as is," without warranties of any kind, and we aren't liable for any loss of data.
+Your lists are stored on your device and, while you are signed in, synced to our servers so they can be shared with the people you invite. You are responsible for who you share lists with. The app is provided "as is," without warranties of any kind, and we aren't liable for any loss of data.
 
 We may update these terms from time to time. Continued use of the app means you accept the current terms.`;
 const OPEN_SOURCE_LIBS = [
@@ -167,19 +169,7 @@ const DAILY_TEST_LOOKAHEAD_DAYS = 60;
 const DAILY_TEST_DEFAULT_HOUR = 20; // 8 PM, 24h device-local time
 const DAILY_TEST_DEFAULT_MINUTE = 0;
 
-// Notifications.setNotificationHandler({
-//   handleNotification: async () => ({
-//     shouldShowAlert: true,
-//     shouldPlaySound: false,
-//     shouldSetBadge: false,
-//     shouldShowBanner: true,
-//     shouldShowList: true,
-//   }),
-// });
 
-// Old-architecture Android needs this opt-in for LayoutAnimation to animate
-// list insert/remove/reorder; harmless no-op everywhere else (new
-// architecture / iOS animate these automatically).
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
 }
@@ -206,12 +196,7 @@ function arrayToItemMap(arr) {
   return map;
 }
 
-// Turns a dropped sync-queue op (one that failed for a real server reason,
-// not just connectivity — see syncQueue.js) into a human-readable sentence
-// fragment for the notice banner. The most common real-world case this
-// covers: you edited a list while offline, but were removed from it (or it
-// was deleted) before the edit could reach the server — without this, that
-// edit just silently vanishes with zero explanation.
+
 function describeDroppedOp(op, lists) {
   const listId = op.payload?.listId || op.payload?.id;
   const list = lists.find((l) => l.id === listId);
@@ -248,8 +233,7 @@ function AnimatedCheckbox({ checked, onPress, style }) {
   );
 }
 
-// Red "Delete" panel revealed by swiping an item row to the left —
-// used by <Swipeable renderRightActions={...}> below.
+
 function SwipeDeleteAction({ t, onDelete }) {
   return (
     <TouchableOpacity
@@ -267,13 +251,6 @@ function SwipeDeleteAction({ t, onDelete }) {
 
 const ROLE_RANK = { OWNER: 0, WRITE: 1, READ: 2 };
 
-// Decide which list should be selected after cloud lists are merged in.
-// Order of preference:
-//   1. the current selection, if it still exists
-//   2. a cloud list you own
-//   3. one of your own local-only lists
-//   4. a list shared with you (WRITE before READ)
-//   5. null (nothing available)
 function pickListId(cur, cloudLists, localLists, excludedIds = []) {
   const excluded = new Set(excludedIds);
   const cloudIds = new Set(cloudLists.map((l) => l.id));
@@ -295,6 +272,47 @@ function pickListId(cur, cloudLists, localLists, excludedIds = []) {
   return null;
 }
 
+// Number(x) that never returns NaN/Infinity — a stray "." typed into a price
+// box used to turn every total on screen into NaN.
+function safeAmount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+const toLocalList = (cl) => ({
+  id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
+  createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
+});
+
+// Pure merge used right after sign-in. Returns the next `lists` plus the id
+// groups the caller needs for follow-up cleanup. Kept pure (no state, no
+// side effects) so it can be run on listsRef.current for the side values and
+// again inside a setState updater for the state itself.
+function mergeCloudOnSignIn(prev, cloudLists) {
+  const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+  const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+  const staleSeedIds = (cloudLists.length
+    ? notInCloud.filter((l) => l.isDefaultSeed && !l.cloudConfirmed)
+    : []
+  ).map((l) => l.id);
+  const keepable = notInCloud.filter((l) => !staleSeedIds.includes(l.id));
+  const legacyLocal = keepable.filter((l) => !l.cloudConfirmed);
+  const lostAccessIds = keepable.filter((l) => l.cloudConfirmed).map((l) => l.id);
+  const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
+  return { next: [...cloudLists.map(toLocalList), ...promoted], legacyLocal, lostAccessIds, staleSeedIds };
+}
+
+// Pure merge used after accepting an invite: keep every list the server
+// doesn't currently return unless it was previously cloud-confirmed (then
+// access was lost).
+function mergeCloudOnAccept(prev, cloudLists) {
+  const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+  const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+  const keepAsIs = notInCloud.filter((l) => !l.cloudConfirmed);
+  const lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
+  return { next: [...cloudLists.map(toLocalList), ...keepAsIs], lostAccessIds };
+}
+
 export default function DmartApp() {
   const [appLoaded, setAppLoaded] = useState(false);
   const hydrated = useRef(false); // guards the very first save-effect run
@@ -314,7 +332,10 @@ export default function DmartApp() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
-  const [pendingDelete, setPendingDelete] = useState(null); // { item, timer }
+  const [pendingDelete, setPendingDelete] = useState(null); // { item, listId, timer }
+  const pendingDeleteRef = useRef(null); // always the live entry, so back-to-back deletes can't miss it
+  pendingDeleteRef.current = pendingDelete;
+  const pendingSelectRef = useRef(null); // a list id (from a push tap) to select once it shows up in `lists`
   const [notice, setNotice] = useState("");
 
   const [exportingPdf, setExportingPdf] = useState(false);
@@ -383,7 +404,7 @@ export default function DmartApp() {
   const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
   const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
   const [respondingInviteId, setRespondingInviteId] = useState(null);
-  const [notifOpen, setNotifOpen] = useState(false); // notifications panel (header bell + Family tab both open it)
+  const [notifOpen, setNotifOpen] = useState(false); // notifications panel (opened by the header bell)
   const [activity, setActivity] = useState([]); // non-actionable notifications: { id, kind, text, at, read }
   const notifAnim = useRef(new Animated.Value(0)).current;
   const [invitesOpen, setInvitesOpen] = useState(false); // "Pending invitations" popup (Family tab row)
@@ -393,6 +414,12 @@ export default function DmartApp() {
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
   const showSearch = tab === "home"||tab === "add";
   const badgeCount = receivedInvites.length + activity.filter((a) => !a.read).length;
+  // Live mirrors so socket handlers can read current values synchronously
+  // instead of smuggling them out of setState updaters (which React may run later).
+  const receivedInvitesRef = useRef(receivedInvites);
+  receivedInvitesRef.current = receivedInvites;
+  const pendingInvitesRef = useRef(pendingInvitesByList);
+  pendingInvitesRef.current = pendingInvitesByList;
 
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
@@ -408,26 +435,10 @@ export default function DmartApp() {
         if (cancelled) return;
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
 
-        let legacyLocal = [];
-        let lostAccessIds = [];
-        let staleSeedIds = [];
-        setLists((prev) => {
-          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
-          const staleSeeds = cloudLists.length
-            ? notInCloud.filter((l) => l.isDefaultSeed && !l.cloudConfirmed)
-            : [];
-          staleSeedIds = staleSeeds.map((l) => l.id);
-          const keepable = notInCloud.filter((l) => !staleSeedIds.includes(l.id));
-  
-          legacyLocal = keepable.filter((l) => !l.cloudConfirmed);
-          lostAccessIds = keepable.filter((l) => l.cloudConfirmed).map((l) => l.id);
-          const cloudAsLocal = cloudLists.map((cl) => ({
-            id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
-            createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
-          }));
-          const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
-          return [...cloudAsLocal, ...promoted];
-        });
+        // Derived values come from listsRef (synchronously) — never from a
+        // side-effect inside a setState updater, which React is free to run later.
+        const { legacyLocal, lostAccessIds, staleSeedIds } = mergeCloudOnSignIn(listsRef.current, cloudLists);
+        setLists((prev) => mergeCloudOnSignIn(prev, cloudLists).next);
         if (lostAccessIds.length) {
           setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
@@ -491,53 +502,53 @@ export default function DmartApp() {
       }
       try {
         const { received } = await fetchInvites();
-        if (!cancelled) setReceivedInvites(received);
+        if (!cancelled) setReceivedInvites(received || []);
       } catch { /* non-fatal — the invite banner just stays empty */ }
     })();
     return () => { cancelled = true; };
-  }, [user, appLoaded]);
+  }, [user?.id, appLoaded]);
 
   // One invitation card (avatar, who/what, permission chip, Decline / Accept).
   // Shared by the bell's notification panel and the Family tab's invitations popup.
   function renderInviteCard(invite) {
-                    const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
-                    const isResponding = respondingInviteId === invite.id;
-                    const canEdit = invite.role !== "READ";
-                    return (
-                      <View key={invite.id} style={[s.itemCard, { gap: 12 }]}>
-                        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                          <View style={s.avatarCircle}>
-                            <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
-                          </View>
-                          <View style={{ flex: 1, minWidth: 0 }}>
-                            <Text style={s.itemName} numberOfLines={1}>{senderLabel}</Text>
-                            <Text style={s.itemUnit} numberOfLines={2}>
-                              {invite.inviteAllLists ? "invited you to join their family" : `invited you to "${invite.listName}"`}
-                            </Text>
-                          </View>
-                          <View style={[s.permBadge, { marginRight: 0, flexDirection: "row", alignItems: "center", gap: 4 }]}>
-                            {canEdit ? <Pencil size={11} color={t.accent} /> : <Eye size={11} color={t.accent} />}
-                            <Text style={{ color: t.accent, fontSize: 11, fontWeight: "700" }}>{canEdit ? "Can edit" : "Can view"}</Text>
-                          </View>
-                        </View>
-                        <View style={{ flexDirection: "row", gap: 8 }}>
-                          <TouchableOpacity
-                            onPress={() => respondToInvite(invite, false)}
-                            disabled={isResponding}
-                            style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 11, opacity: isResponding ? 0.5 : 1 }]}
-                          >
-                            <Text style={s.smallBtnText}>Decline</Text>
-                          </TouchableOpacity>
-                          <TouchableOpacity
-                            onPress={() => respondToInvite(invite, true)}
-                            disabled={isResponding}
-                            style={[s.addItemBtn, { flex: 2, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
-                          >
-                            {isResponding ? <ActivityIndicator color="#fff" /> : (<><Check size={15} color="#fff" /><Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text></>)}
-                          </TouchableOpacity>
-                        </View>
-                      </View>
-                    );
+    const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
+    const isResponding = respondingInviteId === invite.id;
+    const canEdit = invite.role !== "READ";
+    return (
+      <View key={invite.id} style={[s.itemCard, { gap: 12 }]}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <View style={s.avatarCircle}>
+            <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
+          </View>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={s.itemName} numberOfLines={1}>{senderLabel}</Text>
+            <Text style={s.itemUnit} numberOfLines={2}>
+              {invite.inviteAllLists ? "invited you to join their family" : `invited you to "${invite.listName}"`}
+            </Text>
+          </View>
+          <View style={[s.permBadge, { marginRight: 0, flexDirection: "row", alignItems: "center", gap: 4 }]}>
+            {canEdit ? <Pencil size={11} color={t.accent} /> : <Eye size={11} color={t.accent} />}
+            <Text style={{ color: t.accent, fontSize: 11, fontWeight: "700" }}>{canEdit ? "Can edit" : "Can view"}</Text>
+          </View>
+        </View>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          <TouchableOpacity
+            onPress={() => respondToInvite(invite, false)}
+            disabled={isResponding}
+            style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 11, opacity: isResponding ? 0.5 : 1 }]}
+          >
+            <Text style={s.smallBtnText}>Decline</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => respondToInvite(invite, true)}
+            disabled={isResponding}
+            style={[s.addItemBtn, { flex: 2, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
+          >
+            {isResponding ? <ActivityIndicator color="#fff" /> : (<><Check size={15} color="#fff" /><Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text></>)}
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
   }
 
   // Adds a non-actionable entry to the notification panel (newest first).
@@ -590,33 +601,15 @@ export default function DmartApp() {
         await acceptInvite(invite.id);
         const { lists: cloudLists } = await fetchLists();
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
-        // Same fix as the sign-in merge above: keep any list the server
-        // doesn't currently return, full stop — never key that decision
-        // off `.role`, since a list gets that tag optimistically before
-        // the server has necessarily confirmed it. This is the exact spot
-        // that was deleting the accepting user's OWN lists: their list
-        // already had `role: "OWNER"` from being created/migrated earlier,
-        // so it failed the old "keep if no role" check, and if it also
-        // hadn't finished syncing to the server yet it was missing from
-        // `cloudLists` too — so it matched neither bucket and disappeared.
-        let lostAccessIds = [];
-        setLists((prev) => {
-          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
-          const keepAsIs = notInCloud.filter((l) => !l.cloudConfirmed);
-          lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
-          const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true }));
-          return [...cloudAsLocal, ...keepAsIs];
-        });
+        const { lostAccessIds } = mergeCloudOnAccept(listsRef.current, cloudLists);
+        setLists((prev) => mergeCloudOnAccept(prev, cloudLists).next);
         if (lostAccessIds.length) {
           setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
         }
-        // Avoid clobbering a DIFFERENT list's not-yet-synced local edits —
-        // accepting an invite refreshes every cloud list, not just the
-        // newly shared one, so without this guard an unrelated list with a
-        // pending offline change could get overwritten by a stale server
-        // snapshot the moment this fires.
+
+
         const pendingListIds = getPendingSyncListIds();
         setItemsByList((prev) => {
           const next = { ...prev };
@@ -647,12 +640,6 @@ export default function DmartApp() {
     }
   }
 
-  // Surface sync-queue drops (an offline edit that could never legally land
-  // — e.g. you were removed from the list, or it was deleted — as opposed
-  // to a normal connectivity retry, which stays silent by design). Without
-  // this, a dropped edit just disappeared with no explanation. Registered
-  // once; reads listsRef so it always has current list names without
-  // needing to re-subscribe every time `lists` changes.
   useEffect(() => {
     onSyncDropped((op, err) => {
       const action = describeDroppedOp(op, listsRef.current);
@@ -665,8 +652,17 @@ export default function DmartApp() {
   // effect only (un)subscribes the listeners while it's live.
   useEffect(() => {
     if (!user) return;
+    // AuthContext opens the socket on sign-in, which can land a tick after
+    // this effect first runs — retry briefly instead of silently never subscribing.
+    let detach = null;
+    let retryTimer = null;
+    let tries = 0;
+    const attach = () => {
     const socket = getSocket();
-    if (!socket) return;
+    if (!socket) {
+      if (tries++ < 20) retryTimer = setTimeout(attach, 500);
+      return;
+    }
 
     // All three of these are id-keyed map operations now, so it doesn't
     // matter whether this socket event arrives before or after the local
@@ -693,31 +689,23 @@ export default function DmartApp() {
           for (const cl of cloudLists) next[cl.id] = cl.members;
           return next;
         });
-        // A memberRemoved event can mean *you* were removed, and a
-        // memberRoleChanged event can mean *your own* role changed — this
-        // used to only refresh the members panel, so a list you'd just
-        // lost access to (or had downgraded to read-only) kept sitting in
-        // your switcher with its old role, letting you keep tapping "add
-        // item" into a wall of 404s. Only ever act on lists this effect
-        // itself confirmed as real cloud lists (`cloudConfirmed`) — a
-        // list still mid-migration and not yet in a cloudLists response
-        // for an unrelated reason must never get swept up in this.
-        let lostAccessTo = null;
+
+        const lostIds = listsRef.current
+          .filter((l) => l.cloudConfirmed && !cloudIds.has(l.id))
+          .map((l) => l.id); // was cloud-confirmed, now missing -> access revoked
         setLists((prev) => {
           const stillMine = [];
           for (const l of prev) {
             if (!l.cloudConfirmed) { stillMine.push(l); continue; }
             const fresh = cloudLists.find((cl) => cl.id === l.id);
             if (fresh) stillMine.push({ ...l, role: fresh.role, name: fresh.name });
-            else lostAccessTo = l.id; // was cloud-confirmed, now missing -> access revoked
           }
           return stillMine;
         });
-        if (lostAccessTo) {
-          const removedId = lostAccessTo;
-          setItemsByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
-          setCloudMembersByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
-          setSelectedListId((cur) => (cur === removedId ? null : cur));
+        if (lostIds.length) {
+          setItemsByList((p) => { const n = { ...p }; lostIds.forEach((id) => delete n[id]); return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; lostIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (lostIds.includes(cur) ? null : cur));
           setNotice("You no longer have access to a list that was removed from your account.");
         }
       }).catch(() => {});
@@ -739,21 +727,22 @@ export default function DmartApp() {
     socket.on("invite:received", onInviteReceived);
 
     // Push accept/decline back to the SENDER's Pending Invites panel live,
-    // instead of only resolving the next time they open the Family tab.
-    // The event payload is just { inviteId } — pendingInvitesByList doesn't
-    // know its own scope per-entry, so just scrub the id out of every
-    // list's cached array; it's a no-op wherever it isn't present.
-    const onInviteAccepted = ({ inviteId }) => {
+
+    const scrubSentInvite = (inviteId) => {
       let matched = null;
+      for (const invites of Object.values(pendingInvitesRef.current || {})) {
+        const found = invites.find((inv) => inv.id === inviteId);
+        if (found) { matched = found; break; }
+      }
       setPendingInvitesByList((prev) => {
         const next = {};
-        for (const [listId, invites] of Object.entries(prev)) {
-          const found = invites.find((inv) => inv.id === inviteId);
-          if (found) matched = found;
-          next[listId] = invites.filter((inv) => inv.id !== inviteId);
-        }
+        for (const [listId, invites] of Object.entries(prev)) next[listId] = invites.filter((inv) => inv.id !== inviteId);
         return next;
       });
+      return matched;
+    };
+    const onInviteAccepted = ({ inviteId }) => {
+      const matched = scrubSentInvite(inviteId);
       if (matched) {
         const msg = `${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`;
         setNotice(msg);
@@ -761,16 +750,7 @@ export default function DmartApp() {
       }
     };
     const onInviteDeclined = ({ inviteId }) => {
-      let matched = null;
-      setPendingInvitesByList((prev) => {
-        const next = {};
-        for (const [listId, invites] of Object.entries(prev)) {
-          const found = invites.find((inv) => inv.id === inviteId);
-          if (found) matched = found;
-          next[listId] = invites.filter((inv) => inv.id !== inviteId);
-        }
-        return next;
-      });
+      const matched = scrubSentInvite(inviteId);
       if (matched) {
         const msg = `${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`;
         setNotice(msg);
@@ -783,11 +763,8 @@ export default function DmartApp() {
     // Push revoke back to the RECIPIENT live — previously they only found
     // out by tapping Accept/Decline and getting a stale "not found".
     const onInviteRevoked = ({ inviteId }) => {
-      let existed = false;
-      setReceivedInvites((prev) => {
-        existed = prev.some((i) => i.id === inviteId);
-        return prev.filter((i) => i.id !== inviteId);
-      });
+      const existed = receivedInvitesRef.current.some((i) => i.id === inviteId);
+      setReceivedInvites((prev) => prev.filter((i) => i.id !== inviteId));
       if (existed) {
         setNotice("An invitation was withdrawn by the sender.");
         pushActivity("revoked", "An invitation was withdrawn by the sender.");
@@ -813,7 +790,7 @@ export default function DmartApp() {
     };
     socket.on("list:granted", onListGranted);
 
-    return () => {
+    detach = () => {
       socket.off("item:created", onItemCreated);
       socket.off("item:updated", onItemUpdated);
       socket.off("item:deleted", onItemDeleted);
@@ -828,6 +805,9 @@ export default function DmartApp() {
       socket.off("invite:revoked", onInviteRevoked);
       socket.off("list:granted", onListGranted);
     };
+    };
+    attach();
+    return () => { clearTimeout(retryTimer); if (detach) detach(); };
   }, [user]);
 
       useEffect(() => {
@@ -838,10 +818,7 @@ export default function DmartApp() {
         case PUSH_TYPES.INVITE_RECEIVED:
           // Refresh from the server rather than trusting the payload —
           // the invite may already have been revoked since it was sent.
-          fetchInvites()
-            .then(({ received }) => setReceivedInvites(received || []))
-            .catch(() => {});
-          openInvites();
+          openInvites(); // re-fetches the invites itself
           break;
 
         case PUSH_TYPES.INVITE_ACCEPTED:
@@ -850,7 +827,12 @@ export default function DmartApp() {
           break;
 
         case PUSH_TYPES.LIST_GRANTED:
-          if (data?.listId) setSelectedListId(data.listId);
+          // Only ever select a list we actually have. If it hasn't loaded yet
+          // (cold start), remember it and select it the moment it appears.
+          if (typeof data?.listId === "string") {
+            if (listsRef.current.some((l) => l.id === data.listId)) { setSelectedListId(data.listId); setTab("home"); }
+            else pendingSelectRef.current = data.listId;
+          }
           break;
 
         default:
@@ -919,18 +901,14 @@ export default function DmartApp() {
     setDebouncedSearch("");
   }, [selectedListId]);
 
-  // Refresh pending invites for a list right when its Family tab is opened,
-  // rather than polling constantly in the background.
+  // On unmount, don't drop a delete that's still inside its undo window —
+  // send it to the server now instead of just cancelling its timer.
   useEffect(() => {
-    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
-    // eslint-disable-next-line
-  }, [tab, selectedList?.id]);
-
-  // clear any pending "undo delete" timer on unmount
-  useEffect(() => {
-    return () => { if (pendingDelete) clearTimeout(pendingDelete.timer); };
-    // eslint-disable-next-line
-  }, [pendingDelete]);
+    return () => {
+      const pd = pendingDeleteRef.current;
+      if (pd) { clearTimeout(pd.timer); deleteItemApi(pd.listId, pd.item.id).catch(() => {}); }
+    };
+  }, []);
 
   // const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
 
@@ -958,7 +936,7 @@ export default function DmartApp() {
   //   // eslint-disable-next-line
   // }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
 
-  const t = getTheme(dark);
+  const t = useMemo(() => getTheme(dark), [dark]);
   const s = useMemo(() => makeStyles(t), [t]);
 
   // Currency lives on the profile object, which is already persisted and
@@ -988,11 +966,56 @@ export default function DmartApp() {
   // `items` (below) is the sorted array view used everywhere else in the
   // component — nothing downstream of `items` needs to know storage is a
   // map at all.
-  const items = useMemo(() => {
-    const map = itemsByList[selectedListId] || {};
-    return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-  }, [itemsByList, selectedListId]);
+  // selectedList first, and `items` keyed on ITS id: when selectedListId is
+  // null/stale the header shows lists[0], so the items must come from
+  // lists[0] too (they used to come from itemsByList[null] = empty).
   const selectedList = lists.find((l) => l.id === selectedListId) || lists[0];
+  const items = useMemo(() => {
+    const map = itemsByList[selectedList?.id] || {};
+    return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }, [itemsByList, selectedList?.id]);
+
+  // Keep selectedListId pointing at a real list, so every action that reads
+  // it (add / edit / delete item, new trip…) targets the list on screen.
+  useEffect(() => {
+    if (!appLoaded || lists.length === 0) return;
+    if (!lists.some((l) => l.id === selectedListId)) {
+      const best = lists.find((l) => l.role === "OWNER") || lists.find((l) => !l.role) || lists[0];
+      setSelectedListId(best.id);
+    }
+  }, [appLoaded, lists, selectedListId]);
+
+  // Refresh pending invites for a list right when its Family tab is opened,
+  // rather than polling constantly in the background. (Lives below the
+  // `selectedList` declaration on purpose — above it, the dependency array
+  // read `selectedList` before it existed, so it was always `undefined` and
+  // switching lists while on the Family tab never refreshed.)
+  useEffect(() => {
+    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
+    // eslint-disable-next-line
+  }, [tab, selectedList?.id]);
+
+  // A list tapped from a push notification before it had loaded.
+  useEffect(() => {
+    const want = pendingSelectRef.current;
+    if (want && lists.some((l) => l.id === want)) {
+      pendingSelectRef.current = null;
+      setSelectedListId(want);
+      setTab("home");
+    }
+  }, [lists]);
+
+  // Signing out (or switching accounts) must not leave the previous account's
+  // invites, activity or member lists in memory for the next person.
+  useEffect(() => {
+    if (user) return;
+    setReceivedInvites([]);
+    setPendingInvitesByList({});
+    setCloudMembersByList({});
+    setActivity([]);
+    setNotifOpen(false);
+    setInvitesOpen(false);
+  }, [user]);
   // A READ-only collaborator could otherwise tap every add/check/edit/delete
   // control in the UI (none of them are currently disabled for that role) —
   // the server would correctly reject the write, but only after the local
@@ -1012,8 +1035,8 @@ export default function DmartApp() {
     // price is the final amount for the whole line (not a per-unit price),
     // so totals just sum it directly — qty is informational only and does
     // not multiply into the total.
-    const boughtTotal = boughtItems.reduce((s, i) => s + Number(i.price || 0), 0);
-    const pendingTotal = pendingItems.reduce((s, i) => s + Number(i.price || 0), 0);
+    const boughtTotal = boughtItems.reduce((sum, i) => sum + safeAmount(i.price), 0);
+    const pendingTotal = pendingItems.reduce((sum, i) => sum + safeAmount(i.price), 0);
     return { filtered, searchMatch, itemCategories, boughtItems, pendingItems, skippedItems, boughtTotal, pendingTotal };
     // eslint-disable-next-line
   }, [items, debouncedSearch]);
@@ -1144,24 +1167,41 @@ export default function DmartApp() {
     setRenameDraft("");
     setListNameError("");
     renameListApi(renamingListId, name).catch((e) => {
-      setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
+      if (target) setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
       setNotice(`Rename didn't save, so it's been undone: ${e?.message || "network error"}`);
     });
   }
   function deleteList(listId) {
+    const removed = lists.find((l) => l.id === listId);
+    if (!removed) { setConfirmDeleteListId(null); return; }
+    // Only the owner can delete a shared list — the server rejects it for
+    // anyone else and the list would just reappear on the next sync.
+    if (removed.role && removed.role !== "OWNER") {
+      setNotice("Only the owner can delete a shared list.");
+      setConfirmDeleteListId(null);
+      return;
+    }
     if (lists.length <= 1) {
       setNotice("You need at least one list — create another before deleting this one.");
       setConfirmDeleteListId(null);
       return;
     }
     const remaining = lists.filter((l) => l.id !== listId);
-    const removed = lists.find((l) => l.id === listId);
-    if (removed?.reminderNotifId) { Notifications.cancelScheduledNotificationAsync(removed.reminderNotifId).catch(() => {}); }
+    const removedItems = itemsByList[listId];
+    if (removed.reminderNotifId) { Notifications.cancelScheduledNotificationAsync(removed.reminderNotifId).catch(() => {}); }
     setLists(remaining);
     setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+    setCloudMembersByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
     if (selectedListId === listId) setSelectedListId(remaining[0].id);
     setConfirmDeleteListId(null);
-    deleteListApi(listId).catch((e) => setNotice(`Delete didn't sync: ${e?.message || "network error"}`));
+    deleteListApi(listId).catch((e) => {
+      // A real failure (an offline delete is queued, not thrown): the list
+      // still exists on the server, so bring it back instead of letting it
+      // silently vanish here and reappear on the next sync.
+      setLists((prev) => (prev.some((l) => l.id === removed.id) ? prev : [...prev, removed]));
+      if (removedItems) setItemsByList((prev) => ({ ...prev, [listId]: removedItems }));
+      setNotice(`Couldn't delete "${removed.name}", so it's back: ${e?.message || "network error"}`);
+    });
   }
 
   // ---------- Family sharing ----------
@@ -1273,7 +1313,7 @@ export default function DmartApp() {
           title: "Shopping reminder",
           body: `You haven't shopped for "${list.name}" in ${days} day${days === 1 ? "" : "s"}.`,
         },
-        trigger: { seconds: Math.max(1, days) * 24 * 60 * 60, channelId: "default" },
+        trigger: { type: Notifications.SchedulableTriggerInputTypes?.TIME_INTERVAL, seconds: Math.min(365, Math.max(1, Number(days) || 5)) * 24 * 60 * 60, channelId: "default" },
       });
     } catch {
       // scheduling can fail without permission or on unsupported platforms — safe to ignore
@@ -1387,7 +1427,7 @@ export default function DmartApp() {
           title: "Test notification 🎉",
           body: "If you see this, notifications are set up correctly.",
         },
-        trigger: { seconds: 3, channelId: "default" },
+        trigger: { type: Notifications.SchedulableTriggerInputTypes?.TIME_INTERVAL, seconds: 3, channelId: "default" },
       });
       setNotice("Test notification sent — it should appear in about 3 seconds.");
     } catch (e) {
@@ -1397,10 +1437,8 @@ export default function DmartApp() {
 
   // ---------- Item management ----------
   async function addItem() {
-    console.log("Adding item:", fName, fCategory, fUnit, fPrice);
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (!fName.trim()) return;
-    console.log("Raw input:", fName);
     const rawNames = fName.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 20);
     if (rawNames.length === 0) return;
     const category = (fCategory || "Other").trim() || "Other";
@@ -1416,7 +1454,6 @@ export default function DmartApp() {
       if (validationErr) { errors.push(validationErr); continue; }
       seenInBatch.push(capped);
       toAdd.push(capped);
-      console.log("Adding item:", capped);
     }
 
     if (toAdd.length === 0) {
@@ -1503,30 +1540,42 @@ export default function DmartApp() {
   // optimistic delete with a 5s "Undo" window. For cloud lists the actual
   // server delete only fires once that window closes without an Undo —
   // that's the real point of no return, so it doubles as the sync trigger.
+  function commitPendingDelete(pd) {
+    clearTimeout(pd.timer);
+    deleteItemApi(pd.listId, pd.item.id).catch((e) => {
+      // A real (non-connectivity) failure — the item never actually left the
+      // server, so don't let it silently vanish from just this device. An
+      // offline delete queues instead of rejecting.
+      upsertItem(pd.listId, pd.item);
+      setNotice(`Delete didn't sync, so "${pd.item.name}" is back: ${e?.message || "network error"}`);
+    });
+  }
   function deleteItem(item) {
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
-    if (pendingDelete) clearTimeout(pendingDelete.timer);
+    // Deleting a second item inside the first one's undo window used to cancel
+    // the first server delete outright (its timer was cleared and never
+    // re-armed), so that item came back on the next sync. Commit it now.
+    const previous = pendingDeleteRef.current;
+    if (previous) commitPendingDelete(previous);
     animateListChange();
     const listId = selectedListId;
     removeItemFromList(listId, item.id);
-    const timer = setTimeout(() => {
-      setPendingDelete(null);
-      deleteItemApi(listId, item.id).catch((e) => {
-        // A real (non-connectivity) failure — the item never actually
-        // left the server, so don't let it silently vanish forever from
-        // just this one device. An offline delete queues instead of
-        // rejecting, so this branch is only for genuine errors.
-        upsertItem(listId, item);
-        setNotice(`Delete didn't sync, so "${item.name}" is back: ${e?.message || "network error"}`);
-      });
+    const entry = { item, listId, timer: null };
+    entry.timer = setTimeout(() => {
+      if (pendingDeleteRef.current === entry) pendingDeleteRef.current = null;
+      setPendingDelete((cur) => (cur === entry ? null : cur));
+      commitPendingDelete(entry);
     }, 5000);
-    setPendingDelete({ item, timer });
+    pendingDeleteRef.current = entry;
+    setPendingDelete(entry);
   }
   function undoDelete() {
-    if (!pendingDelete) return;
-    clearTimeout(pendingDelete.timer);
+    const pd = pendingDeleteRef.current;
+    if (!pd) return;
+    clearTimeout(pd.timer);
     animateListChange();
-    upsertItem(selectedListId, pendingDelete.item);
+    upsertItem(pd.listId, pd.item); // the list it was deleted from, even if you've switched lists since
+    pendingDeleteRef.current = null;
     setPendingDelete(null);
   }
 
@@ -1537,7 +1586,6 @@ export default function DmartApp() {
   async function exportPDF() {
     if (exportingPdf) return; // guard against double taps while one export is in flight
      if (pendingItems.length === 0 && boughtItems.length === 0) {
-      console.log("No items to export.");
     setNotice("No items to export.");
     return;
   }
@@ -1545,7 +1593,7 @@ export default function DmartApp() {
     try {
       await exportListPdf({
         listName: selectedList ? selectedList.name : "MindCart",
-        profileName: profile.name,
+        profileName: profile.name || user?.name || "",
         pendingItems,
         boughtItems,
         pendingTotal,
@@ -1553,7 +1601,6 @@ export default function DmartApp() {
         currencySymbol: currency.symbol,
       });
     } catch (e) {
-      console.log("PDF export error:", e);
       setNotice(`Couldn't export PDF: ${e?.message || "unknown error"}`);
     } finally {
       setExportingPdf(false);
@@ -1619,9 +1666,9 @@ function confirmStartNewTrip() {
 }
 
   function addCategory(name) {
-    const trimmed = name.trim();
+    const trimmed = name.trim().slice(0, 30);
     if (!trimmed) return;
-    setCategories((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
+    setCategories((prev) => (prev.some((c) => c.toLowerCase() === trimmed.toLowerCase()) || prev.length >= 60 ? prev : [...prev, trimmed]));
   }
 
   // ---------- Master items: quick-add a common item straight into the current list ----------
@@ -2186,16 +2233,12 @@ function confirmStartNewTrip() {
             <View style={{ gap: 14 }}>
               <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
                 <View style={s.avatarCircleLg}>
-                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(user.name || "U").slice(0, 1).toUpperCase()}</Text>
+                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(profile.name || user.name || "U").slice(0, 1).toUpperCase()}</Text>
                 </View>
                 <View style={{ flex: 1, minWidth: 0 }}>
-                  <TextInput
-                    value={user.name}
-                    onChangeText={(v) => setProfile((p) => ({ ...p, name: v }))}
-                    placeholder={user?.name || "Enter your name"}                   
-                    placeholderTextColor={t.muted}
-                    style={{ color: t.text, fontWeight: "800", fontSize: 16, padding: 0 }}
-                  />
+                  <Text style={{ color: t.text, fontWeight: "800", fontSize: 16 }}>
+                  {user?.name || "Enter your name"}
+                </Text>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 }}>
                     <Crown size={12} color={t.accent2} />
                     <Text style={{ color: t.accent2, fontSize: 11.5, fontWeight: "700" }}>Family Plan Manager</Text>
@@ -2236,7 +2279,7 @@ function confirmStartNewTrip() {
                     <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
                   </TouchableOpacity> */}
                   <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
-                     Comming Soon
+                     Coming Soon
                     </Text>
                 </View>
 
@@ -2254,14 +2297,14 @@ function confirmStartNewTrip() {
 
               <Text style={s.sectionLabel}>Data & Cloud</Text>
               <View style={{ gap: 8 }}>
-                <TouchableOpacity style={s.settingsRow} onPress={exportPDF} disabled={exportingPdf}>
+                {/* <TouchableOpacity style={s.settingsRow} onPress={exportPDF} disabled={exportingPdf}>
                   <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><FileDown size={16} color={t.accent} /></View>
                   <View style={{ flex: 1 }}>
                     <Text style={s.itemName}>Export Shopping Data</Text>
                     <Text style={s.itemUnit}>Download this list as a PDF</Text>
                   </View>
                   {exportingPdf ? <ActivityIndicator size="small" color={t.accent} /> : <ChevronRight size={16} color={t.muted} />}
-                </TouchableOpacity>
+                </TouchableOpacity> */}
                 <TouchableOpacity
                   style={s.settingsRow}
                   disabled={authLoading || signingIn}
@@ -2645,7 +2688,7 @@ function confirmStartNewTrip() {
               </View>
               <Text style={{ fontSize: 12.5, color: t.muted, marginBottom: 12 }}>
                 {needsCurrencySetup
-                  ? "This just sets which symbol shows next to prices — you can change it anytime from the settings icon up top."
+                  ? "This just sets which symbol shows next to prices — you can change it anytime from Profile → Currency."
                   : "Changing this only updates the symbol shown next to prices; existing amounts stay the same."}
               </Text>
 
@@ -2722,7 +2765,7 @@ function confirmStartNewTrip() {
               {/* Short description */}
               <Text style={{ fontSize: 13, color: t.muted, textAlign: "center", lineHeight: 19, marginBottom: 18 }}>
                 MindCart helps you plan your shopping trips with categorized items, quantities, prices, and reminders — 
-                all saved on your device, so your lists are always ready when you need them.**
+                saved on your device and synced to your account, so your lists are always ready when you need them.
               </Text>
 
               {/* Version & developer */}
@@ -3063,10 +3106,10 @@ function Loader({ t }) {
           Animated.timing(dot, { toValue: 0, duration: 300, useNativeDriver: true }),
           Animated.delay(600 - delay),
         ])
-      ).start();
-    bounce(dot1, 0);
-    bounce(dot2, 150);
-    bounce(dot3, 300);
+      );
+    const loops = [bounce(dot1, 0), bounce(dot2, 150), bounce(dot3, 300)];
+    loops.forEach((l) => l.start());
+    return () => loops.forEach((l) => l.stop());
     // eslint-disable-next-line
   }, []);
 

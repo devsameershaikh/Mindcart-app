@@ -2,7 +2,7 @@
   "expo": {
     "name": "Mind cart",
     "slug": "mindcart",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "portrait",
     "icon": "./src/assets/icon.png",
     "userInterfaceStyle": "light",
@@ -14,14 +14,21 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.samappstudio.mindcart",
       "infoPlist": {
-        "UIBackgroundModes": ["remote-notification"]
+        "UIBackgroundModes": [
+          "remote-notification",
+          "remote-notification"
+        ]
       }
     },
     "android": {
       "package": "com.samappstudio.mindcart",
       "edgeToEdgeEnabled": true,
-      "permissions": ["POST_NOTIFICATIONS"],
-      "googleServicesFile": "./google-services.json"
+      "permissions": [
+        "POST_NOTIFICATIONS",
+        "POST_NOTIFICATIONS"
+      ],
+      "googleServicesFile": "./google-services.json",
+      "versionCode": 7
     },
     "extra": {
       "eas": {
@@ -29,7 +36,7 @@
       }
     },
     "owner": "sameer.shaikh.dev",
-   "plugins": [
+    "plugins": [
       "@react-native-community/datetimepicker",
       [
         "expo-notifications",
@@ -45,6 +52,12 @@
           "project": "mindcart-app"
         }
       ]
-    ]
+    ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/be3c1ca4-5e59-44a0-b580-87b843761b6f"
+    }
   }
 }

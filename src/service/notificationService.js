@@ -132,17 +132,17 @@ const notificationService = {
    * not block sign-in or leave the app on a loading screen.
    */
   async init({ force = false } = {}) {
-    console.log("[PUSH] Initialising notification service...");
+    // console.log("[PUSH] Initialising notification service...");
     if (initialised && !force) return { ok: true, alreadyInitialised: true };
 
     try {
-      console.log("[PUSH] Requesting permission...");
+      // console.log("[PUSH] Requesting permission...");
       await ensureAndroidChannels();
       this._attachListeners();
       initialised = true;
  
       const result = await this.registerDevice();
-      console.log("[PUSH] Device registration result:", result);
+      // console.log("[PUSH] Device registration result:", result);
       return { ok: true, ...result };
     } catch (e) {
       captureError(e, { scope: "notifications.init" });
@@ -200,7 +200,7 @@ const notificationService = {
 
 const granted = await requestPermission();
 
-console.log("[PUSH] Permission result:", granted);
+// console.log("[PUSH] Permission result:", granted);
 
 if (!granted) {
   console.log("[PUSH] ❌ Permission denied");
@@ -208,11 +208,10 @@ if (!granted) {
   return { registered: false, reason: "permission-denied" };
 }
 
-console.log("[PUSH] ✅ Notification permission granted");
+// console.log("[PUSH] ✅ Notification permission granted");
 
 const projectId = resolveProjectId();
 
-console.log("[PUSH] EAS projectId:", projectId);
 
 if (!projectId) {
   console.log("[PUSH] ❌ Missing EAS projectId");
@@ -224,7 +223,7 @@ if (!projectId) {
   return { registered: false, reason: "missing-project-id" };
 }
 
-console.log("[PUSH] Requesting Expo push token...");
+// console.log("[PUSH] Requesting Expo push token...");
 
 try {
   const { data: token } =
@@ -232,21 +231,19 @@ try {
       projectId,
     });
 
-  console.log("[PUSH] Expo push token:", token);
+
 
   if (!token) {
     console.log("[PUSH] ❌ No Expo push token returned");
     return { registered: false, reason: "no-token" };
   }
 
-  console.log("[PUSH] ✅ Expo push token received");
 
   const previous = await AsyncStorage.getItem(TOKEN_KEY);
 
-  console.log("[PUSH] Previous cached token:", previous);
 
   if (previous === token) {
-    console.log("[PUSH] ✅ Token already registered/cached");
+    // console.log("[PUSH] ✅ Token already registered/cached");
 
     return {
       registered: true,
@@ -264,11 +261,8 @@ try {
     appVersion: Constants?.expoConfig?.version || null,
   });
 
-  console.log("[PUSH] ✅ Backend registration successful");
-
   await AsyncStorage.setItem(TOKEN_KEY, token);
 
-  console.log("[PUSH] ✅ Token saved locally");
 
   addBreadcrumb("push token registered");
 

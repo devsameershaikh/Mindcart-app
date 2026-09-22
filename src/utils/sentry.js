@@ -54,6 +54,8 @@ export function initSentry() {
       return event;
     },
   });
+  Sentry.captureException(new Error("My first Sentry error!"));
+
   enabled = true;
 }
 

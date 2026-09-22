@@ -52,6 +52,33 @@ import {
 import { getSocket, joinListRoom } from "./src/utils/socket";
 import { Share2 } from "lucide-react-native";
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
+import * as Sentry from '@sentry/react-native';
+import * as Updates from "expo-updates";
+
+const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN || "";
+
+Sentry.init({
+  dsn: DSN,
+
+  // Adds more context data to events (IP address, cookies, user, etc.)
+  // For more information, visit: https://docs.sentry.io/platforms/react-native/data-management/data-collected/
+  sendDefaultPii: true,
+
+  // Enable Logs
+  enableLogs: true,
+
+  // Configure Session Replay
+  replaysSessionSampleRate: 0.1,
+  replaysOnErrorSampleRate: 1,
+  integrations: [Sentry.mobileReplayIntegration()],
+
+  // uncomment the line below to enable Spotlight (https://spotlightjs.com)
+  // spotlight: __DEV__,
+});
+
+console.log("[Updates] isEnabled:", Updates.isEnabled);
+console.log("[Updates] runtimeVersion:", Updates.runtimeVersion);
+console.log("[Updates] updateId:", Updates.updateId);
 
 
 // This app is local-first: everything lives in on-device storage (see
@@ -134,7 +161,7 @@ const DEFAULT_CURRENCY = CURRENCIES[0];
 
 // ---------- About screen content ----------
 // Edit these to match your actual details before publishing.
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.0.3";
 const DEVELOPER_NAME = "Sameer Shaikh";
 const PRIVACY_POLICY_URL = "https://example.com/privacy-policy";
 const CONTACT_EMAIL = "support@example.com";
@@ -333,7 +360,7 @@ function mergeCloudOnAccept(prev, cloudLists) {
   return { next: [...cloudLists.map(toLocalList), ...keepAsIs], lostAccessIds };
 }
 
-export default function DmartApp() {
+export default Sentry.wrap(function DmartApp() {
   const [appLoaded, setAppLoaded] = useState(false);
   const hydrated = useRef(false); // guards the very first save-effect run
 
@@ -955,6 +982,26 @@ export default function DmartApp() {
   // sign of the tester actually being here. Must stay above the
   // `if (!appLoaded)` early return below, like every other hook in this
   // component — hooks can't be called conditionally.
+
+// One-time cleanup of the old daily testing reminders still queued in the OS.
+// Remove after a few app releases.
+useEffect(() => {
+  if (!appLoaded) return;
+  (async () => {
+    try {
+      const all = await Notifications.getAllScheduledNotificationsAsync();
+      for (const n of all) {
+        const isDailyTest =
+          n.content?.title === "MindCart" ||
+          DAILY_TEST_MESSAGES.includes(n.content?.body);
+        if (isDailyTest) {
+          await Notifications.cancelScheduledNotificationAsync(n.identifier);
+        }
+      }
+    } catch {}
+  })();
+}, [appLoaded]);
+
   // useEffect(() => {
   //   if (!appLoaded) return;
   //   const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
@@ -3072,7 +3119,7 @@ function confirmStartNewTrip() {
     </View>
     </GestureHandlerRootView>
   );
-}
+});
 
 // ---------- First-run onboarding ----------
 // Marketing copy below is placeholder — edit the description and feature

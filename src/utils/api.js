@@ -51,12 +51,20 @@ export function resolveApiBaseUrl() {
     console.log("[api.js] Environment: PROD");
     console.log("[api.js] API:", PROD_API_URL);
 
+    console.log("[api.js] Environment:", ENV);
+    console.log("[api.js] API length:", PROD_API_URL?.length);
+    console.log("[api.js] API contains spring:",PROD_API_URL?.includes("mindcart-backend-spring.onrender.com"));
+console.log(
+  "[api.js] API contains old:",
+  PROD_API_URL?.includes("mindcart-backend.onrender.com")
+);
+
     return PROD_API_URL;
   }
 
   if (ENV === "dev") {
-    console.log("[api.js] Environment: DEV");
-    console.log("[api.js] API:", DEV_LAN_IP);
+    // console.log("[api.js] Environment: DEV");
+    // console.log("[api.js] API:", DEV_LAN_IP);
 
     return `http://${DEV_LAN_IP}:4000`;
   }
@@ -65,10 +73,8 @@ export function resolveApiBaseUrl() {
 }
 
 export const API_BASE_URL = resolveApiBaseUrl();
-console.log(`[api.js] API_BASE_URL = ${API_BASE_URL}`);
 const TOKEN_KEY = "mindcart_session_token_v1";
 
-console.log(`[api.js] API_BASE_URL = ${API_BASE_URL}`);
 let cachedToken = null;
 
 export async function getToken() {
@@ -103,8 +109,7 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     // mutating call the caller treats this the same way regardless: queue
     // it and retry later rather than losing the change.
     const err = new Error(
-      `Couldn't reach the backend at ${API_BASE_URL} — check it's running and that this device can reach that address (see the comment at the top of src/utils/api.js).`
-    );
+      `Offline. Changes will sync when you’re back online`);
     err.isOffline = true;
     throw err;
   }

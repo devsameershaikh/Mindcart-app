@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "437801982739",
+    "project_id": "samappstudio-622d7",
+    "storage_bucket": "samappstudio-622d7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:437801982739:android:109aa2e8240b7752fb98e6",
+        "android_client_info": {
+          "package_name": "com.samappstudio.mindcart"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDynQzKfP_qtP6ifhIc9IkGpJu3MvF-19U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

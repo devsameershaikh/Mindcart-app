@@ -27,6 +27,9 @@ import {
   disconnectSocket,
 } from "../utils/socket";
 
+import notificationService from "../service/notificationService";
+import { setSentryUser, captureError } from "../utils/sentry";
+
 const AuthContext = createContext(null);
 
 // A cached copy of the last-known user profile, kept alongside the JWT so
@@ -71,8 +74,10 @@ export const useAuth = () => useContext(AuthContext);
 // IMPORTANT:
 // This must be your Google OAuth "Web application" client ID.
 // Do NOT use the Android client ID here.
-const GOOGLE_WEB_CLIENT_ID =
-  "861993628635-m0elkbft86hq83ejupcu6vm14cpc1034.apps.googleusercontent.com";
+
+
+const GOOGLE_WEB_CLIENT_ID =process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID;
+
 // Configure Google Sign-In once.
 GoogleSignin.configure({
   webClientId: GOOGLE_WEB_CLIENT_ID,
@@ -116,6 +121,7 @@ export function AuthProvider({ children }) {
       } catch (error) {
         console.log("Socket connect skipped (likely offline):", error?.message || error);
       }
+       notificationService.init();
 
       // Validate/refresh in the background. Only an explicit auth
       // rejection from the server (401/403 — token really is invalid or
@@ -190,6 +196,13 @@ export function AuthProvider({ children }) {
       // Connect socket using authenticated session
       await connectSocket();
 
+      // setSentryUser(user);
+      // Fire-and-forget: if the user denies the permission prompt, sign-in
+      // still completes normally and they just don't get pushes.
+      notificationService.init().catch((e) =>
+        captureError(e, { scope: "auth.signIn.notifications" })
+      );
+
       console.log("MindCart Google Sign-In successful");
 
       return {
@@ -234,8 +247,13 @@ export function AuthProvider({ children }) {
       // Both are cleared before anything else so that even if a later step
       // in this function throws, the token/cached profile are already gone
       // — no path through sign-out leaves a stale JWT sitting in storage.
+      // Must run while the JWT is still valid — teardown() calls the
+      // backend to delete this device's token, and that call needs auth.
+      await notificationService.teardown();
+
       await setToken(null);
       await setCachedUser(null);
+      // setSentryUser(null);
 
       disconnectSocket();
 

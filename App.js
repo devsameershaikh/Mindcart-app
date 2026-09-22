@@ -24,7 +24,6 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
-console.log("Swipeable:", Swipeable);
 import * as Haptics from "expo-haptics";
 import {
   Plus, Trash2, Moon, SunMedium, Search, Settings, ChevronDown, Check,
@@ -32,7 +31,7 @@ import {
   Barcode, Bell, Menu, BellRing, Info, Mail, ShieldCheck, FileText,
   ChevronRight, Users, Layers, UserCircle2, Eye,
   Cloud, Crown, Sparkles, LogOut, Palette, Wallet, BellDot,
-  Zap, ArrowRight, Star, ShoppingBag,
+  Zap, ArrowRight, Star, ShoppingBag, AlertCircle,
 } from "lucide-react-native";
 
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
@@ -52,6 +51,35 @@ import {
 } from "./src/utils/api";
 import { getSocket, joinListRoom } from "./src/utils/socket";
 import { Share2 } from "lucide-react-native";
+import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
+import * as Sentry from '@sentry/react-native';
+import * as Updates from "expo-updates";
+
+const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN || "";
+
+Sentry.init({
+  dsn: DSN,
+
+  // Adds more context data to events (IP address, cookies, user, etc.)
+  // For more information, visit: https://docs.sentry.io/platforms/react-native/data-management/data-collected/
+  sendDefaultPii: true,
+
+  // Enable Logs
+  enableLogs: true,
+
+  // Configure Session Replay
+  replaysSessionSampleRate: 0.1,
+  replaysOnErrorSampleRate: 1,
+  integrations: [Sentry.mobileReplayIntegration()],
+
+  // uncomment the line below to enable Spotlight (https://spotlightjs.com)
+  // spotlight: __DEV__,
+});
+
+console.log("[Updates] isEnabled:", Updates.isEnabled);
+console.log("[Updates] runtimeVersion:", Updates.runtimeVersion);
+console.log("[Updates] updateId:", Updates.updateId);
+
 
 // This app is local-first: everything lives in on-device storage (see
 // storage.js) by default, so it works fully offline with no account.
@@ -61,6 +89,36 @@ import { Share2 } from "lucide-react-native";
 // a `role` field on it (OWNER/WRITE/READ, set when it's fetched from or
 // created on the server) — local-only lists never get that field and are
 // never sent anywhere.
+
+// "just now" / "5m ago" / "3h ago" / "2d ago"
+function timeAgo(ts) {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+// Toast helpers: setNotice(msg) stays the single entry point everywhere in
+// the app; the type (error / success / info) and on-screen time are derived
+// from the message so no call site has to change.
+function noticeKind(msg) {
+  if (/couldn't|didn't|can't|failed|no longer|only the owner|view-only|at least one/i.test(msg)) return "error";
+  if (/^(added|invited|invite accepted|started a new trip|test notification sent)|is now shareable/i.test(msg)) return "success";
+  return "info";
+}
+function noticeDuration(msg, kind) {
+  const base = kind === "error" ? 5000 : kind === "success" ? 2500 : 3500;
+  return Math.min(9000, base + Math.max(0, msg.length - 40) * 40); // longer text stays longer
+}
+
+// Collapse several validation messages into one short line.
+function summarizeItemErrors(errors) {
+  const uniq = [...new Set(errors)];
+  const shown = uniq.slice(0, 2).join(" · ");
+  return uniq.length > 2 ? `${shown} (+${uniq.length - 2} more)` : shown;
+}
 
 // ---------- Currency ----------
 // Symbol-only: picking a currency just changes the label shown next to
@@ -103,19 +161,22 @@ const DEFAULT_CURRENCY = CURRENCIES[0];
 
 // ---------- About screen content ----------
 // Edit these to match your actual details before publishing.
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.0.3";
 const DEVELOPER_NAME = "Sameer Shaikh";
 const PRIVACY_POLICY_URL = "https://example.com/privacy-policy";
 const CONTACT_EMAIL = "support@example.com";
 // Short, plain-language Privacy Policy shown in-app (condensed from the
 // full policy). Edit this if your data practices change.
-const PRIVACY_POLICY_TEXT = `MindCart does not collect, store, or transmit your personal information to any server. You can use the app without an account.
+const PRIVACY_POLICY_TEXT = `MindCart uses your Google account to sign you in. Here is what the app handles:
 
-All your lists, items, quantities, prices, and notes stay stored locally on your device. We don't see or receive this information.
+Account: when you sign in with Google we receive your name, email address and profile picture, and use them to identify you and to let people you invite find you.
 
-We do not sell, rent, or share your data with third parties. If any third-party service (analytics, cloud backup, etc.) is added in the future, this policy will be updated first.
+Your lists: your lists, items, quantities, prices, notes and categories are stored on your device and synced to our servers so they are available on your devices and can be shared. People you invite can see the lists you share with them (an "all my lists" family invite shares every list you own).
+Notifications: if you allow notifications, your device's push token is stored so we can send you invitations and updates.
 
-Since your data lives on your device, keeping your device secure keeps your data secure.
+We do not sell your data or use it for advertising. Our hosting providers process it on our behalf only to run the app.
+
+You can sign out at any time. To have your account and data deleted, contact us at the support email shown in the app.
 
 Not intended for children under 13.`;
 // Short, plain-language Terms of Use shown in-app. Edit this to match your
@@ -123,7 +184,7 @@ Not intended for children under 13.`;
 // for proper legal text if your app needs one.
 const TERMS_OF_USE_TEXT = `By using MindCart, you agree to use the app for personal, lawful purposes only.
 
-All your lists and data are stored locally on your device — we don't collect or store it on any server. The app is provided "as is," without warranties of any kind, and we aren't liable for any loss of data.
+Your lists are stored on your device and, while you are signed in, synced to our servers so they can be shared with the people you invite. You are responsible for who you share lists with. The app is provided "as is," without warranties of any kind, and we aren't liable for any loss of data.
 
 We may update these terms from time to time. Continued use of the app means you accept the current terms.`;
 const OPEN_SOURCE_LIBS = [
@@ -155,19 +216,7 @@ const DAILY_TEST_LOOKAHEAD_DAYS = 60;
 const DAILY_TEST_DEFAULT_HOUR = 20; // 8 PM, 24h device-local time
 const DAILY_TEST_DEFAULT_MINUTE = 0;
 
-// Notifications.setNotificationHandler({
-//   handleNotification: async () => ({
-//     shouldShowAlert: true,
-//     shouldPlaySound: false,
-//     shouldSetBadge: false,
-//     shouldShowBanner: true,
-//     shouldShowList: true,
-//   }),
-// });
 
-// Old-architecture Android needs this opt-in for LayoutAnimation to animate
-// list insert/remove/reorder; harmless no-op everywhere else (new
-// architecture / iOS animate these automatically).
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
 }
@@ -194,12 +243,7 @@ function arrayToItemMap(arr) {
   return map;
 }
 
-// Turns a dropped sync-queue op (one that failed for a real server reason,
-// not just connectivity — see syncQueue.js) into a human-readable sentence
-// fragment for the notice banner. The most common real-world case this
-// covers: you edited a list while offline, but were removed from it (or it
-// was deleted) before the edit could reach the server — without this, that
-// edit just silently vanishes with zero explanation.
+
 function describeDroppedOp(op, lists) {
   const listId = op.payload?.listId || op.payload?.id;
   const list = lists.find((l) => l.id === listId);
@@ -236,8 +280,7 @@ function AnimatedCheckbox({ checked, onPress, style }) {
   );
 }
 
-// Red "Delete" panel revealed by swiping an item row to the left —
-// used by <Swipeable renderRightActions={...}> below.
+
 function SwipeDeleteAction({ t, onDelete }) {
   return (
     <TouchableOpacity
@@ -253,7 +296,71 @@ function SwipeDeleteAction({ t, onDelete }) {
   );
 }
 
-export default function DmartApp() {
+const ROLE_RANK = { OWNER: 0, WRITE: 1, READ: 2 };
+
+function pickListId(cur, cloudLists, localLists, excludedIds = []) {
+  const excluded = new Set(excludedIds);
+  const cloudIds = new Set(cloudLists.map((l) => l.id));
+  const localKept = localLists.filter((l) => !cloudIds.has(l.id) && !excluded.has(l.id));
+  const validIds = new Set([...cloudIds, ...localKept.map((l) => l.id)]);
+
+  // Keep the selection only if it still points at a real list.
+  if (cur && validIds.has(cur)) return cur;
+
+  // Array.sort is stable, so ties keep the server's order.
+  const rankedCloud = [...cloudLists].sort(
+    (a, b) => (ROLE_RANK[a.role] ?? 3) - (ROLE_RANK[b.role] ?? 3)
+  );
+  const ownedCloud = rankedCloud.find((l) => l.role === "OWNER");
+
+  if (ownedCloud) return ownedCloud.id;
+  if (localKept.length) return localKept[0].id;
+  if (rankedCloud.length) return rankedCloud[0].id;
+  return null;
+}
+
+// Number(x) that never returns NaN/Infinity — a stray "." typed into a price
+// box used to turn every total on screen into NaN.
+function safeAmount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+const toLocalList = (cl) => ({
+  id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
+  createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
+});
+
+// Pure merge used right after sign-in. Returns the next `lists` plus the id
+// groups the caller needs for follow-up cleanup. Kept pure (no state, no
+// side effects) so it can be run on listsRef.current for the side values and
+// again inside a setState updater for the state itself.
+function mergeCloudOnSignIn(prev, cloudLists) {
+  const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+  const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+  const staleSeedIds = (cloudLists.length
+    ? notInCloud.filter((l) => l.isDefaultSeed && !l.cloudConfirmed)
+    : []
+  ).map((l) => l.id);
+  const keepable = notInCloud.filter((l) => !staleSeedIds.includes(l.id));
+  const legacyLocal = keepable.filter((l) => !l.cloudConfirmed);
+  const lostAccessIds = keepable.filter((l) => l.cloudConfirmed).map((l) => l.id);
+  const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
+  return { next: [...cloudLists.map(toLocalList), ...promoted], legacyLocal, lostAccessIds, staleSeedIds };
+}
+
+// Pure merge used after accepting an invite: keep every list the server
+// doesn't currently return unless it was previously cloud-confirmed (then
+// access was lost).
+function mergeCloudOnAccept(prev, cloudLists) {
+  const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+  const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
+  const keepAsIs = notInCloud.filter((l) => !l.cloudConfirmed);
+  const lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
+  return { next: [...cloudLists.map(toLocalList), ...keepAsIs], lostAccessIds };
+}
+
+export default Sentry.wrap(function DmartApp() {
   const [appLoaded, setAppLoaded] = useState(false);
   const hydrated = useRef(false); // guards the very first save-effect run
 
@@ -272,7 +379,10 @@ export default function DmartApp() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
-  const [pendingDelete, setPendingDelete] = useState(null); // { item, timer }
+  const [pendingDelete, setPendingDelete] = useState(null); // { item, listId, timer }
+  const pendingDeleteRef = useRef(null); // always the live entry, so back-to-back deletes can't miss it
+  pendingDeleteRef.current = pendingDelete;
+  const pendingSelectRef = useRef(null); // a list id (from a push tap) to select once it shows up in `lists`
   const [notice, setNotice] = useState("");
 
   const [exportingPdf, setExportingPdf] = useState(false);
@@ -341,17 +451,29 @@ export default function DmartApp() {
   const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
   const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
   const [respondingInviteId, setRespondingInviteId] = useState(null);
+  const [notifOpen, setNotifOpen] = useState(false); // notifications panel (opened by the header bell)
+  const [activity, setActivity] = useState([]); // non-actionable notifications: { id, kind, text, at, read }
+  const notifAnim = useRef(new Animated.Value(0)).current;
+  const [invitesOpen, setInvitesOpen] = useState(false); // "Pending invitations" popup (Family tab row)
+  const invitesAnim = useRef(new Animated.Value(0)).current;
   const [makingShareable, setMakingShareable] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
   const showSearch = tab === "home"||tab === "add";
+  const badgeCount = receivedInvites.length + activity.filter((a) => !a.read).length;
+  // Live mirrors so socket handlers can read current values synchronously
+  // instead of smuggling them out of setState updaters (which React may run later).
+  const receivedInvitesRef = useRef(receivedInvites);
+  receivedInvitesRef.current = receivedInvites;
+  const pendingInvitesRef = useRef(pendingInvitesByList);
+  pendingInvitesRef.current = pendingInvitesByList;
 
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
   // lists (kept exactly as they were, untouched) rather than replacing them.
   useEffect(() => {
 
-    if (!user) return;
+    if (!user || !appLoaded) return;
     let cancelled = false;
     (async () => {
       setCloudSyncing(true);
@@ -360,26 +482,10 @@ export default function DmartApp() {
         if (cancelled) return;
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
 
-        let legacyLocal = [];
-        let lostAccessIds = [];
-        let staleSeedIds = [];
-        setLists((prev) => {
-          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
-          const staleSeeds = cloudLists.length
-            ? notInCloud.filter((l) => l.isDefaultSeed && !l.cloudConfirmed)
-            : [];
-          staleSeedIds = staleSeeds.map((l) => l.id);
-          const keepable = notInCloud.filter((l) => !staleSeedIds.includes(l.id));
-  
-          legacyLocal = keepable.filter((l) => !l.cloudConfirmed);
-          lostAccessIds = keepable.filter((l) => l.cloudConfirmed).map((l) => l.id);
-          const cloudAsLocal = cloudLists.map((cl) => ({
-            id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role,
-            createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true,
-          }));
-          const promoted = legacyLocal.map((l) => (l.role ? l : { ...l, role: "OWNER" }));
-          return [...cloudAsLocal, ...promoted];
-        });
+        // Derived values come from listsRef (synchronously) — never from a
+        // side-effect inside a setState updater, which React is free to run later.
+        const { legacyLocal, lostAccessIds, staleSeedIds } = mergeCloudOnSignIn(listsRef.current, cloudLists);
+        setLists((prev) => mergeCloudOnSignIn(prev, cloudLists).next);
         if (lostAccessIds.length) {
           setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
@@ -433,9 +539,9 @@ export default function DmartApp() {
         });
         // If nothing is selected yet (or the only thing selected was the
         // placeholder local default list) and cloud lists exist, land on one.
-        if (cloudLists.length) {
-          setSelectedListId((cur) => (cur ? cur : cloudLists[0].id));
-        }
+      setSelectedListId((cur) =>
+        pickListId(cur, cloudLists, listsRef.current, [...lostAccessIds, ...staleSeedIds])
+      );
       } catch (e) {
         setNotice(`Couldn't load your cloud lists: ${e?.message || "network error"}`);
       } finally {
@@ -443,11 +549,95 @@ export default function DmartApp() {
       }
       try {
         const { received } = await fetchInvites();
-        if (!cancelled) setReceivedInvites(received);
+        if (!cancelled) setReceivedInvites(received || []);
       } catch { /* non-fatal — the invite banner just stays empty */ }
     })();
     return () => { cancelled = true; };
-  }, [user]);
+  }, [user?.id, appLoaded]);
+
+  // One invitation card (avatar, who/what, permission chip, Decline / Accept).
+  // Shared by the bell's notification panel and the Family tab's invitations popup.
+  function renderInviteCard(invite) {
+    const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
+    const isResponding = respondingInviteId === invite.id;
+    const canEdit = invite.role !== "READ";
+    return (
+      <View key={invite.id} style={[s.itemCard, { gap: 12 }]}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <View style={s.avatarCircle}>
+            <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
+          </View>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={s.itemName} numberOfLines={1}>{senderLabel}</Text>
+            <Text style={s.itemUnit} numberOfLines={2}>
+              {invite.inviteAllLists ? "invited you to join their family" : `invited you to "${invite.listName}"`}
+            </Text>
+          </View>
+          <View style={[s.permBadge, { marginRight: 0, flexDirection: "row", alignItems: "center", gap: 4 }]}>
+            {canEdit ? <Pencil size={11} color={t.accent} /> : <Eye size={11} color={t.accent} />}
+            <Text style={{ color: t.accent, fontSize: 11, fontWeight: "700" }}>{canEdit ? "Can edit" : "Can view"}</Text>
+          </View>
+        </View>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          <TouchableOpacity
+            onPress={() => respondToInvite(invite, false)}
+            disabled={isResponding}
+            style={[s.smallBtn, { flex: 1, alignItems: "center", paddingVertical: 11, opacity: isResponding ? 0.5 : 1 }]}
+          >
+            <Text style={s.smallBtnText}>Decline</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => respondToInvite(invite, true)}
+            disabled={isResponding}
+            style={[s.addItemBtn, { flex: 2, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
+          >
+            {isResponding ? <ActivityIndicator color="#fff" /> : (<><Check size={15} color="#fff" /><Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text></>)}
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  // Adds a non-actionable entry to the notification panel (newest first).
+  // kind: "accepted" | "declined" | "revoked" | "info". Any part of the app
+  // can call this to surface a notification — it only touches a state setter.
+  function pushActivity(kind, text) {
+    setActivity((prev) => [{ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, kind, text, at: Date.now(), read: false }, ...prev].slice(0, 30));
+  }
+
+  // Family tab's "Pending invitations" popup — a separate centred dialog that
+  // only handles invites (the bell's panel is the general notification centre).
+  function openInvites() {
+    invitesAnim.setValue(0);
+    setInvitesOpen(true);
+    Animated.timing(invitesAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+    fetchInvites()
+      .then(({ received }) => setReceivedInvites(received || []))
+      .catch(() => {});
+  }
+  function closeInvites() { setInvitesOpen(false); }
+
+  // Once the last pending invite is answered there's nothing left to show.
+  useEffect(() => {
+    if (invitesOpen && receivedInvites.length === 0) setInvitesOpen(false);
+  }, [invitesOpen, receivedInvites.length]);
+
+  function closeNotifications() {
+    setNotifOpen(false);
+    setActivity((prev) => (prev.some((a) => !a.read) ? prev.map((a) => (a.read ? a : { ...a, read: true })) : prev));
+  }
+
+  // Opens the notifications panel (drops down from the top) and quietly
+  // re-syncs invites from the server so the list is never stale (an invite
+  // may have been revoked since it arrived).
+  function openNotifications() {
+    notifAnim.setValue(0);
+    setNotifOpen(true);
+    Animated.timing(notifAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+    fetchInvites()
+      .then(({ received }) => setReceivedInvites(received || []))
+      .catch(() => {});
+  }
 
   // Accept/decline an invite someone sent *to* me. Accepting immediately
   // pulls the newly-shared list(s) so they show up without a manual refresh.
@@ -458,33 +648,15 @@ export default function DmartApp() {
         await acceptInvite(invite.id);
         const { lists: cloudLists } = await fetchLists();
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
-        // Same fix as the sign-in merge above: keep any list the server
-        // doesn't currently return, full stop — never key that decision
-        // off `.role`, since a list gets that tag optimistically before
-        // the server has necessarily confirmed it. This is the exact spot
-        // that was deleting the accepting user's OWN lists: their list
-        // already had `role: "OWNER"` from being created/migrated earlier,
-        // so it failed the old "keep if no role" check, and if it also
-        // hadn't finished syncing to the server yet it was missing from
-        // `cloudLists` too — so it matched neither bucket and disappeared.
-        let lostAccessIds = [];
-        setLists((prev) => {
-          const notInCloud = prev.filter((l) => !cloudIds.has(l.id));
-          const keepAsIs = notInCloud.filter((l) => !l.cloudConfirmed);
-          lostAccessIds = notInCloud.filter((l) => l.cloudConfirmed).map((l) => l.id);
-          const cloudAsLocal = cloudLists.map((cl) => ({ id: cl.id, name: cl.name, ownerId: cl.ownerId, role: cl.role, createdAt: new Date(cl.createdAt).getTime(), cloudConfirmed: true }));
-          return [...cloudAsLocal, ...keepAsIs];
-        });
+        const { lostAccessIds } = mergeCloudOnAccept(listsRef.current, cloudLists);
+        setLists((prev) => mergeCloudOnAccept(prev, cloudLists).next);
         if (lostAccessIds.length) {
           setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
         }
-        // Avoid clobbering a DIFFERENT list's not-yet-synced local edits —
-        // accepting an invite refreshes every cloud list, not just the
-        // newly shared one, so without this guard an unrelated list with a
-        // pending offline change could get overwritten by a stale server
-        // snapshot the moment this fires.
+
+
         const pendingListIds = getPendingSyncListIds();
         setItemsByList((prev) => {
           const next = { ...prev };
@@ -515,12 +687,6 @@ export default function DmartApp() {
     }
   }
 
-  // Surface sync-queue drops (an offline edit that could never legally land
-  // — e.g. you were removed from the list, or it was deleted — as opposed
-  // to a normal connectivity retry, which stays silent by design). Without
-  // this, a dropped edit just disappeared with no explanation. Registered
-  // once; reads listsRef so it always has current list names without
-  // needing to re-subscribe every time `lists` changes.
   useEffect(() => {
     onSyncDropped((op, err) => {
       const action = describeDroppedOp(op, listsRef.current);
@@ -533,8 +699,17 @@ export default function DmartApp() {
   // effect only (un)subscribes the listeners while it's live.
   useEffect(() => {
     if (!user) return;
+    // AuthContext opens the socket on sign-in, which can land a tick after
+    // this effect first runs — retry briefly instead of silently never subscribing.
+    let detach = null;
+    let retryTimer = null;
+    let tries = 0;
+    const attach = () => {
     const socket = getSocket();
-    if (!socket) return;
+    if (!socket) {
+      if (tries++ < 20) retryTimer = setTimeout(attach, 500);
+      return;
+    }
 
     // All three of these are id-keyed map operations now, so it doesn't
     // matter whether this socket event arrives before or after the local
@@ -561,31 +736,23 @@ export default function DmartApp() {
           for (const cl of cloudLists) next[cl.id] = cl.members;
           return next;
         });
-        // A memberRemoved event can mean *you* were removed, and a
-        // memberRoleChanged event can mean *your own* role changed — this
-        // used to only refresh the members panel, so a list you'd just
-        // lost access to (or had downgraded to read-only) kept sitting in
-        // your switcher with its old role, letting you keep tapping "add
-        // item" into a wall of 404s. Only ever act on lists this effect
-        // itself confirmed as real cloud lists (`cloudConfirmed`) — a
-        // list still mid-migration and not yet in a cloudLists response
-        // for an unrelated reason must never get swept up in this.
-        let lostAccessTo = null;
+
+        const lostIds = listsRef.current
+          .filter((l) => l.cloudConfirmed && !cloudIds.has(l.id))
+          .map((l) => l.id); // was cloud-confirmed, now missing -> access revoked
         setLists((prev) => {
           const stillMine = [];
           for (const l of prev) {
             if (!l.cloudConfirmed) { stillMine.push(l); continue; }
             const fresh = cloudLists.find((cl) => cl.id === l.id);
             if (fresh) stillMine.push({ ...l, role: fresh.role, name: fresh.name });
-            else lostAccessTo = l.id; // was cloud-confirmed, now missing -> access revoked
           }
           return stillMine;
         });
-        if (lostAccessTo) {
-          const removedId = lostAccessTo;
-          setItemsByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
-          setCloudMembersByList((p) => { const n = { ...p }; delete n[removedId]; return n; });
-          setSelectedListId((cur) => (cur === removedId ? null : cur));
+        if (lostIds.length) {
+          setItemsByList((p) => { const n = { ...p }; lostIds.forEach((id) => delete n[id]); return n; });
+          setCloudMembersByList((p) => { const n = { ...p }; lostIds.forEach((id) => delete n[id]); return n; });
+          setSelectedListId((cur) => (lostIds.includes(cur) ? null : cur));
           setNotice("You no longer have access to a list that was removed from your account.");
         }
       }).catch(() => {});
@@ -599,39 +766,43 @@ export default function DmartApp() {
     socket.on("list:memberJoined", onMemberChange);
     socket.on("list:memberRemoved", onMemberChange);
     socket.on("list:memberRoleChanged", onMemberChange);
-    const onInviteReceived = ({ invite }) => setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
+    const onInviteReceived = ({ invite }) => {
+      setReceivedInvites((prev) => (prev.some((i) => i.id === invite.id) ? prev : [invite, ...prev]));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      setNotice(`${invite.sender?.name || invite.sender?.email || "Someone"} sent you an invitation — tap the bell.`);
+    };
     socket.on("invite:received", onInviteReceived);
 
     // Push accept/decline back to the SENDER's Pending Invites panel live,
-    // instead of only resolving the next time they open the Family tab.
-    // The event payload is just { inviteId } — pendingInvitesByList doesn't
-    // know its own scope per-entry, so just scrub the id out of every
-    // list's cached array; it's a no-op wherever it isn't present.
-    const onInviteAccepted = ({ inviteId }) => {
+
+    const scrubSentInvite = (inviteId) => {
       let matched = null;
+      for (const invites of Object.values(pendingInvitesRef.current || {})) {
+        const found = invites.find((inv) => inv.id === inviteId);
+        if (found) { matched = found; break; }
+      }
       setPendingInvitesByList((prev) => {
         const next = {};
-        for (const [listId, invites] of Object.entries(prev)) {
-          const found = invites.find((inv) => inv.id === inviteId);
-          if (found) matched = found;
-          next[listId] = invites.filter((inv) => inv.id !== inviteId);
-        }
+        for (const [listId, invites] of Object.entries(prev)) next[listId] = invites.filter((inv) => inv.id !== inviteId);
         return next;
       });
-      if (matched) setNotice(`${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+      return matched;
+    };
+    const onInviteAccepted = ({ inviteId }) => {
+      const matched = scrubSentInvite(inviteId);
+      if (matched) {
+        const msg = `${matched.recipientEmail} accepted your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`;
+        setNotice(msg);
+        pushActivity("accepted", msg);
+      }
     };
     const onInviteDeclined = ({ inviteId }) => {
-      let matched = null;
-      setPendingInvitesByList((prev) => {
-        const next = {};
-        for (const [listId, invites] of Object.entries(prev)) {
-          const found = invites.find((inv) => inv.id === inviteId);
-          if (found) matched = found;
-          next[listId] = invites.filter((inv) => inv.id !== inviteId);
-        }
-        return next;
-      });
-      if (matched) setNotice(`${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`);
+      const matched = scrubSentInvite(inviteId);
+      if (matched) {
+        const msg = `${matched.recipientEmail} declined your invite${matched.list ? ` to "${matched.list.name}"` : ""}.`;
+        setNotice(msg);
+        pushActivity("declined", msg);
+      }
     };
     socket.on("invite:accepted", onInviteAccepted);
     socket.on("invite:declined", onInviteDeclined);
@@ -639,12 +810,12 @@ export default function DmartApp() {
     // Push revoke back to the RECIPIENT live — previously they only found
     // out by tapping Accept/Decline and getting a stale "not found".
     const onInviteRevoked = ({ inviteId }) => {
-      let existed = false;
-      setReceivedInvites((prev) => {
-        existed = prev.some((i) => i.id === inviteId);
-        return prev.filter((i) => i.id !== inviteId);
-      });
-      if (existed) setNotice("An invitation was withdrawn by the sender.");
+      const existed = receivedInvitesRef.current.some((i) => i.id === inviteId);
+      setReceivedInvites((prev) => prev.filter((i) => i.id !== inviteId));
+      if (existed) {
+        setNotice("An invitation was withdrawn by the sender.");
+        pushActivity("revoked", "An invitation was withdrawn by the sender.");
+      }
     };
     socket.on("invite:revoked", onInviteRevoked);
 
@@ -660,11 +831,13 @@ export default function DmartApp() {
       setCloudMembersByList((prev) => ({ ...prev, [list.id]: list.members }));
       joinListRoom(list.id);
       const ownerMember = list.members.find((m) => m.role === "OWNER");
-      setNotice(`${ownerMember?.name || ownerMember?.email || "A family member"} added you to "${list.name}".`);
+      const grantedMsg = `${ownerMember?.name || ownerMember?.email || "A family member"} added you to "${list.name}".`;
+      setNotice(grantedMsg);
+      pushActivity("info", grantedMsg);
     };
     socket.on("list:granted", onListGranted);
 
-    return () => {
+    detach = () => {
       socket.off("item:created", onItemCreated);
       socket.off("item:updated", onItemUpdated);
       socket.off("item:deleted", onItemDeleted);
@@ -679,18 +852,45 @@ export default function DmartApp() {
       socket.off("invite:revoked", onInviteRevoked);
       socket.off("list:granted", onListGranted);
     };
+    };
+    attach();
+    return () => { clearTimeout(retryTimer); if (detach) detach(); };
   }, [user]);
 
-  // Android 8+ silently drops scheduled notifications without a channel —
-  // this only needs to run once, it's a no-op / ignored on iOS.
-  useEffect(() => {
-    if (Platform.OS === "android") {
-      Notifications.setNotificationChannelAsync("default", {
-        name: "Shopping reminders",
-        importance: Notifications.AndroidImportance.DEFAULT,
-      }).catch(() => {});
-    }
-  }, []);
+      useEffect(() => {
+    if (!user) return;
+
+    const handle = ({ type, data }) => {
+      switch (type) {
+        case PUSH_TYPES.INVITE_RECEIVED:
+          // Refresh from the server rather than trusting the payload —
+          // the invite may already have been revoked since it was sent.
+          openInvites(); // re-fetches the invites itself
+          break;
+
+        case PUSH_TYPES.INVITE_ACCEPTED:
+        case PUSH_TYPES.INVITE_DECLINED:
+          setTab("family");
+          break;
+
+        case PUSH_TYPES.LIST_GRANTED:
+          // Only ever select a list we actually have. If it hasn't loaded yet
+          // (cold start), remember it and select it the moment it appears.
+          if (typeof data?.listId === "string") {
+            if (listsRef.current.some((l) => l.id === data.listId)) { setSelectedListId(data.listId); setTab("home"); }
+            else pendingSelectRef.current = data.listId;
+          }
+          break;
+
+        default:
+          break;
+      }
+    };
+
+    const unsubscribe = notificationService.onTap(handle);
+    notificationService.getInitialTap().then((tap) => { if (tap) handle(tap); });
+    return unsubscribe;
+  }, [user]);
 
   // ---------- Load everything from local storage once, on mount ----------
   useEffect(() => {
@@ -748,25 +948,32 @@ export default function DmartApp() {
     setDebouncedSearch("");
   }, [selectedListId]);
 
-  // Refresh pending invites for a list right when its Family tab is opened,
-  // rather than polling constantly in the background.
+  // On unmount, don't drop a delete that's still inside its undo window —
+  // send it to the server now instead of just cancelling its timer.
   useEffect(() => {
-    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
-    // eslint-disable-next-line
-  }, [tab, selectedList?.id]);
-
-  // clear any pending "undo delete" timer on unmount
-  useEffect(() => {
-    return () => { if (pendingDelete) clearTimeout(pendingDelete.timer); };
-    // eslint-disable-next-line
-  }, [pendingDelete]);
+    return () => {
+      const pd = pendingDeleteRef.current;
+      if (pd) { clearTimeout(pd.timer); deleteItemApi(pd.listId, pd.item.id).catch(() => {}); }
+    };
+  }, []);
 
   // const dailyTestSettings = profile.dailyTest || { hour: DAILY_TEST_DEFAULT_HOUR, minute: DAILY_TEST_DEFAULT_MINUTE, notifIds: [] };
 
-  // auto-clear inline notices after a few seconds
+  // Floating toast driven by `notice`: fades in, auto-dismisses (errors stay
+  // longest), tap to dismiss, and never shifts the layout.
+  const [toast, setToast] = useState(null); // { msg, kind } — kept during fade-out
+  const toastAnim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 4000);
+    if (!notice) {
+      Animated.timing(toastAnim, { toValue: 0, duration: 160, useNativeDriver: true })
+        .start(({ finished }) => { if (finished) setToast(null); });
+      return;
+    }
+    const kind = noticeKind(notice);
+    setToast({ msg: notice, kind });
+    if (kind === "error") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+    Animated.timing(toastAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+    const timer = setTimeout(() => setNotice(""), noticeDuration(notice, kind));
     return () => clearTimeout(timer);
   }, [notice]);
 
@@ -775,6 +982,26 @@ export default function DmartApp() {
   // sign of the tester actually being here. Must stay above the
   // `if (!appLoaded)` early return below, like every other hook in this
   // component — hooks can't be called conditionally.
+
+// One-time cleanup of the old daily testing reminders still queued in the OS.
+// Remove after a few app releases.
+useEffect(() => {
+  if (!appLoaded) return;
+  (async () => {
+    try {
+      const all = await Notifications.getAllScheduledNotificationsAsync();
+      for (const n of all) {
+        const isDailyTest =
+          n.content?.title === "MindCart" ||
+          DAILY_TEST_MESSAGES.includes(n.content?.body);
+        if (isDailyTest) {
+          await Notifications.cancelScheduledNotificationAsync(n.identifier);
+        }
+      }
+    } catch {}
+  })();
+}, [appLoaded]);
+
   // useEffect(() => {
   //   if (!appLoaded) return;
   //   const hour = Number(dailyTestSettings.hour) ?? DAILY_TEST_DEFAULT_HOUR;
@@ -787,7 +1014,7 @@ export default function DmartApp() {
   //   // eslint-disable-next-line
   // }, [appLoaded, dailyTestSettings.hour, dailyTestSettings.minute]);
 
-  const t = getTheme(dark);
+  const t = useMemo(() => getTheme(dark), [dark]);
   const s = useMemo(() => makeStyles(t), [t]);
 
   // Currency lives on the profile object, which is already persisted and
@@ -817,11 +1044,56 @@ export default function DmartApp() {
   // `items` (below) is the sorted array view used everywhere else in the
   // component — nothing downstream of `items` needs to know storage is a
   // map at all.
-  const items = useMemo(() => {
-    const map = itemsByList[selectedListId] || {};
-    return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-  }, [itemsByList, selectedListId]);
+  // selectedList first, and `items` keyed on ITS id: when selectedListId is
+  // null/stale the header shows lists[0], so the items must come from
+  // lists[0] too (they used to come from itemsByList[null] = empty).
   const selectedList = lists.find((l) => l.id === selectedListId) || lists[0];
+  const items = useMemo(() => {
+    const map = itemsByList[selectedList?.id] || {};
+    return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }, [itemsByList, selectedList?.id]);
+
+  // Keep selectedListId pointing at a real list, so every action that reads
+  // it (add / edit / delete item, new trip…) targets the list on screen.
+  useEffect(() => {
+    if (!appLoaded || lists.length === 0) return;
+    if (!lists.some((l) => l.id === selectedListId)) {
+      const best = lists.find((l) => l.role === "OWNER") || lists.find((l) => !l.role) || lists[0];
+      setSelectedListId(best.id);
+    }
+  }, [appLoaded, lists, selectedListId]);
+
+  // Refresh pending invites for a list right when its Family tab is opened,
+  // rather than polling constantly in the background. (Lives below the
+  // `selectedList` declaration on purpose — above it, the dependency array
+  // read `selectedList` before it existed, so it was always `undefined` and
+  // switching lists while on the Family tab never refreshed.)
+  useEffect(() => {
+    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
+    // eslint-disable-next-line
+  }, [tab, selectedList?.id]);
+
+  // A list tapped from a push notification before it had loaded.
+  useEffect(() => {
+    const want = pendingSelectRef.current;
+    if (want && lists.some((l) => l.id === want)) {
+      pendingSelectRef.current = null;
+      setSelectedListId(want);
+      setTab("home");
+    }
+  }, [lists]);
+
+  // Signing out (or switching accounts) must not leave the previous account's
+  // invites, activity or member lists in memory for the next person.
+  useEffect(() => {
+    if (user) return;
+    setReceivedInvites([]);
+    setPendingInvitesByList({});
+    setCloudMembersByList({});
+    setActivity([]);
+    setNotifOpen(false);
+    setInvitesOpen(false);
+  }, [user]);
   // A READ-only collaborator could otherwise tap every add/check/edit/delete
   // control in the UI (none of them are currently disabled for that role) —
   // the server would correctly reject the write, but only after the local
@@ -841,8 +1113,8 @@ export default function DmartApp() {
     // price is the final amount for the whole line (not a per-unit price),
     // so totals just sum it directly — qty is informational only and does
     // not multiply into the total.
-    const boughtTotal = boughtItems.reduce((s, i) => s + Number(i.price || 0), 0);
-    const pendingTotal = pendingItems.reduce((s, i) => s + Number(i.price || 0), 0);
+    const boughtTotal = boughtItems.reduce((sum, i) => sum + safeAmount(i.price), 0);
+    const pendingTotal = pendingItems.reduce((sum, i) => sum + safeAmount(i.price), 0);
     return { filtered, searchMatch, itemCategories, boughtItems, pendingItems, skippedItems, boughtTotal, pendingTotal };
     // eslint-disable-next-line
   }, [items, debouncedSearch]);
@@ -973,24 +1245,41 @@ export default function DmartApp() {
     setRenameDraft("");
     setListNameError("");
     renameListApi(renamingListId, name).catch((e) => {
-      setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
+      if (target) setLists((prev) => prev.map((l) => (l.id === target.id ? { ...l, name: target.name } : l)));
       setNotice(`Rename didn't save, so it's been undone: ${e?.message || "network error"}`);
     });
   }
   function deleteList(listId) {
+    const removed = lists.find((l) => l.id === listId);
+    if (!removed) { setConfirmDeleteListId(null); return; }
+    // Only the owner can delete a shared list — the server rejects it for
+    // anyone else and the list would just reappear on the next sync.
+    if (removed.role && removed.role !== "OWNER") {
+      setNotice("Only the owner can delete a shared list.");
+      setConfirmDeleteListId(null);
+      return;
+    }
     if (lists.length <= 1) {
       setNotice("You need at least one list — create another before deleting this one.");
       setConfirmDeleteListId(null);
       return;
     }
     const remaining = lists.filter((l) => l.id !== listId);
-    const removed = lists.find((l) => l.id === listId);
-    if (removed?.reminderNotifId) { Notifications.cancelScheduledNotificationAsync(removed.reminderNotifId).catch(() => {}); }
+    const removedItems = itemsByList[listId];
+    if (removed.reminderNotifId) { Notifications.cancelScheduledNotificationAsync(removed.reminderNotifId).catch(() => {}); }
     setLists(remaining);
     setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+    setCloudMembersByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
     if (selectedListId === listId) setSelectedListId(remaining[0].id);
     setConfirmDeleteListId(null);
-    deleteListApi(listId).catch((e) => setNotice(`Delete didn't sync: ${e?.message || "network error"}`));
+    deleteListApi(listId).catch((e) => {
+      // A real failure (an offline delete is queued, not thrown): the list
+      // still exists on the server, so bring it back instead of letting it
+      // silently vanish here and reappear on the next sync.
+      setLists((prev) => (prev.some((l) => l.id === removed.id) ? prev : [...prev, removed]));
+      if (removedItems) setItemsByList((prev) => ({ ...prev, [listId]: removedItems }));
+      setNotice(`Couldn't delete "${removed.name}", so it's back: ${e?.message || "network error"}`);
+    });
   }
 
   // ---------- Family sharing ----------
@@ -1102,7 +1391,7 @@ export default function DmartApp() {
           title: "Shopping reminder",
           body: `You haven't shopped for "${list.name}" in ${days} day${days === 1 ? "" : "s"}.`,
         },
-        trigger: { seconds: Math.max(1, days) * 24 * 60 * 60, channelId: "default" },
+        trigger: { type: Notifications.SchedulableTriggerInputTypes?.TIME_INTERVAL, seconds: Math.min(365, Math.max(1, Number(days) || 5)) * 24 * 60 * 60, channelId: "default" },
       });
     } catch {
       // scheduling can fail without permission or on unsupported platforms — safe to ignore
@@ -1216,7 +1505,7 @@ export default function DmartApp() {
           title: "Test notification 🎉",
           body: "If you see this, notifications are set up correctly.",
         },
-        trigger: { seconds: 3, channelId: "default" },
+        trigger: { type: Notifications.SchedulableTriggerInputTypes?.TIME_INTERVAL, seconds: 3, channelId: "default" },
       });
       setNotice("Test notification sent — it should appear in about 3 seconds.");
     } catch (e) {
@@ -1226,10 +1515,12 @@ export default function DmartApp() {
 
   // ---------- Item management ----------
   async function addItem() {
-    console.log("Adding item:", fName, fCategory, fUnit, fPrice);
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
-    if (!fName.trim()) return;
-    console.log("Raw input:", fName);
+    if (!fName.trim()) {
+      tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+      setItemNameError("Type an item name first.");
+      return;
+    }
     const rawNames = fName.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 20);
     if (rawNames.length === 0) return;
     const category = (fCategory || "Other").trim() || "Other";
@@ -1245,11 +1536,11 @@ export default function DmartApp() {
       if (validationErr) { errors.push(validationErr); continue; }
       seenInBatch.push(capped);
       toAdd.push(capped);
-      console.log("Adding item:", capped);
     }
 
     if (toAdd.length === 0) {
-      setItemNameError(errors[0] || "Enter a valid item name.");
+      tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+      setItemNameError(summarizeItemErrors(errors) || "Enter a valid item name.");
       return;
     }
     setItemNameError("");
@@ -1304,7 +1595,7 @@ export default function DmartApp() {
     setFName("");
     setFPrice("");
     setCategoryTouched(false);
-    if (errors.length) setNotice(errors[0]);
+    if (errors.length) setItemNameError(`Added ${toAdd.length}, skipped ${errors.length}: ${summarizeItemErrors(errors)}`);
     bumpActivity(selectedListId);
   }
 
@@ -1332,80 +1623,52 @@ export default function DmartApp() {
   // optimistic delete with a 5s "Undo" window. For cloud lists the actual
   // server delete only fires once that window closes without an Undo —
   // that's the real point of no return, so it doubles as the sync trigger.
+  function commitPendingDelete(pd) {
+    clearTimeout(pd.timer);
+    deleteItemApi(pd.listId, pd.item.id).catch((e) => {
+      // A real (non-connectivity) failure — the item never actually left the
+      // server, so don't let it silently vanish from just this device. An
+      // offline delete queues instead of rejecting.
+      upsertItem(pd.listId, pd.item);
+      setNotice(`Delete didn't sync, so "${pd.item.name}" is back: ${e?.message || "network error"}`);
+    });
+  }
   function deleteItem(item) {
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
-    if (pendingDelete) clearTimeout(pendingDelete.timer);
+    // Deleting a second item inside the first one's undo window used to cancel
+    // the first server delete outright (its timer was cleared and never
+    // re-armed), so that item came back on the next sync. Commit it now.
+    const previous = pendingDeleteRef.current;
+    if (previous) commitPendingDelete(previous);
     animateListChange();
     const listId = selectedListId;
     removeItemFromList(listId, item.id);
-    const timer = setTimeout(() => {
-      setPendingDelete(null);
-      deleteItemApi(listId, item.id).catch((e) => {
-        // A real (non-connectivity) failure — the item never actually
-        // left the server, so don't let it silently vanish forever from
-        // just this one device. An offline delete queues instead of
-        // rejecting, so this branch is only for genuine errors.
-        upsertItem(listId, item);
-        setNotice(`Delete didn't sync, so "${item.name}" is back: ${e?.message || "network error"}`);
-      });
+    const entry = { item, listId, timer: null };
+    entry.timer = setTimeout(() => {
+      if (pendingDeleteRef.current === entry) pendingDeleteRef.current = null;
+      setPendingDelete((cur) => (cur === entry ? null : cur));
+      commitPendingDelete(entry);
     }, 5000);
-    setPendingDelete({ item, timer });
+    pendingDeleteRef.current = entry;
+    setPendingDelete(entry);
   }
   function undoDelete() {
-    if (!pendingDelete) return;
-    clearTimeout(pendingDelete.timer);
+    const pd = pendingDeleteRef.current;
+    if (!pd) return;
+    clearTimeout(pd.timer);
     animateListChange();
-    upsertItem(selectedListId, pendingDelete.item);
+    upsertItem(pd.listId, pd.item); // the list it was deleted from, even if you've switched lists since
+    pendingDeleteRef.current = null;
     setPendingDelete(null);
   }
 
 
   function toggleCollapse(cat) { setCollapsed((p) => ({ ...p, [cat]: !p[cat] })); }
 
-  // ---------- Barcode scanning ----------
-  // async function openScanner() {
-  //   if (!cameraPermission?.granted) {
-  //     const res = await requestCameraPermission();
-  //     if (!res.granted) { setNotice("Camera permission is needed to scan barcodes."); return; }
-  //   }
-  //   scanLockRef.current = false;
-  //   setScannerOpen(true);
-  // }
-  // function onBarcodeScanned(result) {
-  //   if (scanLockRef.current) return;
-  //   scanLockRef.current = true;
-  //   setScannerOpen(false);
-  //   // lookupBarcode(result.data);
-  // }
-  // Uses UPCitemdb's free lookup endpoint — no API key needed, but it's a
-  // trial/rate-limited endpoint, so failures (unknown code, rate limit,
-  // offline) are expected sometimes; the user can still type the name in.
-  // async function lookupBarcode(code) {
-  //   setScanLoading(true);
-  //   try {
-  //     const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(code)}`);
-  //     const data = await res.json();
-  //     const item = data?.items?.[0];
-  //     if (item?.title) {
-  //       setFName(item.title.length > 40 ? item.title.slice(0, 40) : item.title);
-  //       const price = item.lowest_recorded_price || item.highest_recorded_price || item.offers?.[0]?.price;
-  //       if (price) setFPrice(String(Math.round(Number(price))));
-  //       setNotice(`Found "${item.title}" — check the details before adding.`);
-  //     } else {
-  //       setNotice("No product found for that barcode — you can still type the name in.");
-  //     }
-  //   } catch(e) {
-  //     console.log("Barcode lookup error:", e);
-  //     setNotice("Couldn't look up that barcode — check your connection and try again.");
-  //   } finally {
-  //     setScanLoading(false);
-  //   }
-  // }
 
   async function exportPDF() {
     if (exportingPdf) return; // guard against double taps while one export is in flight
      if (pendingItems.length === 0 && boughtItems.length === 0) {
-      console.log("No items to export.");
     setNotice("No items to export.");
     return;
   }
@@ -1413,7 +1676,7 @@ export default function DmartApp() {
     try {
       await exportListPdf({
         listName: selectedList ? selectedList.name : "MindCart",
-        profileName: profile.name,
+        profileName: profile.name || user?.name || "",
         pendingItems,
         boughtItems,
         pendingTotal,
@@ -1421,7 +1684,6 @@ export default function DmartApp() {
         currencySymbol: currency.symbol,
       });
     } catch (e) {
-      console.log("PDF export error:", e);
       setNotice(`Couldn't export PDF: ${e?.message || "unknown error"}`);
     } finally {
       setExportingPdf(false);
@@ -1487,9 +1749,9 @@ function confirmStartNewTrip() {
 }
 
   function addCategory(name) {
-    const trimmed = name.trim();
+    const trimmed = name.trim().slice(0, 30);
     if (!trimmed) return;
-    setCategories((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
+    setCategories((prev) => (prev.some((c) => c.toLowerCase() === trimmed.toLowerCase()) || prev.length >= 60 ? prev : [...prev, trimmed]));
   }
 
   // ---------- Master items: quick-add a common item straight into the current list ----------
@@ -1601,6 +1863,16 @@ function confirmStartNewTrip() {
           </TouchableOpacity>
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
+            {!!user && (
+              <TouchableOpacity onPress={openNotifications} style={s.iconBtn} accessibilityLabel="Notifications">
+                {badgeCount > 0 ? <BellRing size={17} color={t.accent} /> : <Bell size={17} color={t.text} />}
+                {badgeCount > 0 && (
+                  <View style={s.bellBadge}>
+                    <Text style={s.bellBadgeText}>{badgeCount > 9 ? "9+" : badgeCount}</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+            )}
             <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf}>
               {exportingPdf ? (
                 <ActivityIndicator size="small" color={t.text} />
@@ -1613,54 +1885,6 @@ function confirmStartNewTrip() {
             </TouchableOpacity> */}
           </View>
         </View>
-
-        {notice ? (
-          <View style={s.notice}><Text style={{ color: t.accent2, fontSize: 12.5 }}>{notice}</Text></View>
-        ) : null}
-
-        {receivedInvites.length > 0 && (
-          <View style={{ marginHorizontal: 18, marginTop: 12, gap: 8 }}>
-            <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.4 }}>
-              {receivedInvites.length === 1 ? "Pending invitation" : `Pending invitations (${receivedInvites.length})`}
-            </Text>
-            {receivedInvites.map((invite) => {
-              const senderLabel = invite.sender?.name || invite.sender?.email || "Someone";
-              const isResponding = respondingInviteId === invite.id;
-              return (
-                <View key={invite.id} style={[s.itemCard, { gap: 10 }]}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                    <View style={s.avatarCircle}>
-                      <Text style={{ color: "#fff", fontWeight: "800", fontSize: 13 }}>{senderLabel.slice(0, 1).toUpperCase()}</Text>
-                    </View>
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={s.itemName}>{senderLabel}</Text>
-                      <Text style={s.itemUnit}>
-                        {invite.inviteAllLists ? "Invited you as a family member" : `Invited you to "${invite.list?.name}"`}
-                        {"  ·  "}{invite.role === "READ" ? "Can view" : "Can edit"}
-                      </Text>
-                    </View>
-                  </View>
-                  <View style={{ flexDirection: "row", gap: 8 }}>
-                    <TouchableOpacity
-                      onPress={() => respondToInvite(invite, true)}
-                      disabled={isResponding}
-                      style={[s.addItemBtn, { flex: 1, marginLeft: 0, justifyContent: "center", opacity: isResponding ? 0.6 : 1 }]}
-                    >
-                      {isResponding ? <ActivityIndicator color="#fff" /> : <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Accept</Text>}
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      onPress={() => respondToInvite(invite, false)}
-                      disabled={isResponding}
-                      style={[s.smallBtn, { flex: 1, alignItems: "center", opacity: isResponding ? 0.6 : 1 }]}
-                    >
-                      <Text style={s.smallBtnText}>Decline</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              );
-            })}
-          </View>
-        )}
 
         {pendingDelete ? (
           <View style={s.undoRow}>
@@ -1684,9 +1908,9 @@ function confirmStartNewTrip() {
             </View>
           )}
 
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
-          {tab === "home" && (
-            <>
+        {/* ===== Pinned header (does NOT scroll): summary + All/Pending/Bought ===== */}
+        {tab === "home" && (
+          <View style={{ paddingHorizontal: 16 }}>
               <View style={s.summaryCard}>
                 <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 18, alignItems: "center" }}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
@@ -1740,8 +1964,7 @@ function confirmStartNewTrip() {
                   <Text style={{ color: tripDirty ? t.accent : t.muted, fontWeight: "600", fontSize: 12.5 }}>Start new trip</Text>
                 </TouchableOpacity>
               </View>
-
-              {/* ===== Segmented filter: All / Pending / Bought ===== */}
+            <View style={s.stickyFilterWrap}>
               <View style={s.segmentWrap}>
                 {[
                   { id: "all", label: `All (${items.length})` },
@@ -1757,7 +1980,72 @@ function confirmStartNewTrip() {
                   </TouchableOpacity>
                 ))}
               </View>
+            </View>
+          </View>
+        )}
 
+        {/* ===== Pinned "Add item" card (does NOT scroll) ===== */}
+        {tab === "add" && (
+          <View style={{ paddingHorizontal: 16, paddingBottom: 8, zIndex: 10 }}>
+              {debouncedSearch.trim() ? (
+                <Text style={{ marginTop: 10, fontSize: 12.5, color: searchMatch ? t.accent : t.muted }}>
+                  {searchMatch
+                    ? `✅ "${searchMatch.name}" is already on your list (qty: ${searchMatch.qty} ${searchMatch.unit})`
+                    : `"${debouncedSearch}" is not on your list yet — add it below.`}
+                </Text>
+              ) : null}
+
+              <View style={s.addCard}>
+                <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <TextInput
+                    value={fName}
+                    maxLength={200}
+                    onChangeText={(val) => {
+                      setFName(val);
+                      if (itemNameError) setItemNameError("");
+                      if (!categoryTouched && !val.includes(",")) {
+                        const guess = suggestCategory(val);
+                        if (guess) setFCategory(guess);
+                      }
+                    }}
+                    onSubmitEditing={addItem}
+                    placeholder="Item name"
+                    placeholderTextColor={t.muted}
+                    style={[s.input, { flex: 1, minWidth: 140, borderColor: itemNameError ? t.danger : t.border }]}
+                  />
+                  {/* <TouchableOpacity onPress={openScanner} style={s.iconBtn} disabled={scanLoading}>
+                    <Barcode size={16} color={scanLoading ? t.muted : t.text} />
+                  </TouchableOpacity> */}
+                  <CategorySelect
+                    value={fCategory}
+                    categories={categories}
+                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
+                    onAddCategory={addCategory}
+                    t={t}
+                    style={{ flex: 1, minWidth: 100 }}
+                  />
+                </View>
+                {itemNameError ? (
+                  <View style={s.inlineError} accessibilityLiveRegion="polite">
+                    <AlertCircle size={14} color={t.danger} style={{ marginTop: 1 }} />
+                    <Text style={s.inlineErrorText}>{itemNameError}</Text>
+                  </View>
+                ) : null}
+                <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
+                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
+                  <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
+                    <Plus size={15} color="#fff" />
+                    <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+          </View>
+        )}
+
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
+          {tab === "home" && (
+            <>
               {items.length === 0 && (
                 <View style={s.emptyStateWrap}>
                   <View style={s.emptyStateIconWrap}>
@@ -1921,56 +2209,7 @@ function confirmStartNewTrip() {
 
           {tab === "add" && (
             <>
-              {debouncedSearch.trim() ? (
-                <Text style={{ marginTop: 10, fontSize: 12.5, color: searchMatch ? t.accent : t.muted }}>
-                  {searchMatch
-                    ? `✅ "${searchMatch.name}" is already on your list (qty: ${searchMatch.qty} ${searchMatch.unit})`
-                    : `"${debouncedSearch}" is not on your list yet — add it below.`}
-                </Text>
-              ) : null}
-
-              <View style={s.addCard}>
-                <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <TextInput
-                    value={fName}
-                    maxLength={200}
-                    onChangeText={(val) => {
-                      setFName(val);
-                      if (itemNameError) setItemNameError("");
-                      if (!categoryTouched && !val.includes(",")) {
-                        const guess = suggestCategory(val);
-                        if (guess) setFCategory(guess);
-                      }
-                    }}
-                    onSubmitEditing={addItem}
-                    placeholder="Item name"
-                    placeholderTextColor={t.muted}
-                    style={[s.input, { flex: 1, minWidth: 140, borderColor: itemNameError ? t.danger : t.border }]}
-                  />
-                  {/* <TouchableOpacity onPress={openScanner} style={s.iconBtn} disabled={scanLoading}>
-                    <Barcode size={16} color={scanLoading ? t.muted : t.text} />
-                  </TouchableOpacity> */}
-                  <CategorySelect
-                    value={fCategory}
-                    categories={categories}
-                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
-                    onAddCategory={addCategory}
-                    t={t}
-                    style={{ flex: 1, minWidth: 100 }}
-                  />
-                </View>
-                {itemNameError ? <Text style={s.errorText}>{itemNameError}</Text> : null}
-                <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
-                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
-                  <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
-                    <Plus size={15} color="#fff" />
-                    <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              <View style={{ marginTop: 16, gap: 8 }}>
+              <View style={{ marginTop: 4, gap: 8 }}>
                 {filtered.length === 0 && (
                   <View style={s.emptyStateWrap}>
                     <View style={s.emptyStateIconWrap}>
@@ -2043,6 +2282,24 @@ function confirmStartNewTrip() {
           )}
 
           {tab === "family" && (
+            <>
+            {receivedInvites.length > 0 && (
+              <TouchableOpacity onPress={openInvites} activeOpacity={0.85} style={[s.inviteEntry, { marginBottom: 14 }]}>
+                <View style={s.inviteEntryIcon}>
+                  <Mail size={18} color="#fff" />
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={s.itemName}>Pending invitations</Text>
+                  <Text style={s.itemUnit}>
+                    {receivedInvites.length === 1
+                      ? `${receivedInvites[0].sender?.name || receivedInvites[0].sender?.email || "Someone"} is waiting for your reply`
+                      : `${receivedInvites.length} people are waiting for your reply`}
+                  </Text>
+                </View>
+                <View style={s.countPill}><Text style={s.countPillText}>{receivedInvites.length}</Text></View>
+                <ChevronRight size={18} color={t.muted} />
+              </TouchableOpacity>
+            )}
             <FamilySyncScreen
               t={t} s={s}
               selectedList={selectedList}
@@ -2063,22 +2320,19 @@ function confirmStartNewTrip() {
               onChangeRole={(userId, role) => changeFamilyMemberRole(selectedList.id, userId, role)}
               onRemoveMember={(userId) => removeFamilyMember(selectedList.id, userId)}
             />
+            </>
           )}
 
           {tab === "profile" && (
             <View style={{ gap: 14 }}>
               <View style={[s.summaryCard, { flexDirection: "row", alignItems: "center", gap: 12 }]}>
                 <View style={s.avatarCircleLg}>
-                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(user.name || "U").slice(0, 1).toUpperCase()}</Text>
+                  <Text style={{ color: "#fff", fontWeight: "800", fontSize: 20 }}>{(profile.name || user.name || "U").slice(0, 1).toUpperCase()}</Text>
                 </View>
                 <View style={{ flex: 1, minWidth: 0 }}>
-                  <TextInput
-                    value={user.name}
-                    onChangeText={(v) => setProfile((p) => ({ ...p, name: v }))}
-                    placeholder={user?.name || "Enter your name"}                   
-                    placeholderTextColor={t.muted}
-                    style={{ color: t.text, fontWeight: "800", fontSize: 16, padding: 0 }}
-                  />
+                  <Text style={{ color: t.text, fontWeight: "800", fontSize: 16 }}>
+                  {user?.name || "Enter your name"}
+                </Text>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 }}>
                     <Crown size={12} color={t.accent2} />
                     <Text style={{ color: t.accent2, fontSize: 11.5, fontWeight: "700" }}>Family Plan Manager</Text>
@@ -2119,7 +2373,7 @@ function confirmStartNewTrip() {
                     <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
                   </TouchableOpacity> */}
                   <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
-                     Comming Soon
+                     Coming Soon
                     </Text>
                 </View>
 
@@ -2137,14 +2391,14 @@ function confirmStartNewTrip() {
 
               <Text style={s.sectionLabel}>Data & Cloud</Text>
               <View style={{ gap: 8 }}>
-                <TouchableOpacity style={s.settingsRow} onPress={exportPDF} disabled={exportingPdf}>
+                {/* <TouchableOpacity style={s.settingsRow} onPress={exportPDF} disabled={exportingPdf}>
                   <View style={[s.settingsIconWrap, { backgroundColor: t.accentSoft }]}><FileDown size={16} color={t.accent} /></View>
                   <View style={{ flex: 1 }}>
                     <Text style={s.itemName}>Export Shopping Data</Text>
                     <Text style={s.itemUnit}>Download this list as a PDF</Text>
                   </View>
                   {exportingPdf ? <ActivityIndicator size="small" color={t.accent} /> : <ChevronRight size={16} color={t.muted} />}
-                </TouchableOpacity>
+                </TouchableOpacity> */}
                 <TouchableOpacity
                   style={s.settingsRow}
                   disabled={authLoading || signingIn}
@@ -2188,6 +2442,31 @@ function confirmStartNewTrip() {
             </View>
           )}
         </ScrollView>
+
+        {/* ===== Floating toast (overlays, never pushes content) ===== */}
+        {toast ? (() => {
+          const tone = toast.kind === "error" ? t.danger : toast.kind === "success" ? t.accent : t.accent2;
+          const Icon = toast.kind === "error" ? AlertCircle : toast.kind === "success" ? Check : Info;
+          return (
+            <Animated.View
+              pointerEvents="box-none"
+              style={[s.toastWrap, { opacity: toastAnim, transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-12, 0] }) }] }]}
+            >
+              <Pressable
+                onPress={() => setNotice("")}
+                accessibilityRole="alert"
+                accessibilityLiveRegion="polite"
+                style={[s.toast, { borderColor: `${tone}66` }]}
+              >
+                <View style={[s.toastIcon, { backgroundColor: `${tone}22` }]}>
+                  <Icon size={15} color={tone} />
+                </View>
+                <Text style={s.toastText}>{toast.msg}</Text>
+                <X size={14} color={t.muted} />
+              </Pressable>
+            </Animated.View>
+          );
+        })() : null}
       </KeyboardAvoidingView>
 
       {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
@@ -2203,6 +2482,7 @@ function confirmStartNewTrip() {
           <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
             <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
               <Icon size={18} color={tab === id ? "#fff" : t.muted} />
+              {id === "family" && receivedInvites.length > 0 && tab !== "family" && <View style={s.tabDot} />}
             </View>
             <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
           </TouchableOpacity>
@@ -2387,6 +2667,103 @@ function confirmStartNewTrip() {
       )}
 
       {/* ===== Confirm "Start new trip" popup ===== */}
+      {/* ===== Pending invitations popup — centred dialog opened from the Family tab row.
+          Invites only (the header bell opens the full Notifications panel instead). ===== */}
+      {invitesOpen && (
+        <View style={[s.overlayFill, { zIndex: 46, elevation: 26 }]}>
+          <Pressable style={s.modalBackdropCenter} onPress={closeInvites}>
+            <Animated.View style={{ width: "100%", alignItems: "center", opacity: invitesAnim, transform: [{ scale: invitesAnim.interpolate({ inputRange: [0, 1], outputRange: [0.94, 1] }) }] }}>
+              <Pressable style={s.popupCard} onPress={() => {}}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 14 }}>
+                  <View style={s.inviteEntryIcon}><Mail size={18} color="#fff" /></View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={s.sheetTitle}>Pending invitations</Text>
+                    <Text style={{ color: t.muted, fontSize: 12.5, marginTop: 1 }}>
+                      {receivedInvites.length === 1 ? "1 person is waiting for your reply" : `${receivedInvites.length} people are waiting for your reply`}
+                    </Text>
+                  </View>
+                  <TouchableOpacity onPress={closeInvites} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                    <X size={18} color={t.muted} />
+                  </TouchableOpacity>
+                </View>
+                <ScrollView style={{ maxHeight: 420 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: 10 }}>
+                  {receivedInvites.map(renderInviteCard)}
+                </ScrollView>
+                <TouchableOpacity onPress={closeInvites} style={{ alignSelf: "center", marginTop: 14, paddingVertical: 4, paddingHorizontal: 10 }}>
+                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "700" }}>Decide later</Text>
+                </TouchableOpacity>
+              </Pressable>
+            </Animated.View>
+          </Pressable>
+        </View>
+      )}
+
+      {/* ===== Notifications panel — drops down from the top, right under the header bell.
+          Opened by the bell and by the Family tab's "Pending invitations" row.
+          In-tree overlay (not <Modal>) like the other popups, to avoid the Android flicker. ===== */}
+      {notifOpen && (
+        <View style={[s.overlayFill, { zIndex: 45, elevation: 25 }]}>
+          <Pressable style={s.notifBackdrop} onPress={closeNotifications}>
+            <Animated.View style={{ opacity: notifAnim, transform: [{ translateY: notifAnim.interpolate({ inputRange: [0, 1], outputRange: [-16, 0] }) }] }}>
+              <Pressable style={s.notifPanel} onPress={() => {}}>
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <Text style={s.sheetTitle}>Notifications</Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 16 }}>
+                    {activity.length > 0 && (
+                      <TouchableOpacity onPress={() => setActivity([])} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                        <Text style={{ color: t.accent, fontSize: 12.5, fontWeight: "700" }}>Clear</Text>
+                      </TouchableOpacity>
+                    )}
+                    <TouchableOpacity onPress={closeNotifications} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                      <X size={18} color={t.muted} />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                <ScrollView style={{ maxHeight: 460 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: 10 }}>
+                  {receivedInvites.length === 0 && activity.length === 0 && (
+                    <View style={s.emptyStateWrap}>
+                      <View style={s.emptyStateIconWrap}><Bell size={26} color={t.accent} /></View>
+                      <Text style={s.emptyStateTitle}>You're all caught up</Text>
+                      <Text style={s.emptyStateSub}>Invitations and updates from your family lists will show up here.</Text>
+                    </View>
+                  )}
+
+                  {receivedInvites.length > 0 && (
+                    <Text style={s.sectionLabel}>Invitations · {receivedInvites.length}</Text>
+                  )}
+                  {receivedInvites.map(renderInviteCard)}
+
+                  {activity.length > 0 && (
+                    <Text style={[s.sectionLabel, receivedInvites.length > 0 && { marginTop: 10 }]}>Recent activity</Text>
+                  )}
+                  {activity.map((a) => {
+                    const good = a.kind === "accepted";
+                    const bad = a.kind === "declined" || a.kind === "revoked";
+                    const Icon = good ? Check : bad ? X : Bell;
+                    const tint = good ? t.accent2 : bad ? t.danger : t.accent;
+                    const tintBg = good ? t.accent2Soft : bad ? t.dangerSoft : t.accentSoft;
+                    return (
+                      <View key={a.id} style={s.activityRow}>
+                        <View style={[s.activityIcon, { backgroundColor: tintBg }]}><Icon size={15} color={tint} /></View>
+                        <View style={{ flex: 1, minWidth: 0 }}>
+                          <Text style={{ color: t.text, fontSize: 13, fontWeight: a.read ? "500" : "700", lineHeight: 18 }}>{a.text}</Text>
+                          <Text style={s.itemUnit}>{timeAgo(a.at)}</Text>
+                        </View>
+                        {!a.read && <View style={s.unreadDot} />}
+                        <TouchableOpacity onPress={() => setActivity((prev) => prev.filter((x) => x.id !== a.id))} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                          <X size={14} color={t.muted} />
+                        </TouchableOpacity>
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+              </Pressable>
+            </Animated.View>
+          </Pressable>
+        </View>
+      )}
+
       {confirmNewTripOpen && (
         <View style={[s.overlayFill, { zIndex: 44, elevation: 24 }]}>
         <Pressable style={s.modalBackdropCenter} onPress={() => setConfirmNewTripOpen(false)}>
@@ -2430,7 +2807,7 @@ function confirmStartNewTrip() {
               </View>
               <Text style={{ fontSize: 12.5, color: t.muted, marginBottom: 12 }}>
                 {needsCurrencySetup
-                  ? "This just sets which symbol shows next to prices — you can change it anytime from the settings icon up top."
+                  ? "This just sets which symbol shows next to prices — you can change it anytime from Profile → Currency."
                   : "Changing this only updates the symbol shown next to prices; existing amounts stay the same."}
               </Text>
 
@@ -2507,7 +2884,7 @@ function confirmStartNewTrip() {
               {/* Short description */}
               <Text style={{ fontSize: 13, color: t.muted, textAlign: "center", lineHeight: 19, marginBottom: 18 }}>
                 MindCart helps you plan your shopping trips with categorized items, quantities, prices, and reminders — 
-                all saved on your device, so your lists are always ready when you need them.**
+                saved on your device and synced to your account, so your lists are always ready when you need them.
               </Text>
 
               {/* Version & developer */}
@@ -2742,7 +3119,7 @@ function confirmStartNewTrip() {
     </View>
     </GestureHandlerRootView>
   );
-}
+});
 
 // ---------- First-run onboarding ----------
 // Marketing copy below is placeholder — edit the description and feature
@@ -2848,10 +3225,10 @@ function Loader({ t }) {
           Animated.timing(dot, { toValue: 0, duration: 300, useNativeDriver: true }),
           Animated.delay(600 - delay),
         ])
-      ).start();
-    bounce(dot1, 0);
-    bounce(dot2, 150);
-    bounce(dot3, 300);
+      );
+    const loops = [bounce(dot1, 0), bounce(dot2, 150), bounce(dot3, 300)];
+    loops.forEach((l) => l.start());
+    return () => loops.forEach((l) => l.stop());
     // eslint-disable-next-line
   }, []);
 
@@ -2917,6 +3294,12 @@ function makeStyles(t) {
     addHint: { fontSize: 13, color: t.muted, fontWeight: "600", marginBottom: 10 },
     input: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 12, color: t.text, fontSize: 14 },
     errorText: { color: t.danger, fontSize: 11.5, marginTop: 4 },
+    toastWrap: { position: "absolute", top: 70, left: 16, right: 16, zIndex: 100, elevation: 12 },
+    toast: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: t.surface, borderWidth: 1, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 12, shadowColor: "#000", shadowOpacity: 0.2, shadowRadius: 12, shadowOffset: { width: 0, height: 6 } },
+    toastIcon: { width: 26, height: 26, borderRadius: RADIUS.pill, alignItems: "center", justifyContent: "center" },
+    toastText: { flex: 1, color: t.text, fontSize: 13, lineHeight: 18, fontWeight: "600" },
+    inlineError: { flexDirection: "row", alignItems: "flex-start", gap: 6, marginTop: 8 },
+    inlineErrorText: { flex: 1, color: t.danger, fontSize: 12.5, lineHeight: 17, fontWeight: "600" },
     addItemBtn: { marginLeft: "auto", backgroundColor: t.accent, borderRadius: RADIUS.md, paddingVertical: 10, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", gap: 6 },
     smallBtn: { borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 5, paddingHorizontal: 10, backgroundColor: t.surface },
     smallBtnText: { color: t.text, fontSize: 12, fontWeight: "700" },
@@ -2948,11 +3331,26 @@ function makeStyles(t) {
     toggleThumbOn: { transform: [{ translateX: 18 }] },
 
     // ---- Segmented filter (Home: All / Pending / Bought) ----
-    segmentWrap: { flexDirection: "row", backgroundColor: t.surface2, borderRadius: RADIUS.pill, padding: 3, marginTop: 14, gap: 2 },
+    stickyFilterWrap: { backgroundColor: t.bg, marginHorizontal: -16, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: t.border },
+    segmentWrap: { flexDirection: "row", backgroundColor: t.surface2, borderRadius: RADIUS.pill, padding: 3, gap: 2 },
     segmentBtn: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 8, borderRadius: RADIUS.pill },
     segmentBtnActive: { backgroundColor: t.accent, ...cardShadow },
     segmentText: { fontSize: 12, fontWeight: "700", color: t.muted },
     segmentTextActive: { color: "#fff" },
+
+    // ---- Invitations (bell, sheet, Family entry) ----
+    bellBadge: { position: "absolute", top: -3, right: -3, minWidth: 17, height: 17, paddingHorizontal: 4, borderRadius: 9, backgroundColor: t.danger, alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: t.bg },
+    bellBadgeText: { color: "#fff", fontSize: 9.5, fontWeight: "800" },
+    tabDot: { position: "absolute", top: 6, right: 17, width: 9, height: 9, borderRadius: 5, backgroundColor: t.danger, borderWidth: 1.5, borderColor: t.surface },
+    notifBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.45)", paddingTop: 60, paddingHorizontal: 14 },
+    notifPanel: { backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 16, elevation: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 14, shadowOffset: { width: 0, height: 8 } },
+    activityRow: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 11 },
+    activityIcon: { width: 30, height: 30, borderRadius: RADIUS.pill, alignItems: "center", justifyContent: "center" },
+    unreadDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: t.accent },
+    inviteEntry: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: t.accentSoft, borderWidth: 1, borderColor: `${t.accent}40`, borderRadius: RADIUS.lg, padding: 14 },
+    inviteEntryIcon: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    countPill: { minWidth: 24, height: 24, paddingHorizontal: 7, borderRadius: 12, backgroundColor: t.accent, alignItems: "center", justifyContent: "center" },
+    countPillText: { color: "#fff", fontSize: 12, fontWeight: "800" },
 
     // ---- Empty states ----
     emptyStateWrap: { alignItems: "center", paddingVertical: 36, paddingHorizontal: 20, gap: 10 },

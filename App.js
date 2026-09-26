@@ -471,16 +471,16 @@ export default Sentry.wrap(function DmartApp() {
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
   // lists (kept exactly as they were, untouched) rather than replacing them.
-  useEffect(() => {
-
-    if (!user || !appLoaded) return;
-    let cancelled = false;
-    (async () => {
-      setCloudSyncing(true);
-      try {
-        const { lists: cloudLists } = await fetchLists();
-        if (cancelled) return;
-        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+  // Callable by name (not just as an effect) so the foreground/reconnect
+  // listeners below can trigger the exact same reconciliation that runs on
+  // sign-in — e.g. picking up a member removal that happened while this
+  // device was backgrounded or offline and missed the live socket event.
+  const syncCloudLists = useRef(async () => {
+    if (!user) return;
+    setCloudSyncing(true);
+    try {
+      const { lists: cloudLists } = await fetchLists();
+      const cloudIds = new Set(cloudLists.map((cl) => cl.id));
 
         // Derived values come from listsRef (synchronously) — never from a
         // side-effect inside a setState updater, which React is free to run later.
@@ -545,15 +545,29 @@ export default Sentry.wrap(function DmartApp() {
       } catch (e) {
         setNotice(`Couldn't load your cloud lists: ${e?.message || "network error"}`);
       } finally {
-        if (!cancelled) setCloudSyncing(false);
+        setCloudSyncing(false);
       }
       try {
         const { received } = await fetchInvites();
-        if (!cancelled) setReceivedInvites(received || []);
+        setReceivedInvites(received || []);
       } catch { /* non-fatal — the invite banner just stays empty */ }
-    })();
-    return () => { cancelled = true; };
+  }).current;
+
+  useEffect(() => {
+    if (!user || !appLoaded) return;
+    syncCloudLists();
   }, [user?.id, appLoaded]);
+
+  // Re-run the same cloud reconciliation whenever the app comes back to the
+  // foreground — covers a member removal (or role change) that happened
+  // while this device was backgrounded and missed the live socket event.
+  useEffect(() => {
+    if (!user) return;
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") syncCloudLists();
+    });
+    return () => sub.remove();
+  }, [user, syncCloudLists]);
 
   // One invitation card (avatar, who/what, permission chip, Decline / Accept).
   // Shared by the bell's notification panel and the Family tab's invitations popup.
@@ -836,6 +850,9 @@ export default Sentry.wrap(function DmartApp() {
       pushActivity("info", grantedMsg);
     };
     socket.on("list:granted", onListGranted);
+    // Picks up anything missed (e.g. a removal) while this socket was
+    // disconnected — same reconciliation the sign-in/foreground paths use.
+    socket.on("connect", syncCloudLists);
 
     detach = () => {
       socket.off("item:created", onItemCreated);
@@ -851,6 +868,7 @@ export default Sentry.wrap(function DmartApp() {
       socket.off("invite:declined", onInviteDeclined);
       socket.off("invite:revoked", onInviteRevoked);
       socket.off("list:granted", onListGranted);
+      socket.off("connect", syncCloudLists);
     };
     };
     attach();
@@ -880,6 +898,9 @@ export default Sentry.wrap(function DmartApp() {
             if (listsRef.current.some((l) => l.id === data.listId)) { setSelectedListId(data.listId); setTab("home"); }
             else pendingSelectRef.current = data.listId;
           }
+          break;
+          case PUSH_TYPES.MEMBER_REMOVED:
+          refreshMembership();
           break;
 
         default:
@@ -3160,7 +3181,7 @@ function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
         </View>
 
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
-          Remember what to buy.
+          Remember what To buy.
         </Text>
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
           Shop smarter. Together.

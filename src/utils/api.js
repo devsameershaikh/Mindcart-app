@@ -49,7 +49,7 @@ const ENV = process.env.EXPO_PUBLIC_ENV;
 export function resolveApiBaseUrl() {
   if (ENV === "prod") {
     console.log("[api.js] Environment: PROD");
-    console.log("[api.js] API:", PROD_API_URL);
+    console.log("[api.js] full URL:", PROD_API_URL);
 
     console.log("[api.js] Environment:", ENV);
     console.log("[api.js] API length:", PROD_API_URL?.length);
@@ -65,8 +65,10 @@ console.log(
   if (ENV === "dev") {
     // console.log("[api.js] Environment: DEV");
     // console.log("[api.js] API:", DEV_LAN_IP);
+     console.log("[api.js] Environment: DEV");
+    console.log("[api.js] API:", DEV_LAN_IP);
 
-    return `http://${DEV_LAN_IP}:4000`;
+    return DEV_LAN_IP ;
   }
 
   throw new Error(`[api.js] Unknown environment: ${ENV}`);
@@ -80,6 +82,7 @@ let cachedToken = null;
 export async function getToken() {
   if (cachedToken) return cachedToken;
   cachedToken = await AsyncStorage.getItem(TOKEN_KEY);
+  console.log("[api.js] Retrieved token from AsyncStorage:", cachedToken);
   return cachedToken;
 }
 export async function setToken(token) {
@@ -96,13 +99,25 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     if (token) headers.Authorization = `Bearer ${token}`;
   }
   let res;
-  try {
-    res = await fetch(`${API_BASE_URL}${path}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-  } catch (networkError) {
+try {
+  const fullUrl = `${API_BASE_URL}${path}`;
+
+  console.log("========== API REQUEST ==========");
+  console.log("URL:", fullUrl);
+  console.log("Method:", method);
+  console.log("Headers:", headers);
+  console.log("Body:", body);
+  console.log("=================================");
+
+  res = await fetch(fullUrl, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+ console.log("-------------");
+  console.log(`[api.js] ${method} ${fullUrl} => ${res.status}`);
+   console.log("-------------");
+} catch (networkError) {
     // RN's fetch throws a generic "Network request failed" for anything
     // from "server not running" to "wrong IP for this device" to "phone
     // is actually offline". We can't tell those apart here, but for every

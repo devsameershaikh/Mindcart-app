@@ -22,7 +22,7 @@ import {
   LayoutAnimation,
   UIManager,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
 import * as Haptics from "expo-haptics";
 import {
@@ -49,7 +49,7 @@ import {
   changeMemberRole as changeMemberRoleApi, removeMember as removeMemberApi,
   getPendingSyncListIds, onSyncDropped,
 } from "./src/utils/api";
-import { getSocket, joinListRoom } from "./src/utils/socket";
+import { getSocket, joinListRoom, leaveListRoom } from "./src/utils/socket";
 import { Share2 } from "lucide-react-native";
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
 import * as Sentry from '@sentry/react-native';
@@ -361,6 +361,7 @@ function mergeCloudOnAccept(prev, cloudLists) {
 }
 
 export default Sentry.wrap(function DmartApp() {
+  const insets = useSafeAreaInsets();
   const [appLoaded, setAppLoaded] = useState(false);
   const hydrated = useRef(false); // guards the very first save-effect run
 
@@ -490,6 +491,7 @@ export default Sentry.wrap(function DmartApp() {
           setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
+          lostAccessIds.forEach((id) => leaveListRoom(id));
         }
         if (staleSeedIds.length) {
           setItemsByList((p) => { const n = { ...p }; staleSeedIds.forEach((id) => delete n[id]); return n; });
@@ -737,7 +739,10 @@ export default Sentry.wrap(function DmartApp() {
     const onListDeleted = ({ listId }) => {
       setLists((prev) => prev.filter((l) => l.id !== listId));
       setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+      setCloudMembersByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+      setPendingInvitesByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
       setSelectedListId((cur) => (cur === listId ? null : cur));
+      leaveListRoom(listId);
     };
     const onMemberChange = () => {
       // Cheapest correct way to keep member lists (roles, who's on the
@@ -768,6 +773,7 @@ export default Sentry.wrap(function DmartApp() {
           setCloudMembersByList((p) => { const n = { ...p }; lostIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostIds.includes(cur) ? null : cur));
           setNotice("You no longer have access to a list that was removed from your account.");
+          lostIds.forEach((id) => leaveListRoom(id));
         }
       }).catch(() => {});
     };
@@ -821,6 +827,28 @@ export default Sentry.wrap(function DmartApp() {
     socket.on("invite:accepted", onInviteAccepted);
     socket.on("invite:declined", onInviteDeclined);
 
+    // Echoes of MY OWN invite actions, so every device I'm signed in on
+    // (not just the one that made the API call) keeps its Pending Invites
+    // list correct in real time.
+    const onInviteSent = ({ invite }) => {
+      setPendingInvitesByList((prev) => {
+        const key = invite.inviteAllLists ? null : invite.listId;
+        if (!key) return prev; // an "all my lists" invite isn't scoped to one list's pending panel
+        const existing = prev[key] || [];
+        if (existing.some((inv) => inv.id === invite.id)) return prev;
+        return { ...prev, [key]: [...existing, invite] };
+      });
+    };
+    socket.on("invite:sent", onInviteSent);
+    const onInviteRevokedAck = ({ inviteId }) => {
+      setPendingInvitesByList((prev) => {
+        const next = {};
+        for (const [listId, invites] of Object.entries(prev)) next[listId] = invites.filter((inv) => inv.id !== inviteId);
+        return next;
+      });
+    };
+    socket.on("invite:revoked:ack", onInviteRevokedAck);
+
     // Push revoke back to the RECIPIENT live — previously they only found
     // out by tapping Accept/Decline and getting a stale "not found".
     const onInviteRevoked = ({ inviteId }) => {
@@ -866,6 +894,8 @@ export default Sentry.wrap(function DmartApp() {
       socket.off("invite:received", onInviteReceived);
       socket.off("invite:accepted", onInviteAccepted);
       socket.off("invite:declined", onInviteDeclined);
+      socket.off("invite:sent", onInviteSent);
+      socket.off("invite:revoked:ack", onInviteRevokedAck);
       socket.off("invite:revoked", onInviteRevoked);
       socket.off("list:granted", onListGranted);
       socket.off("connect", syncCloudLists);
@@ -1090,7 +1120,10 @@ useEffect(() => {
   // read `selectedList` before it existed, so it was always `undefined` and
   // switching lists while on the Family tab never refreshed.)
   useEffect(() => {
-    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
+    if (tab === "family" && selectedList?.role) {
+      refreshInvitesForList(selectedList.id);
+      refreshMembersForList(selectedList.id);
+    }
     // eslint-disable-next-line
   }, [tab, selectedList?.id]);
 
@@ -1347,6 +1380,24 @@ useEffect(() => {
       const mine = sent.filter((inv) => inv.status === "PENDING" && (inv.listId === listId || inv.inviteAllLists));
       setPendingInvitesByList((prev) => ({ ...prev, [listId]: mine }));
     } catch { /* best-effort — the members list still works without this */ }
+  }
+
+  // Pulls fresh members for THIS list from the server. Members were
+  // previously only ever set at sign-in or by a socket event (memberJoined/
+  // Removed/RoleChanged) — if either was missed (app was closed, the socket
+  // reconnected a beat late, the change came from a session that never had
+  // a live connection), the Family screen just kept showing whatever it
+  // last had for that list, with no way to become correct again short of a
+  // full app restart. Calling this the moment the Family tab is opened (or
+  // the selected list changes while already on it) makes "who's on this
+  // list" correct on every view, the same way refreshInvitesForList already
+  // does for pending invites.
+  async function refreshMembersForList(listId) {
+    try {
+      const { lists: cloudLists } = await fetchLists();
+      const fresh = cloudLists.find((cl) => cl.id === listId);
+      if (fresh) setCloudMembersByList((prev) => ({ ...prev, [listId]: fresh.members }));
+    } catch { /* best-effort — the last known member list stays on screen */ }
   }
 
   // role: "READ" | "WRITE". allLists=true invites as a standing family
@@ -2492,7 +2543,7 @@ function confirmStartNewTrip() {
 
       {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
           pinned to the bottom of the screen, not the top of the keyboard) ===== */}
-      <View style={s.tabBar}>
+      <View style={[s.tabBar, { paddingBottom: Math.max(4, insets.bottom) }]}>
         {[
           { id: "home", label: "Home", icon: Home },
           { id: "add", label: "Add", icon: ListPlus },
@@ -3181,7 +3232,7 @@ function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
         </View>
 
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
-          Remember what To buy.
+          Remember what to buy.
         </Text>
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
           Shop smarter. Together.

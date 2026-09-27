@@ -483,6 +483,14 @@ export default Sentry.wrap(function DmartApp() {
       const { lists: cloudLists } = await fetchLists();
       const cloudIds = new Set(cloudLists.map((cl) => cl.id));
 
+        // Join every cloud list's socket room so live updates (item/list
+        // changes from the owner, member changes, etc.) actually reach this
+        // device. Without this, a member only sees changes on the next full
+        // syncCloudLists() run (sign-in/foreground) instead of in real time —
+        // this call runs on sign-in, foreground, AND socket reconnect, so it
+        // has to (re)join every time, not just on first accept.
+        cloudLists.forEach((cl) => joinListRoom(cl.id));
+
         // Derived values come from listsRef (synchronously) — never from a
         // side-effect inside a setState updater, which React is free to run later.
         const { legacyLocal, lostAccessIds, staleSeedIds } = mergeCloudOnSignIn(listsRef.current, cloudLists);

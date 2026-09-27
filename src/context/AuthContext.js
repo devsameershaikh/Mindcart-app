@@ -88,6 +88,10 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
+  // Non-null while a cold-start retry is in flight, e.g. "Waking up the
+  // server… (2/4)" — lets the sign-in screen show real status instead of
+  // the button just sitting there through 3 silent retries.
+  const [signInStatus, setSignInStatus] = useState(null);
 
   // --------------------------------------------------
   // Restore existing MindCart session
@@ -159,14 +163,48 @@ export function AuthProvider({ children }) {
     try {
       console.log("Starting Google Sign-In...");
 
-      // Check Google Play Services
-      await GoogleSignin.hasPlayServices({
-        showPlayServicesUpdateDialog: true,
+      // Re-assert config right before use instead of trusting it landed at
+      // module-import time. On Android the native bridge call behind
+      // configure() isn't guaranteed to have finished by the time a user
+      // taps the button a split-second after a cold launch (e.g. right
+      // after "clear data"), so hasPlayServices()/signIn() can throw with
+      // nothing ever reaching the backend — which is why those failures
+      // show zero server-side logs. configure() is safe to call repeatedly.
+      GoogleSignin.configure({
+        webClientId: GOOGLE_WEB_CLIENT_ID,
+        offlineAccess: false,
       });
-      console.log("Google Play Services available");
 
-      // Open native Google account picker
-      const result = await GoogleSignin.signIn();
+      // The native call itself (not the backend call) gets its own short
+      // retry for the same cold-launch race — a couple hundred ms is
+      // usually enough for the bridge to settle, so this is quick, not a
+      // long backend-style backoff.
+      let result;
+      let lastNativeErr;
+      for (let i = 0; i < 3; i++) {
+        try {
+          await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+          console.log("Google Play Services available");
+          result = await GoogleSignin.signIn();
+          lastNativeErr = null;
+          break;
+        } catch (nativeErr) {
+          lastNativeErr = nativeErr;
+          // A real user action (cancel) or a real unavailability should
+          // surface immediately — only retry the ambiguous "something
+          // wasn't ready yet" cases.
+          if (
+            nativeErr?.code === statusCodes.SIGN_IN_CANCELLED ||
+            nativeErr?.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE ||
+            i === 2
+          ) {
+            throw nativeErr;
+          }
+          console.log(`Google Sign-In native call not ready yet, retrying (${i + 1}/3)...`);
+          await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+        }
+      }
+      if (lastNativeErr) throw lastNativeErr;
     
       // New versions of the library return user data inside `data`
       const idToken = result?.data?.idToken;
@@ -177,8 +215,12 @@ export function AuthProvider({ children }) {
 
       console.log("Google ID token received");
 
-      // Send Google ID token to MindCart backend
-      const response = await signInWithGoogle(idToken);
+      // Send Google ID token to MindCart backend — retries a few times with
+      // backoff if the backend is cold-starting (see withColdStartRetry in
+      // api.js) instead of failing on the first hit.
+      const response = await signInWithGoogle(idToken, (attempt, max) => {
+        setSignInStatus(`Waking up the server… (${attempt}/${max})`);
+      });
 
       const { token, user } = response;
 
@@ -233,6 +275,7 @@ export function AuthProvider({ children }) {
       };
     } finally {
       setSigningIn(false);
+      setSignInStatus(null);
     }
   }, [signingIn]);
 
@@ -285,6 +328,7 @@ export function AuthProvider({ children }) {
         user,
         authLoading,
         signingIn,
+        signInStatus,
         signIn,
         signOut,
 

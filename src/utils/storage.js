@@ -44,16 +44,17 @@ export const DEFAULT_LIST_ID = "list_groceries";
 // backend's src/routes/auth.js — that's what actually seeds Neon on
 // first sign-up; this copy only seeds the local, pre-sign-in placeholder
 // list so offline-first launch looks the same before an account exists.
-export const DEFAULT_ITEMS = [
-  { name: "Milk", category: "Dairy", unit: "liter" },
-  { name: "Rice", category: "Grains & Pulses", unit: "kg" },
-  { name: "Sugar", category: "Kitchen", unit: "kg" },
-  { name: "Cooking Oil", category: "Oil & Ghee", unit: "liter" },
-  { name: "Wheat Flour (Atta)", category: "Grains & Pulses", unit: "kg" },
-  { name: "Salt", category: "Spices & Masala", unit: "kg" },
-  { name: "Tea", category: "Beverages", unit: "packet" },
-  { name: "Onion", category: "Vegetables", unit: "kg" },
-];
+// export const DEFAULT_ITEMS = [
+//   { name: "Milk", category: "Dairy", unit: "liter" },
+//   { name: "Rice", category: "Grains & Pulses", unit: "kg" },
+//   { name: "Sugar", category: "Kitchen", unit: "kg" },
+//   { name: "Cooking Oil", category: "Oil & Ghee", unit: "liter" },
+//   { name: "Wheat Flour (Atta)", category: "Grains & Pulses", unit: "kg" },
+//   { name: "Salt", category: "Spices & Masala", unit: "kg" },
+//   { name: "Tea", category: "Beverages", unit: "packet" },
+//   { name: "Onion", category: "Vegetables", unit: "kg" },
+// ];
+export const DEFAULT_ITEMS = [];
 
 // function makeId(prefix = "id") {
 //   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;

@@ -193,8 +193,41 @@ export function initSync() {
 initSync();
 
 // ---------- Auth ----------
-export const signInWithGoogle = (idToken) =>
-  request("/auth/google", { method: "POST", body: { idToken }, auth: false });
+// Sign-in is the very first network call after a cold app start, which is
+// exactly when a Render free-tier backend is most likely to be asleep
+// (spins down after ~15 min idle, takes ~30-50s to wake on the next
+// request). Every other request either goes through attemptOrQueue
+// (which queues on failure) or is a background refresh where "try again
+// later" is fine — but sign-in is the one place a user is sitting there
+// watching it fail with no recourse but to keep tapping. Retry a few
+// times with backoff so a cold start resolves itself instead of looking
+// like a broken login.
+async function withColdStartRetry(fn, { attempts = 4, delaysMs = [3000, 6000, 10000], onRetry } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      // Only retry actual connectivity failures (cold start looks
+      // identical to "offline" from fetch's point of view) — a real 4xx/5xx
+      // from an awake server (bad token, validation, etc.) should surface
+      // immediately instead of being retried pointlessly.
+      if (!e.isOffline || i === attempts - 1) throw e;
+      onRetry?.(i + 1, attempts);
+      await new Promise((r) => setTimeout(r, delaysMs[i] ?? delaysMs[delaysMs.length - 1]));
+    }
+  }
+  throw lastErr;
+}
+
+// onRetry(attempt, maxAttempts) lets the caller show "Waking up the
+// server…" instead of a flat failure while this quietly retries.
+export const signInWithGoogle = (idToken, onRetry) =>
+  withColdStartRetry(
+    () => request("/auth/google", { method: "POST", body: { idToken }, auth: false }),
+    { onRetry }
+  );
 export const fetchMe = () => request("/auth/me");
 
 // ---------- Lists & items ----------

@@ -299,6 +299,9 @@ function SwipeDeleteAction({ t, onDelete }) {
 
 const ROLE_RANK = { OWNER: 0, WRITE: 1, READ: 2 };
 
+// Height of one row in the "Your lists" panel — the panel shows 3 rows, then scrolls.
+const LIST_ROW_HEIGHT = 66;
+
 function pickListId(cur, cloudLists, localLists, excludedIds = []) {
   const excluded = new Set(excludedIds);
   const cloudIds = new Set(cloudLists.map((l) => l.id));
@@ -459,6 +462,7 @@ export default Sentry.wrap(function DmartApp() {
   const notifAnim = useRef(new Animated.Value(0)).current;
   const [invitesOpen, setInvitesOpen] = useState(false); // "Pending invitations" popup (Family tab row)
   const invitesAnim = useRef(new Animated.Value(0)).current;
+  const listsAnim = useRef(new Animated.Value(0)).current; // "Your lists" panel fade/slide
   const [makingShareable, setMakingShareable] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
@@ -666,6 +670,17 @@ export default Sentry.wrap(function DmartApp() {
       .catch(() => {});
   }
   function closeInvites() { setInvitesOpen(false); }
+
+  // "Your lists" panel: drops down from the top, right under the list switcher.
+  function openListsModal() {
+    listsAnim.setValue(0);
+    setListsModalOpen(true);
+    Animated.timing(listsAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+  }
+  function closeListsModal() {
+    setListsModalOpen(false);
+    setConfirmDeleteListId(null);
+  }
 
   // Once the last pending invite is answered there's nothing left to show.
   useEffect(() => {
@@ -2036,7 +2051,7 @@ function confirmStartNewTrip() {
               </View>
               <Text style={s.brand}>MindCart</Text>
             </View>
-            <TouchableOpacity onPress={() => setListsModalOpen(true)} style={s.listSwitcher}>
+            <TouchableOpacity onPress={openListsModal} style={s.listSwitcher}>
             <ListChecks size={12} color={t.accent} />
             <Text style={s.listSwitcherText}>
               {selectedList ? selectedList.name : "Select list"}
@@ -2700,57 +2715,92 @@ function confirmStartNewTrip() {
           window on open/close, and that window transition is what was
           showing up as a flash/flicker every time a popup opened. */}
       {listsModalOpen && (
-        <KeyboardAvoidingView style={[s.overlayFill, { zIndex: 40, elevation: 20 }]} behavior={Platform.OS === "ios" ? "padding" : "height"}>
-        <Pressable style={s.modalBackdrop} onPress={() => setListsModalOpen(false)}>
-          <Pressable style={s.listsSheet} onPress={() => {}}>
-            <ScrollView keyboardShouldPersistTaps="handled">
-              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                <Text style={s.sheetTitle}>Your lists</Text>
-                <View style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
-                  <TouchableOpacity onPress={openNewListModal} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                    <Plus size={16} color={t.accent} />
-                    <Text style={{ color: t.accent, fontWeight: "700", fontSize: 13 }}>New list</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity onPress={() => setListsModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
-                </View>
-              </View>
-
-              <View style={{ gap: 8 }}>
-                {lists.map((list) => (
-                  <View key={list.id} style={[s.listRow, { borderColor: list.id === selectedListId ? t.accent : t.border }]}>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                      {/* <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
-                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
-                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
-                      </TouchableOpacity> */}
-                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
-                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>
-                          {list.name}
-                          {list.id === selectedListId ? "" : ""}
-                          {!!list.role && (cloudMembersByList[list.id]?.length || 0) > 1 ? "(Shared)" : ""}
-                        </Text>
-                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
-                      <TouchableOpacity onPress={() => setConfirmDeleteListId(list.id)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
-                    </View>
-                    {confirmDeleteListId === list.id && (
-                      <View style={s.confirmDeleteBox}>
-                        <Text style={{ fontSize: 12, color: t.text }}>Delete "{list.name}" and all its items? This can't be undone.</Text>
-                        <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-                          <TouchableOpacity onPress={() => deleteList(list.id)} style={[s.smallBtn, { backgroundColor: t.danger, borderColor: t.danger }]}><Text style={[s.smallBtnText, { color: "#fff" }]}>Delete</Text></TouchableOpacity>
-                          <TouchableOpacity onPress={() => setConfirmDeleteListId(null)} style={s.smallBtn}><Text style={s.smallBtnText}>Cancel</Text></TouchableOpacity>
-                        </View>
-                      </View>
-                    )}
+        <View style={[s.overlayFill, { zIndex: 40, elevation: 20 }]}>
+          <Pressable style={[s.listsBackdrop, { paddingTop: insets.top + 84 }]} onPress={closeListsModal}>
+            <Animated.View style={{ opacity: listsAnim, transform: [{ translateY: listsAnim.interpolate({ inputRange: [0, 1], outputRange: [-14, 0] }) }] }}>
+              <Pressable style={s.listsPanel} onPress={() => {}}>
+                {/* Header */}
+                <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 12 }}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={s.sheetTitle}>Your lists</Text>
+                    <Text style={{ color: t.muted, fontSize: 12, marginTop: 1 }}>
+                      {lists.length} {lists.length === 1 ? "list" : "lists"} · tap one to switch
+                    </Text>
                   </View>
-                ))}
-              </View>
+                  <TouchableOpacity onPress={closeListsModal} style={s.listActionBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <X size={16} color={t.muted} />
+                  </TouchableOpacity>
+                </View>
 
-            </ScrollView>
+                {/* Shows exactly 3 rows at a time; scrolls when there are more */}
+                <ScrollView
+                  style={{ maxHeight: LIST_ROW_HEIGHT * 3 + 8 * 2 }}
+                  contentContainerStyle={{ gap: 8 }}
+                  nestedScrollEnabled
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={lists.length > 3}
+                >
+                  {lists.map((list) => {
+                    const isCurrent = list.id === selectedListId;
+                    const itemCount = Object.keys(itemsByList[list.id] || {}).length;
+                    const isShared = !!list.role && (cloudMembersByList[list.id]?.length || 0) > 1;
+                    return (
+                      <View key={list.id} style={[s.listItem, isCurrent && s.listItemActive]}>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: LIST_ROW_HEIGHT - 22 }}>
+                          <TouchableOpacity
+                            activeOpacity={0.7}
+                            onPress={() => { setSelectedListId(list.id); closeListsModal(); }}
+                            style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 10 }}
+                          >
+                            <View style={[s.listItemIcon, isCurrent && { backgroundColor: t.accent }]}>
+                              {isCurrent ? <Check size={16} color="#fff" /> : <ListChecks size={16} color={t.accent} />}
+                            </View>
+                            <View style={{ flex: 1, minWidth: 0 }}>
+                              <Text numberOfLines={1} style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}</Text>
+                              <Text numberOfLines={1} style={{ fontSize: 11.5, color: isCurrent ? t.accent : t.muted, marginTop: 1 }}>
+                                {itemCount} {itemCount === 1 ? "item" : "items"}{isShared ? " · Shared" : ""}{isCurrent ? " · Current" : ""}
+                              </Text>
+                            </View>
+                          </TouchableOpacity>
+                          <TouchableOpacity onPress={() => startRenameList(list)} style={s.listActionBtn} accessibilityLabel="Rename list">
+                            <Pencil size={15} color={t.muted} />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            onPress={() => setConfirmDeleteListId(list.id)}
+                            style={[s.listActionBtn, { backgroundColor: t.dangerSoft }]}
+                            accessibilityLabel="Delete list"
+                          >
+                            <Trash2 size={15} color={t.danger} />
+                          </TouchableOpacity>
+                        </View>
+                        {confirmDeleteListId === list.id && (
+                          <View style={s.confirmDeleteBox}>
+                            <Text style={{ fontSize: 12, color: t.text }}>Delete "{list.name}" and all its items? This can't be undone.</Text>
+                            <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                              <TouchableOpacity onPress={() => deleteList(list.id)} style={[s.smallBtn, { backgroundColor: t.danger, borderColor: t.danger }]}><Text style={[s.smallBtnText, { color: "#fff" }]}>Delete</Text></TouchableOpacity>
+                              <TouchableOpacity onPress={() => setConfirmDeleteListId(null)} style={s.smallBtn}><Text style={s.smallBtnText}>Cancel</Text></TouchableOpacity>
+                            </View>
+                          </View>
+                        )}
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+
+                {lists.length > 3 && (
+                  <Text style={{ color: t.muted, fontSize: 11.5, textAlign: "center", marginTop: 8 }}>
+                    Scroll to see {lists.length - 3} more
+                  </Text>
+                )}
+
+                <TouchableOpacity onPress={openNewListModal} style={[s.addItemBtn, { marginLeft: 0, marginTop: 12, justifyContent: "center" }]}>
+                  <Plus size={16} color="#fff" />
+                  <Text style={{ color: "#fff", fontWeight: "700", fontSize: 14 }}>New list</Text>
+                </TouchableOpacity>
+              </Pressable>
+            </Animated.View>
           </Pressable>
-        </Pressable>
-        </KeyboardAvoidingView>
+        </View>
       )}
 
       {/* ===== Rename list popup — its own screen instead of an inline row,
@@ -3518,6 +3568,14 @@ function makeStyles(t) {
     popupCard: { width: "100%", maxWidth: 420, backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 20 },
     sheetTitle: { fontSize: 18, fontWeight: "800", color: t.text },
     listRow: { backgroundColor: t.surface, borderWidth: 1, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+
+    // ---- "Your lists" dropdown panel ----
+    listsBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", paddingHorizontal: 14 },
+    listsPanel: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 16, elevation: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 14, shadowOffset: { width: 0, height: 8 } },
+    listItem: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 10 },
+    listItemActive: { backgroundColor: t.accentSoft, borderColor: t.accent },
+    listItemIcon: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center" },
+    listActionBtn: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, alignItems: "center", justifyContent: "center" },
     confirmDeleteBox: { marginTop: 8, padding: 10, backgroundColor: t.dangerSoft, borderWidth: 1, borderColor: `${t.danger}55`, borderRadius: RADIUS.sm },
 
     // ---- New sections: Master Items / Family / Profile ----

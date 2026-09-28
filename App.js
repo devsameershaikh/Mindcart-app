@@ -51,7 +51,6 @@ import {
   getPendingSyncListIds, onSyncDropped,
 } from "./src/utils/api";
 import { getSocket, connectSocket, joinListRoom, leaveListRoom } from "./src/utils/socket";
-import { Share2 } from "lucide-react-native";
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
 import * as Sentry from '@sentry/react-native';
 import * as Updates from "expo-updates";
@@ -273,7 +272,14 @@ function AnimatedCheckbox({ checked, onPress, style }) {
     onPress();
   }
   return (
-    <TouchableOpacity onPress={handlePress} activeOpacity={0.8}>
+    <TouchableOpacity
+      onPress={handlePress}
+      activeOpacity={0.8}
+      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked: !!checked }}
+      accessibilityLabel={checked ? "Mark as not bought" : "Mark as bought"}
+    >
       <Animated.View style={[style, { transform: [{ scale }] }]}>
         {checked && <Check size={13} color="#fff" />}
       </Animated.View>
@@ -294,6 +300,21 @@ function SwipeDeleteAction({ t, onDelete }) {
       <Trash2 size={17} color="#fff" />
       <Text style={{ color: "#fff", fontSize: 10.5, fontWeight: "700" }}>Delete</Text>
     </TouchableOpacity>
+  );
+}
+
+// Left-swipe-to-reveal counterpart of SwipeDeleteAction: swipe right to mark bought / undo.
+function SwipeCheckAction({ t, checked }) {
+  return (
+    <View
+      style={{
+        backgroundColor: t.accent, justifyContent: "center", alignItems: "center",
+        width: 76, borderRadius: RADIUS.md, marginRight: 8, gap: 3,
+      }}
+    >
+      <Check size={17} color="#fff" />
+      <Text style={{ color: "#fff", fontSize: 10.5, fontWeight: "700" }}>{checked ? "Undo" : "Bought"}</Text>
+    </View>
   );
 }
 
@@ -384,6 +405,8 @@ export default Sentry.wrap(function DmartApp() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
+  const [noteOpen, setNoteOpen] = useState({}); // itemId -> true while its (optional) note box is open
+  const swipeRefs = useRef({}); // itemId -> Swipeable, so a right-swipe can close itself after acting
   const [pendingDelete, setPendingDelete] = useState(null); // { item, listId, timer }
   const pendingDeleteRef = useRef(null); // always the live entry, so back-to-back deletes can't miss it
   pendingDeleteRef.current = pendingDelete;
@@ -2071,11 +2094,11 @@ function confirmStartNewTrip() {
                 )}
               </TouchableOpacity>
             )}
-            <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf}>
+            <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf} accessibilityLabel="Export list as PDF">
               {exportingPdf ? (
                 <ActivityIndicator size="small" color={t.text} />
               ) : (
-                <Share2 size={16} color={t.text} />
+                <FileDown size={17} color={t.text} />
               )}
             </TouchableOpacity>
             {/* <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
@@ -2084,14 +2107,6 @@ function confirmStartNewTrip() {
           </View>
         </View>
 
-        {pendingDelete ? (
-          <View style={s.undoRow}>
-            <Text style={{ color: t.text, fontSize: 12.5 }}>Deleted "{pendingDelete.item.name}"</Text>
-            <TouchableOpacity onPress={undoDelete}>
-              <Text style={{ color: t.accent, fontWeight: "700", fontSize: 12.5 }}>Undo</Text>
-            </TouchableOpacity>
-          </View>
-        ) : null}
 
           {showSearch && (
             <View style={s.searchWrap}>
@@ -2110,16 +2125,30 @@ function confirmStartNewTrip() {
         {tab === "home" && (
           <View style={{ paddingHorizontal: 16 }}>
               <View style={s.summaryCard}>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 18, alignItems: "center" }}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                    <CurrencyGlyph symbol={currency.symbol} color={t.accent} />
-                    <Text style={{ color: t.accent, fontSize: 13 }}>{boughtTotal.toFixed(0)} bought ({boughtItems.length})</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={{ color: t.text, fontWeight: "800", fontSize: 15 }}>
+                      {boughtItems.length} of {boughtItems.length + pendingItems.length} bought
+                    </Text>
+                    <Text style={{ color: t.muted, fontSize: 12, marginTop: 2 }} numberOfLines={1}>
+                      {currency.symbol}{boughtTotal.toFixed(0)} spent · {currency.symbol}{pendingTotal.toFixed(0)} to go
+                    </Text>
                   </View>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                    <CurrencyGlyph symbol={currency.symbol} color={t.accent2} />
-                    <Text style={{ color: t.accent2, fontSize: 13 }}>{pendingTotal.toFixed(0)} pending ({pendingItems.length})</Text>
+                  <View style={{ alignItems: "flex-end" }}>
+                    <Text style={{ color: t.muted, fontSize: 11, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.4 }}>Total</Text>
+                    <Text style={{ color: t.text, fontWeight: "800", fontSize: 16 }}>{currency.symbol}{(boughtTotal + pendingTotal).toFixed(0)}</Text>
                   </View>
-                  <Text style={{ color: t.text, fontWeight: "700", marginLeft: "auto", fontSize: 13 }}>Total {currency.symbol}{(boughtTotal + pendingTotal).toFixed(0)}</Text>
+                  <TouchableOpacity
+                    onPress={requestNewTrip}
+                    disabled={!tripDirty}
+                    accessibilityLabel="Start new trip"
+                    style={[s.tripIconBtn, !tripDirty && { opacity: 0.4 }]}
+                  >
+                    <RotateCcw size={16} color={tripDirty ? t.accent : t.muted} />
+                  </TouchableOpacity>
+                </View>
+                <View style={s.progressTrack}>
+                  <View style={[s.progressFill, { width: `${(boughtItems.length + pendingItems.length) > 0 ? Math.round((boughtItems.length / (boughtItems.length + pendingItems.length)) * 100) : 0}%` }]} />
                 </View>
 
                 {/* <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10 }}>
@@ -2153,14 +2182,6 @@ function confirmStartNewTrip() {
                   );
                 })() : null} */}
 
-                <TouchableOpacity
-                  onPress={requestNewTrip}
-                  disabled={!tripDirty}
-                  style={[s.newTripBtn, !tripDirty && { borderColor: t.border, opacity: 0.5 }]}
-                >
-                  <RotateCcw size={13} color={tripDirty ? t.accent : t.muted} />
-                  <Text style={{ color: tripDirty ? t.accent : t.muted, fontWeight: "600", fontSize: 12.5 }}>Start new trip</Text>
-                </TouchableOpacity>
               </View>
             <View style={s.stickyFilterWrap}>
               <View style={s.segmentWrap}>
@@ -2263,7 +2284,7 @@ function confirmStartNewTrip() {
           </View>
         )}
 
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: pendingDelete ? 88 : 24 }} keyboardShouldPersistTaps="handled">
           {tab === "home" && (
             <>
               {items.length === 0 && (
@@ -2293,101 +2314,148 @@ function confirmStartNewTrip() {
                   if (homeFilter === "pending") return !i.checked;
                   if (homeFilter === "bought") return i.checked;
                   return true;
-                });
+                }).sort((x, y) => Number(!!x.checked) - Number(!!y.checked)); // bought items sink to the bottom (stable sort keeps the rest in order)
                 if (catItems.length === 0) return null;
                 const isCollapsed = collapsed[cat];
+                const catTotal = items.filter((i) => i.category === cat && !i.skipped).length;
+                const catDone = items.filter((i) => i.category === cat && !i.skipped && i.checked).length;
                 return (
                   <View key={cat} style={{ marginTop: 14 }}>
                     <TouchableOpacity onPress={() => { animateListChange(); toggleCollapse(cat); }} style={s.catHeader}>
-                      <Text style={s.catHeaderText}>{cat}</Text>
+                      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                        <Text style={s.catHeaderText}>{cat}</Text>
+                        <View style={[s.catCountPill, catDone === catTotal && { backgroundColor: t.accentSoft }]}>
+                          <Text style={{ color: catDone === catTotal ? t.accent : t.muted, fontSize: 11, fontWeight: "800" }}>{catDone}/{catTotal}</Text>
+                        </View>
+                      </View>
                       <ChevronDown size={15} color={t.muted} style={{ transform: [{ rotate: isCollapsed ? "-90deg" : "0deg" }] }} />
                     </TouchableOpacity>
                     {!isCollapsed && (
                       <View style={{ gap: 8, marginTop: 6 }}>
-                        {catItems.map((item) => (
+                        {catItems.map((item) => {
+                          const qtyNum = Number(item.qty) || 0;
+                          const hasNoteText = !!noteValue(item).trim();
+                          const showNote = hasNoteText || !!noteOpen[item.id];
+                          return (
                           <Swipeable
                             key={item.id}
+                            ref={(r) => { if (r) swipeRefs.current[item.id] = r; else delete swipeRefs.current[item.id]; }}
                             overshootRight={false}
+                            overshootLeft={false}
                             renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                            renderLeftActions={() => <SwipeCheckAction t={t} checked={item.checked} />}
+                            onSwipeableOpen={(direction) => {
+                              if (direction === "left") {
+                                updateItem(item.id, { checked: !item.checked });
+                                swipeRefs.current[item.id]?.close();
+                              }
+                            }}
                           >
                           <View style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
+                            {/* Row 1: checkbox, emoji, name + unit, quantity stepper */}
                             <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
                               <AnimatedCheckbox
                                 checked={item.checked}
                                 onPress={() => updateItem(item.id, { checked: !item.checked })}
                                 style={[s.checkbox, { borderColor: item.checked ? t.accent : t.border, backgroundColor: item.checked ? t.accent : "transparent" }]}
                               />
-                              <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
+                              <Text style={{ fontSize: 18 }}>{getIcon(item.name)}</Text>
                               <View style={{ flex: 1, minWidth: 0 }}>
-                                <Text style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
-                                <Text style={s.itemUnit}>{item.unit}</Text>
+                                <Text numberOfLines={1} style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
+                                <Text numberOfLines={1} style={s.itemUnit}>{item.unit}</Text>
                               </View>
-                             <TouchableOpacity
-                              onPress={() => {
+                              <View style={s.stepper}>
+                                <TouchableOpacity
+                                  onPress={() => {
                                     tapHaptic(Haptics.ImpactFeedbackStyle.Light);
-                                    updateItem(item.id, { qty: Math.max(0, Number(item.qty) - 1) });
-                                   }}
-                                  disabled={Number(item.qty) <= 0}
-                                  style={[
-                                    s.qtyBtn,
-                                    Number(item.qty) <= 0 && { opacity: 0.5 }
-                                  ]}
+                                    updateItem(item.id, { qty: Math.max(0, qtyNum - 1) });
+                                  }}
+                                  disabled={qtyNum <= 0}
+                                  hitSlop={{ top: 6, bottom: 6, left: 4, right: 2 }}
+                                  accessibilityLabel={`Decrease quantity of ${item.name}`}
+                                  style={[s.qtyBtn, qtyNum <= 0 && { opacity: 0.4 }]}
                                 >
-                                <Text style={s.qtyBtnText}>−</Text>
-                              </TouchableOpacity>
-                              <Text style={s.qtyValue}>{item.qty}</Text>
-                              <TouchableOpacity
-                                onPress={() => {
-                                  tapHaptic(Haptics.ImpactFeedbackStyle.Light);
-                                  updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) });
+                                  <Text style={s.qtyBtnText}>−</Text>
+                                </TouchableOpacity>
+                                <Text style={s.qtyValue}>{qtyNum}</Text>
+                                <TouchableOpacity
+                                  onPress={() => {
+                                    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                    updateItem(item.id, { qty: Math.min(999, qtyNum + 1) });
+                                  }}
+                                  disabled={qtyNum >= 999}
+                                  hitSlop={{ top: 6, bottom: 6, left: 2, right: 4 }}
+                                  accessibilityLabel={`Increase quantity of ${item.name}`}
+                                  style={[s.qtyBtn, qtyNum >= 999 && { opacity: 0.4 }]}
+                                >
+                                  <Text style={s.qtyBtnText}>+</Text>
+                                </TouchableOpacity>
+                              </View>
+                            </View>
+
+                            {/* Row 2 (always visible): price, note, skip */}
+                            <View style={s.itemDetailsRow}>
+                              <TextInput
+                                keyboardType="decimal-pad"
+                                placeholder={qtyNum > 0 ? currency.symbol : "Qty first"}
+                                placeholderTextColor={t.muted}
+                                value={priceValue(item)}
+                                editable={qtyNum > 0}
+                                onChangeText={(v) => {
+                                  const numericValue = v.replace(/[^0-9.]/g, "");
+                                  // Allow only one decimal point
+                                  const parts = numericValue.split(".");
+                                  const cleanedValue =
+                                    parts.length > 2
+                                      ? parts[0] + "." + parts.slice(1).join("")
+                                      : numericValue;
+                                  setPriceDrafts((prev) => ({ ...prev, [item.id]: cleanedValue }));
                                 }}
-                                disabled={Number(item.qty) >= 999}
-                                style={[s.qtyBtn, Number(item.qty) >= 999 && { opacity: 0.5 }]}
-                              >
-                                <Text style={s.qtyBtnText}>+</Text>
-                              </TouchableOpacity>
-                           <TextInput
-                            keyboardType="decimal-pad"
-                            placeholder={currency.symbol}
-                            placeholderTextColor={t.muted}
-                            value={priceValue(item)}
-                            editable={Number(item.qty) > 0}
-                            onChangeText={(v) => {
-                              const numericValue = v.replace(/[^0-9.]/g, "");
-
-                              // Allow only one decimal point
-                              const parts = numericValue.split(".");
-                              const cleanedValue =
-                                parts.length > 2
-                                  ? parts[0] + "." + parts.slice(1).join("")
-                                  : numericValue;
-
-                              setPriceDrafts((prev) => ({
-                                ...prev,
-                                [item.id]: cleanedValue,
-                              }));
-                            }}
-                            onBlur={() => commitPrice(item)}
-                            style={s.priceInput}
-                          />
+                                onBlur={() => commitPrice(item)}
+                                style={[s.priceInput, { width: 84, paddingVertical: 8 }, qtyNum <= 0 && { opacity: 0.5 }]}
+                              />
+                              {/* Note is optional: shows as a small "Add note" button until tapped (or if a note already exists) */}
+                              {showNote ? (
+                                <TextInput
+                                  autoFocus={!!noteOpen[item.id] && !hasNoteText}
+                                  value={noteValue(item)}
+                                  onChangeText={(v) => setNoteDrafts((prev) => ({ ...prev, [item.id]: v }))}
+                                  onBlur={() => {
+                                    const draft = noteDrafts[item.id];
+                                    const finalVal = draft !== undefined ? draft.trim() : (item.note || "").trim();
+                                    commitNote(item);
+                                    if (!finalVal) setNoteOpen((prev) => { const n = { ...prev }; delete n[item.id]; return n; });
+                                  }}
+                                  maxLength={60}
+                                  placeholder="Note (e.g. only Amul)"
+                                  placeholderTextColor={t.muted}
+                                  style={[s.input, { flex: 1, minWidth: 0, paddingVertical: 8, fontSize: 12.5 }]}
+                                />
+                              ) : (
+                                <TouchableOpacity
+                                  onPress={() => setNoteOpen((prev) => ({ ...prev, [item.id]: true }))}
+                                  accessibilityLabel={`Add a note to ${item.name}`}
+                                  style={s.addNoteBtn}
+                                >
+                                  <Pencil size={13} color={t.muted} />
+                                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "600" }}>Add note</Text>
+                                </TouchableOpacity>
+                              )}
                               {!item.checked && (
-                                <TouchableOpacity onPress={() => updateItem(item.id, { skipped: true })} style={{ padding: 2 }}>
-                                  <EyeOff size={15} color={t.muted} />
+                                <TouchableOpacity
+                                  onPress={() => updateItem(item.id, { skipped: true })}
+                                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                                  accessibilityLabel={`Skip ${item.name} this time`}
+                                  style={s.skipIconBtn}
+                                >
+                                  <EyeOff size={17} color={t.muted} />
                                 </TouchableOpacity>
                               )}
                             </View>
-                            <TextInput
-                              value={noteValue(item)}
-                              onChangeText={(v) => setNoteDrafts((prev) => ({ ...prev, [item.id]: v }))}
-                              onBlur={() => commitNote(item)}
-                              maxLength={60}
-                              placeholder="Add a note (e.g. only Amul, small pack)"
-                              placeholderTextColor={t.muted}
-                              style={s.noteInput}
-                            />
                           </View>
                           </Swipeable>
-                        ))}
+                          );
+                        })}
                       </View>
                     )}
                   </View>
@@ -2458,7 +2526,7 @@ function confirmStartNewTrip() {
                           {item.category} · {item.unit}
                         </Text>
                       </View>
-                      <TouchableOpacity onPress={() => startEditItem(item)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
+                      <TouchableOpacity onPress={() => startEditItem(item)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel={`Edit ${item.name}`} style={{ padding: 8 }}><Pencil size={17} color={t.muted} /></TouchableOpacity>
                     </View>
                   </View>
                   </Swipeable>
@@ -2592,7 +2660,7 @@ function confirmStartNewTrip() {
                   {/* <TouchableOpacity onPress={() => toggleReminders(!reminderSettings.enabled)} style={[s.toggleTrack, reminderSettings.enabled && s.toggleTrackOn]}>
                     <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
                   </TouchableOpacity> */}
-                  <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
+                  <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "700" }}>
                      Coming Soon
                     </Text>
                 </View>
@@ -2687,6 +2755,21 @@ function confirmStartNewTrip() {
             </Animated.View>
           );
         })() : null}
+
+        {/* ===== Floating "Undo" snackbar — overlays, never pushes content ===== */}
+        {pendingDelete ? (
+          <View pointerEvents="box-none" style={s.snackbarWrap}>
+            <View style={s.snackbar}>
+              <Trash2 size={15} color={t.muted} />
+              <Text numberOfLines={1} style={{ flex: 1, color: t.text, fontSize: 13, fontWeight: "600" }}>
+                Deleted "{pendingDelete.item.name}"
+              </Text>
+              <TouchableOpacity onPress={undoDelete} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} style={s.snackbarUndo}>
+                <Text style={{ color: t.accent, fontWeight: "800", fontSize: 13 }}>Undo</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        ) : null}
       </KeyboardAvoidingView>
 
       {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
@@ -2744,6 +2827,7 @@ function confirmStartNewTrip() {
                     const isCurrent = list.id === selectedListId;
                     const itemCount = Object.keys(itemsByList[list.id] || {}).length;
                     const isShared = !!list.role && (cloudMembersByList[list.id]?.length || 0) > 1;
+                    const listTotal = Object.values(itemsByList[list.id] || {}).reduce((sum, it) => sum + safeAmount(it.price), 0);
                     return (
                       <View key={list.id} style={[s.listItem, isCurrent && s.listItemActive]}>
                         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: LIST_ROW_HEIGHT - 22 }}>
@@ -2758,7 +2842,7 @@ function confirmStartNewTrip() {
                             <View style={{ flex: 1, minWidth: 0 }}>
                               <Text numberOfLines={1} style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}</Text>
                               <Text numberOfLines={1} style={{ fontSize: 11.5, color: isCurrent ? t.accent : t.muted, marginTop: 1 }}>
-                                {itemCount} {itemCount === 1 ? "item" : "items"}{isShared ? " · Shared" : ""}{isCurrent ? " · Current" : ""}
+                                {itemCount} {itemCount === 1 ? "item" : "items"}{listTotal > 0 ? ` · ${currency.symbol}${listTotal.toFixed(0)}` : ""}{isShared ? " · Shared" : ""}{isCurrent ? " · Current" : ""}
                               </Text>
                             </View>
                           </TouchableOpacity>
@@ -3522,7 +3606,7 @@ function makeStyles(t) {
     searchWrap: { marginHorizontal: 18, marginTop: 16, marginBottom: 8, position: "relative", justifyContent: "center" },
     searchIcon: { position: "absolute", left: 14, zIndex: 1 },
     searchInput: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 11, paddingLeft: 38, paddingRight: 12, color: t.text, fontSize: 14 },
-    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 18, marginTop: 4, ...cardShadow },
+    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 14, marginTop: 4, ...cardShadow },
     newTripBtn: { marginTop: 14, backgroundColor: t.accentSoft, borderRadius: RADIUS.md, padding: 10, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
     emptyText: { textAlign: "center", color: t.muted, fontSize: 13, paddingVertical: 24 },
     catHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6, paddingHorizontal: 2 },
@@ -3531,9 +3615,20 @@ function makeStyles(t) {
     checkbox: { width: 22, height: 22, borderRadius: 7, borderWidth: 2, alignItems: "center", justifyContent: "center" },
     itemName: { fontSize: 14, fontWeight: "700", color: t.text },
     itemUnit: { fontSize: 11.5, color: t.muted, marginTop: 1 },
-    qtyBtn: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 8, width: 24, height: 24, alignItems: "center", justifyContent: "center" },
-    qtyBtnText: { color: t.text, fontSize: 15, fontWeight: "700" },
-    qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "700", color: t.text },
+    stepper: { flexDirection: "row", alignItems: "center", backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.pill, padding: 2 },
+    qtyBtn: { backgroundColor: t.surface, borderRadius: RADIUS.pill, width: 32, height: 32, alignItems: "center", justifyContent: "center" },
+    qtyBtnText: { color: t.text, fontSize: 18, fontWeight: "700", marginTop: -1 },
+    qtyValue: { minWidth: 26, textAlign: "center", fontSize: 14, fontWeight: "800", color: t.text },
+    addNoteBtn: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 9, borderRadius: RADIUS.md, borderWidth: 1, borderStyle: "dashed", borderColor: t.border },
+    itemDetailsRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10 },
+    skipIconBtn: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, alignItems: "center", justifyContent: "center" },
+    catCountPill: { backgroundColor: t.surface2, borderRadius: RADIUS.pill, paddingHorizontal: 8, paddingVertical: 2 },
+    tripIconBtn: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center" },
+    progressTrack: { height: 6, borderRadius: 3, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, overflow: "hidden", marginTop: 12 },
+    progressFill: { height: "100%", borderRadius: 3, backgroundColor: t.accent },
+    snackbarWrap: { position: "absolute", left: 16, right: 16, bottom: 12, zIndex: 90, elevation: 12 },
+    snackbar: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 10, paddingLeft: 14, paddingRight: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 6 } },
+    snackbarUndo: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft },
 
     priceInput: { width: 58, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
     menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "transparent", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },

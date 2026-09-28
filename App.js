@@ -37,6 +37,7 @@ import {
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
 import { getTheme, RADIUS } from "./src/utils/theme";
 import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, clampQty, clampPrice } from "./src/utils/helpers";
+import { buildHistory, getSuggestions } from "./src/utils/suggestions";
 import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
 import SimpleSelect from "./src/components/Simpleselect";
@@ -1147,6 +1148,14 @@ useEffect(() => {
     return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }, [itemsByList, selectedList?.id]);
 
+  // Add-item autocomplete data (must stay above the early `return <Loader>` — hooks can't be conditional).
+  const suggestionHistory = useMemo(() => buildHistory(itemsByList), [itemsByList]);
+  const currentSegment = fName.split(",").pop();
+  const nameSuggestions = useMemo(() => {
+    const existing = new Set(items.map((i) => `${i.category}|${String(i.name).trim().toLowerCase()}`));
+    return getSuggestions(currentSegment, suggestionHistory, existing, 6);
+  }, [currentSegment, suggestionHistory, items]);
+
   // Keep selectedListId pointing at a real list, so every action that reads
   // it (add / edit / delete item, new trip…) targets the list on screen.
   useEffect(() => {
@@ -1647,6 +1656,22 @@ useEffect(() => {
   }
 
   // ---------- Item management ----------
+  // ---- Add-item autocomplete handler (memoized suggestions live next to `items`, above the early return) ----
+
+  function applySuggestion(sug) {
+    const parts = fName.split(",");
+    const isSingle = parts.length === 1;
+    parts[parts.length - 1] = (isSingle ? "" : " ") + sug.name;
+    setFName(parts.join(","));
+    setItemNameError("");
+    if (isSingle) {
+      // Fill category + unit for a single item; keep the user's own choice for multi-add.
+      if (sug.category && categories.includes(sug.category)) { setFCategory(sug.category); setCategoryTouched(true); }
+      if (sug.unit && UNITS.includes(sug.unit)) setFUnit(sug.unit);
+    }
+    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+  }
+
   async function addItem() {
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (!fName.trim()) {
@@ -2155,44 +2180,66 @@ function confirmStartNewTrip() {
 
               <View style={s.addCard}>
                 <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <TextInput
-                    value={fName}
-                    maxLength={200}
-                    onChangeText={(val) => {
-                      setFName(val);
-                      if (itemNameError) setItemNameError("");
-                      if (!categoryTouched && !val.includes(",")) {
-                        const guess = suggestCategory(val);
-                        if (guess) setFCategory(guess);
-                      }
-                    }}
-                    onSubmitEditing={addItem}
-                    placeholder="Item name"
-                    placeholderTextColor={t.muted}
-                    style={[s.input, { flex: 1, minWidth: 140, borderColor: itemNameError ? t.danger : t.border }]}
-                  />
-                  {/* <TouchableOpacity onPress={openScanner} style={s.iconBtn} disabled={scanLoading}>
-                    <Barcode size={16} color={scanLoading ? t.muted : t.text} />
-                  </TouchableOpacity> */}
-                  <CategorySelect
-                    value={fCategory}
-                    categories={categories}
-                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
-                    onAddCategory={addCategory}
-                    t={t}
-                    style={{ flex: 1, minWidth: 100 }}
-                  />
-                </View>
+                {/* Row 1: item name on its own line */}
+                <TextInput
+                  value={fName}
+                  maxLength={200}
+                  onChangeText={(val) => {
+                    setFName(val);
+                    if (itemNameError) setItemNameError("");
+                    if (!categoryTouched && !val.includes(",")) {
+                      const guess = suggestCategory(val);
+                      if (guess) setFCategory(guess);
+                    }
+                  }}
+                  onSubmitEditing={addItem}
+                  placeholder="Item name"
+                  placeholderTextColor={t.muted}
+                  style={[s.input, { borderColor: itemNameError ? t.danger : t.border }]}
+                />
+
+                {/* Suggestions while typing (on-device: your history first, then common items) */}
+                {nameSuggestions.length > 0 && (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    keyboardShouldPersistTaps="always"
+                    style={{ marginTop: 8, flexGrow: 0 }}
+                    contentContainerStyle={{ gap: 8 }}
+                  >
+                    {nameSuggestions.map((sug) => (
+                      <TouchableOpacity
+                        key={sug.name}
+                        onPress={() => applySuggestion(sug)}
+                        style={{ flexDirection: "row", alignItems: "center", gap: 6, borderWidth: 1, borderColor: t.border, backgroundColor: t.surface2, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 12 }}
+                      >
+                        <Text style={{ fontSize: 14 }}>{getIcon(sug.name)}</Text>
+                        <Text style={{ color: t.text, fontSize: 13, fontWeight: "600" }}>{sug.name}</Text>
+                        <Text style={{ color: t.muted, fontSize: 11 }}>{sug.category}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                )}
+
                 {itemNameError ? (
                   <View style={s.inlineError} accessibilityLiveRegion="polite">
                     <AlertCircle size={14} color={t.danger} style={{ marginTop: 1 }} />
                     <Text style={s.inlineErrorText}>{itemNameError}</Text>
                   </View>
                 ) : null}
+
+                {/* Row 2: category + unit + Add in one line */}
                 <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
-                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
-                  <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
+                  <CategorySelect
+                    value={fCategory}
+                    categories={categories}
+                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
+                    onAddCategory={addCategory}
+                    t={t}
+                    style={{ flex: 1.4, minWidth: 0 }}
+                  />
+                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} style={{ flex: 1, minWidth: 0 }} />
+                  <TouchableOpacity onPress={addItem} style={[s.addItemBtn, { marginLeft: 0 }]}>
                     <Plus size={15} color="#fff" />
                     <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
                   </TouchableOpacity>
@@ -3318,7 +3365,7 @@ function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
         </View>
 
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
-          Remember what to Buy
+          Remember what To buy
         </Text>
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
           Shop smarter. Together.

@@ -3318,7 +3318,7 @@ function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
         </View>
 
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
-          Remember what To buy...
+          Remember what to Buy
         </Text>
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
           Shop smarter. Together.

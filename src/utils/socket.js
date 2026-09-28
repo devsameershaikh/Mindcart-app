@@ -9,7 +9,13 @@ export async function connectSocket() {
   if (socket) return socket;
   const token = await getToken();
   if (!token) return null;
-  socket = io(API_BASE_URL, { auth: { token }, transports: ["websocket"] });
+  socket = io(API_BASE_URL, {
+    auth: { token },
+    transports: ["websocket"],
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 10000, // backoff instead of hammering the server
+  });
 
   socket.on("connect", () => console.log("[socket] connected", socket.id));
   socket.on("connect_error", (err) => console.log("[socket] connect_error:", err.message));
@@ -24,7 +30,7 @@ export async function connectSocket() {
     // kick -- so reconnect ourselves rather than sitting dead until the
     // app is restarted.
     if (reason === "io server disconnect") {
-      socket.connect();
+      setTimeout(() => socket && !socket.connected && socket.connect(), 2000);
     }
   });
 

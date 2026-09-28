@@ -49,7 +49,7 @@ const ENV = process.env.EXPO_PUBLIC_ENV;
 export function resolveApiBaseUrl() {
   if (ENV === "prod") {
     console.log("[api.js] Environment: PROD");
-    console.log("[api.js] API:", PROD_API_URL);
+    console.log("[api.js] full URL:", PROD_API_URL);
 
     console.log("[api.js] Environment:", ENV);
     console.log("[api.js] API length:", PROD_API_URL?.length);
@@ -65,8 +65,10 @@ console.log(
   if (ENV === "dev") {
     // console.log("[api.js] Environment: DEV");
     // console.log("[api.js] API:", DEV_LAN_IP);
+     console.log("[api.js] Environment: DEV");
+    console.log("[api.js] API:", DEV_LAN_IP);
 
-    return `http://${DEV_LAN_IP}:4000`;
+    return DEV_LAN_IP ;
   }
 
   throw new Error(`[api.js] Unknown environment: ${ENV}`);
@@ -80,6 +82,7 @@ let cachedToken = null;
 export async function getToken() {
   if (cachedToken) return cachedToken;
   cachedToken = await AsyncStorage.getItem(TOKEN_KEY);
+  console.log("[api.js] Retrieved token from AsyncStorage:", cachedToken);
   return cachedToken;
 }
 export async function setToken(token) {
@@ -96,22 +99,51 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     if (token) headers.Authorization = `Bearer ${token}`;
   }
   let res;
-  try {
-    res = await fetch(`${API_BASE_URL}${path}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-  } catch (networkError) {
+  // Render's free tier (see start.sh) can take a good while to wake a
+  // cold container, and RN's fetch has no built-in timeout — without one,
+  // a slow/cold backend leaves this call hanging indefinitely instead of
+  // failing, which is exactly what stalls anything gated on it (e.g. the
+  // post-signin loader). 15s is generous for a warm backend and still
+  // bounded for a cold one; callers already treat any rejection here the
+  // same way (offline/queue-and-retry for writes, error notice for reads).
+  const REQUEST_TIMEOUT_MS = 15000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+try {
+  const fullUrl = `${API_BASE_URL}${path}`;
+
+  console.log("========== API REQUEST ==========");
+  console.log("URL:", fullUrl);
+  console.log("Method:", method);
+  console.log("Headers:", headers);
+  console.log("Body:", body);
+  console.log("=================================");
+
+  res = await fetch(fullUrl, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: controller.signal,
+  });
+ console.log("-------------");
+  console.log(`[api.js] ${method} ${fullUrl} => ${res.status}`);
+   console.log("-------------");
+} catch (networkError) {
     // RN's fetch throws a generic "Network request failed" for anything
     // from "server not running" to "wrong IP for this device" to "phone
     // is actually offline". We can't tell those apart here, but for every
     // mutating call the caller treats this the same way regardless: queue
     // it and retry later rather than losing the change.
+    const isTimeout = networkError?.name === "AbortError";
     const err = new Error(
-      `Offline. Changes will sync when you’re back online`);
+      isTimeout
+        ? "The server is taking too long to respond. Changes will sync when it's reachable."
+        : `Offline. Changes will sync when you’re back online`);
     err.isOffline = true;
+    err.isTimeout = isTimeout;
     throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
@@ -178,8 +210,41 @@ export function initSync() {
 initSync();
 
 // ---------- Auth ----------
-export const signInWithGoogle = (idToken) =>
-  request("/auth/google", { method: "POST", body: { idToken }, auth: false });
+// Sign-in is the very first network call after a cold app start, which is
+// exactly when a Render free-tier backend is most likely to be asleep
+// (spins down after ~15 min idle, takes ~30-50s to wake on the next
+// request). Every other request either goes through attemptOrQueue
+// (which queues on failure) or is a background refresh where "try again
+// later" is fine — but sign-in is the one place a user is sitting there
+// watching it fail with no recourse but to keep tapping. Retry a few
+// times with backoff so a cold start resolves itself instead of looking
+// like a broken login.
+async function withColdStartRetry(fn, { attempts = 4, delaysMs = [3000, 6000, 10000], onRetry } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      // Only retry actual connectivity failures (cold start looks
+      // identical to "offline" from fetch's point of view) — a real 4xx/5xx
+      // from an awake server (bad token, validation, etc.) should surface
+      // immediately instead of being retried pointlessly.
+      if (!e.isOffline || i === attempts - 1) throw e;
+      onRetry?.(i + 1, attempts);
+      await new Promise((r) => setTimeout(r, delaysMs[i] ?? delaysMs[delaysMs.length - 1]));
+    }
+  }
+  throw lastErr;
+}
+
+// onRetry(attempt, maxAttempts) lets the caller show "Waking up the
+// server…" instead of a flat failure while this quietly retries.
+export const signInWithGoogle = (idToken, onRetry) =>
+  withColdStartRetry(
+    () => request("/auth/google", { method: "POST", body: { idToken }, auth: false }),
+    { onRetry }
+  );
 export const fetchMe = () => request("/auth/me");
 
 // ---------- Lists & items ----------

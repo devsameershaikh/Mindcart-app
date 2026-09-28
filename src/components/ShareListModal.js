@@ -8,7 +8,8 @@ import { sendInvite } from "../utils/api";
 export default function ShareListModal({ visible, onClose, t, listId, listName, onSent }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("READ"); // READ | WRITE
-  const [scope, setScope] = useState(listId ? "list" : "all"); // "list" | "all"
+  // const [scope, setScope] = useState(listId ? "list" : "all"); // "list" | "all"
+  const [scope, setScope] = useState("list");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
 

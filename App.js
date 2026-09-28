@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 // import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Notifications from "expo-notifications";
 import DateTimePicker from "@react-native-community/datetimepicker";
@@ -22,7 +22,7 @@ import {
   LayoutAnimation,
   UIManager,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
 import * as Haptics from "expo-haptics";
 import {
@@ -49,7 +49,7 @@ import {
   changeMemberRole as changeMemberRoleApi, removeMember as removeMemberApi,
   getPendingSyncListIds, onSyncDropped,
 } from "./src/utils/api";
-import { getSocket, joinListRoom } from "./src/utils/socket";
+import { getSocket, connectSocket, joinListRoom, leaveListRoom } from "./src/utils/socket";
 import { Share2 } from "lucide-react-native";
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
 import * as Sentry from '@sentry/react-native';
@@ -361,6 +361,7 @@ function mergeCloudOnAccept(prev, cloudLists) {
 }
 
 export default Sentry.wrap(function DmartApp() {
+  const insets = useSafeAreaInsets();
   const [appLoaded, setAppLoaded] = useState(false);
   const hydrated = useRef(false); // guards the very first save-effect run
 
@@ -447,6 +448,7 @@ export default Sentry.wrap(function DmartApp() {
   // ---------- Cloud sync (Google sign-in + Neon backend) ----------
   const { user, authLoading, signingIn, signIn, signOut } = useAuth();
   const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [hasSyncedOnce, setHasSyncedOnce] = useState(false);
   const [cloudMembersByList, setCloudMembersByList] = useState({}); // listId -> members[] (from GET /lists)
   const [pendingInvitesByList, setPendingInvitesByList] = useState({}); // listId -> invites[] sent but not yet accepted
   const [receivedInvites, setReceivedInvites] = useState([]); // invites addressed TO me, not yet answered
@@ -471,16 +473,36 @@ export default Sentry.wrap(function DmartApp() {
   // Pull down every list this account owns or has been shared into, once
   // right after sign-in. Cloud lists are merged in alongside any local-only
   // lists (kept exactly as they were, untouched) rather than replacing them.
-  useEffect(() => {
+  // Callable by name (not just as an effect) so the foreground/reconnect
+  // listeners below can trigger the exact same reconciliation that runs on
+  // sign-in — e.g. picking up a member removal that happened while this
+  // device was backgrounded or offline and missed the live socket event.
+  const syncCloudListsRef = useRef(null);
+  syncCloudListsRef.current = async () => {
+    if (!user) return;
+    setCloudSyncing(true);
+    try {
+      const { lists: cloudLists } = await fetchLists();
+      const cloudIds = new Set(cloudLists.map((cl) => cl.id));
 
-    if (!user || !appLoaded) return;
-    let cancelled = false;
-    (async () => {
-      setCloudSyncing(true);
-      try {
-        const { lists: cloudLists } = await fetchLists();
-        if (cancelled) return;
-        const cloudIds = new Set(cloudLists.map((cl) => cl.id));
+        // Only bother opening a socket at all if there's actually a shared
+        // list to get live updates for — a first-time signup (or anyone
+        // whose lists are all solo) never needs one. "Shared" here means
+        // either this device's owner has invited someone (members.length
+        // > 1) or this account is itself a member of someone else's list
+        // (role !== "OWNER") — either way, someone besides this account can
+        // change something that needs to reach this device live.
+        const hasSharedList = cloudLists.some(
+          (cl) => (cl.members?.length || 0) > 1 || (cl.role && cl.role !== "OWNER")
+        );
+        if (hasSharedList) {
+          await connectSocket();
+          // Join every cloud list's socket room so live updates (item/list
+          // changes from the owner, member changes, etc.) actually reach
+          // this device. This runs on sign-in, foreground, AND socket
+          // reconnect, so it has to (re)join every time, not just once.
+          cloudLists.forEach((cl) => joinListRoom(cl.id));
+        }
 
         // Derived values come from listsRef (synchronously) — never from a
         // side-effect inside a setState updater, which React is free to run later.
@@ -490,6 +512,7 @@ export default Sentry.wrap(function DmartApp() {
           setItemsByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setCloudMembersByList((p) => { const n = { ...p }; lostAccessIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostAccessIds.includes(cur) ? null : cur));
+          lostAccessIds.forEach((id) => leaveListRoom(id));
         }
         if (staleSeedIds.length) {
           setItemsByList((p) => { const n = { ...p }; staleSeedIds.forEach((id) => delete n[id]); return n; });
@@ -545,15 +568,41 @@ export default Sentry.wrap(function DmartApp() {
       } catch (e) {
         setNotice(`Couldn't load your cloud lists: ${e?.message || "network error"}`);
       } finally {
-        if (!cancelled) setCloudSyncing(false);
+        setCloudSyncing(false);
+        setHasSyncedOnce(true);
+       // first pass is done, selectedListId is now trustworthy
       }
       try {
         const { received } = await fetchInvites();
-        if (!cancelled) setReceivedInvites(received || []);
+        setReceivedInvites(received || []);
       } catch { /* non-fatal — the invite banner just stays empty */ }
-    })();
-    return () => { cancelled = true; };
+  };
+  // Stable identity (needed for the useEffect dep array below and for
+  // socket.on/off("connect", syncCloudLists) to match up) that always
+  // delegates to whatever the latest render assigned into the ref above —
+  // so every call runs with fresh `user`/state instead of what was in
+  // scope on the component's very first render.
+  const syncCloudLists = useCallback(() => syncCloudListsRef.current(), []);
+
+  useEffect(() => {
+    if (!user || !appLoaded) return;
+    syncCloudLists();
   }, [user?.id, appLoaded]);
+
+//   useEffect(() => {
+//   if (!user) setHasSyncedOnce(false);
+// }, [user]);
+
+  // Re-run the same cloud reconciliation whenever the app comes back to the
+  // foreground — covers a member removal (or role change) that happened
+  // while this device was backgrounded and missed the live socket event.
+  useEffect(() => {
+    if (!user) return;
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") syncCloudLists();
+    });
+    return () => sub.remove();
+  }, [user, syncCloudLists]);
 
   // One invitation card (avatar, who/what, permission chip, Decline / Accept).
   // Shared by the bell's notification panel and the Family tab's invitations popup.
@@ -667,6 +716,11 @@ export default Sentry.wrap(function DmartApp() {
           return next;
         });
         setCloudMembersByList((prev) => { const next = { ...prev }; for (const cl of cloudLists) next[cl.id] = cl.members; return next; });
+        // Accepting an invite is exactly the moment this account can go
+        // from "no shared lists" to "has one" — connect (idempotent if
+        // already connected) before joining rooms, since a first-time
+        // signup never opened a socket at all until now.
+        await connectSocket();
         cloudLists.forEach((cl) => joinListRoom(cl.id));
         setNotice("Invite accepted — the list is now in your list switcher.");
       } else {
@@ -699,15 +753,20 @@ export default Sentry.wrap(function DmartApp() {
   // effect only (un)subscribes the listeners while it's live.
   useEffect(() => {
     if (!user) return;
-    // AuthContext opens the socket on sign-in, which can land a tick after
-    // this effect first runs — retry briefly instead of silently never subscribing.
+    // Unlike before, the socket is now connected lazily (only once this
+    // account actually has/gets a shared list — see syncCloudLists,
+    // inviteFamilyMember, respondToInvite) rather than always right after
+    // sign-in. That means "not connected yet" can persist for a long time
+    // for a solo user, not just a brief startup tick — so this keeps
+    // polling for as long as the user is signed in, instead of giving up
+    // after a fixed number of tries and never attaching listeners even
+    // once a socket eventually does appear.
     let detach = null;
     let retryTimer = null;
-    let tries = 0;
     const attach = () => {
     const socket = getSocket();
     if (!socket) {
-      if (tries++ < 20) retryTimer = setTimeout(attach, 500);
+      retryTimer = setTimeout(attach, 2000);
       return;
     }
 
@@ -723,7 +782,10 @@ export default Sentry.wrap(function DmartApp() {
     const onListDeleted = ({ listId }) => {
       setLists((prev) => prev.filter((l) => l.id !== listId));
       setItemsByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+      setCloudMembersByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
+      setPendingInvitesByList((prev) => { const p = { ...prev }; delete p[listId]; return p; });
       setSelectedListId((cur) => (cur === listId ? null : cur));
+      leaveListRoom(listId);
     };
     const onMemberChange = () => {
       // Cheapest correct way to keep member lists (roles, who's on the
@@ -754,6 +816,7 @@ export default Sentry.wrap(function DmartApp() {
           setCloudMembersByList((p) => { const n = { ...p }; lostIds.forEach((id) => delete n[id]); return n; });
           setSelectedListId((cur) => (lostIds.includes(cur) ? null : cur));
           setNotice("You no longer have access to a list that was removed from your account.");
+          lostIds.forEach((id) => leaveListRoom(id));
         }
       }).catch(() => {});
     };
@@ -807,6 +870,28 @@ export default Sentry.wrap(function DmartApp() {
     socket.on("invite:accepted", onInviteAccepted);
     socket.on("invite:declined", onInviteDeclined);
 
+    // Echoes of MY OWN invite actions, so every device I'm signed in on
+    // (not just the one that made the API call) keeps its Pending Invites
+    // list correct in real time.
+    const onInviteSent = ({ invite }) => {
+      setPendingInvitesByList((prev) => {
+        const key = invite.inviteAllLists ? null : invite.listId;
+        if (!key) return prev; // an "all my lists" invite isn't scoped to one list's pending panel
+        const existing = prev[key] || [];
+        if (existing.some((inv) => inv.id === invite.id)) return prev;
+        return { ...prev, [key]: [...existing, invite] };
+      });
+    };
+    socket.on("invite:sent", onInviteSent);
+    const onInviteRevokedAck = ({ inviteId }) => {
+      setPendingInvitesByList((prev) => {
+        const next = {};
+        for (const [listId, invites] of Object.entries(prev)) next[listId] = invites.filter((inv) => inv.id !== inviteId);
+        return next;
+      });
+    };
+    socket.on("invite:revoked:ack", onInviteRevokedAck);
+
     // Push revoke back to the RECIPIENT live — previously they only found
     // out by tapping Accept/Decline and getting a stale "not found".
     const onInviteRevoked = ({ inviteId }) => {
@@ -836,6 +921,9 @@ export default Sentry.wrap(function DmartApp() {
       pushActivity("info", grantedMsg);
     };
     socket.on("list:granted", onListGranted);
+    // Picks up anything missed (e.g. a removal) while this socket was
+    // disconnected — same reconciliation the sign-in/foreground paths use.
+    socket.on("connect", syncCloudLists);
 
     detach = () => {
       socket.off("item:created", onItemCreated);
@@ -849,8 +937,11 @@ export default Sentry.wrap(function DmartApp() {
       socket.off("invite:received", onInviteReceived);
       socket.off("invite:accepted", onInviteAccepted);
       socket.off("invite:declined", onInviteDeclined);
+      socket.off("invite:sent", onInviteSent);
+      socket.off("invite:revoked:ack", onInviteRevokedAck);
       socket.off("invite:revoked", onInviteRevoked);
       socket.off("list:granted", onListGranted);
+      socket.off("connect", syncCloudLists);
     };
     };
     attach();
@@ -880,6 +971,9 @@ export default Sentry.wrap(function DmartApp() {
             if (listsRef.current.some((l) => l.id === data.listId)) { setSelectedListId(data.listId); setTab("home"); }
             else pendingSelectRef.current = data.listId;
           }
+          break;
+          case PUSH_TYPES.MEMBER_REMOVED:
+          refreshMembership();
           break;
 
         default:
@@ -1069,7 +1163,10 @@ useEffect(() => {
   // read `selectedList` before it existed, so it was always `undefined` and
   // switching lists while on the Family tab never refreshed.)
   useEffect(() => {
-    if (tab === "family" && selectedList?.role) refreshInvitesForList(selectedList.id);
+    if (tab === "family" && selectedList?.role) {
+      refreshInvitesForList(selectedList.id);
+      refreshMembersForList(selectedList.id);
+    }
     // eslint-disable-next-line
   }, [tab, selectedList?.id]);
 
@@ -1144,6 +1241,17 @@ useEffect(() => {
         onGetStarted={signIn}
       />
     );
+  }
+
+  // Signed in, but the first post-signin GET /lists hasn't landed yet —
+  // selectedListId may still be pointing at the pre-login placeholder list
+  // in this window. Hold on the loader instead of letting the user reach
+  // the Add screen and write against a list id the server doesn't
+  // recognize yet (that's what produced the "Just a second..." notice and,
+  // worse, a duplicate list). This is normally sub-second: syncCloudLists()
+  // fires the moment `user` is set, so this almost never actually renders.
+  if (!hasSyncedOnce) {
+    return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
   }
 
   // setListItems' updater now receives/returns the { itemId: item } map for
@@ -1328,6 +1436,24 @@ useEffect(() => {
     } catch { /* best-effort — the members list still works without this */ }
   }
 
+  // Pulls fresh members for THIS list from the server. Members were
+  // previously only ever set at sign-in or by a socket event (memberJoined/
+  // Removed/RoleChanged) — if either was missed (app was closed, the socket
+  // reconnected a beat late, the change came from a session that never had
+  // a live connection), the Family screen just kept showing whatever it
+  // last had for that list, with no way to become correct again short of a
+  // full app restart. Calling this the moment the Family tab is opened (or
+  // the selected list changes while already on it) makes "who's on this
+  // list" correct on every view, the same way refreshInvitesForList already
+  // does for pending invites.
+  async function refreshMembersForList(listId) {
+    try {
+      const { lists: cloudLists } = await fetchLists();
+      const fresh = cloudLists.find((cl) => cl.id === listId);
+      if (fresh) setCloudMembersByList((prev) => ({ ...prev, [listId]: fresh.members }));
+    } catch { /* best-effort — the last known member list stays on screen */ }
+  }
+
   // role: "READ" | "WRITE". allLists=true invites as a standing family
   // member across every list the owner has (and will create) instead of
   // just this one — the better option for an actual household, not just a
@@ -1335,6 +1461,13 @@ useEffect(() => {
   async function inviteFamilyMember(list, { email, role, allLists }) {
     try {
       await sendInvite({ recipientEmail: email, role, listId: allLists ? undefined : list.id, allLists: !!allLists });
+      // Sending an invite is the owner-side equivalent of the accept case
+      // above: nothing is shared yet (the recipient hasn't accepted), but
+      // if this account had no shared lists before, its socket was never
+      // connected — without this, the owner would only find out the
+      // invite was accepted on their next foreground/manual refresh
+      // instead of getting the live "invite:accepted" push.
+      await connectSocket();
       setNotice(allLists ? `Invited ${email} as a family member — they'll get every list you own.` : `Invited ${email} to "${list.name}".`);
       refreshInvitesForList(list.id);
     } catch (e) {
@@ -1556,6 +1689,19 @@ useEffect(() => {
     // `pending` until the real server copy arrives over the socket once
     // the queue flushes. A genuine failure (bad request, no permission)
     // still throws and gets rolled back below.
+    if (user && !hasSyncedOnce) {
+      console.log("User:", user);
+      console.log("Has Synced Once:", hasSyncedOnce);
+      // Shouldn't normally be reachable now that the render gate above
+      // covers this window — kept as a safety net for any call path that
+      // doesn't go through the screen (e.g. a queued/background retry).
+      // Self-heals instead of leaving the user stuck: kick off the sync
+      // and let them try again once it lands, rather than a dead-end notice.
+      syncCloudLists();
+      setNotice("Just a second, syncing your lists…");
+      return;
+    }
+
     for (const name of toAdd) {
       const id = makeId("item");
       upsertItem(selectedListId, {
@@ -1569,27 +1715,31 @@ useEffect(() => {
         // under, this removes the stale local-id copy instead of leaving
         // two entries on screen for one saved row.
         if (!queued) reconcileOptimisticItem(selectedListId, id, item); // clears pending; if queued it stays pending until the socket confirms it later
-      } catch (e) {
-        if (e?.status === 404) {
-          // The list looks synced locally (it has a role) but doesn't
-          // actually exist on the server — most likely an earlier create
-          // for the list itself never landed. Recreating is a safe no-op
-          // if it already exists (the backend treats a repeat id as
-          // success), so just retry once instead of dropping the item.
-          try {
-            await createListApi(selectedListId, selectedList.name);
-            const { item, queued } = await createItemApi(selectedListId, { id, name, category, unit: fUnit, price: fPrice || null });
-            if (!queued) reconcileOptimisticItem(selectedListId, id, item);
-            continue;
-          } catch (e2) {
-            removeItemFromList(selectedListId, id);
-            setNotice(`Couldn't add "${name}": ${e2?.message || "something went wrong"}`);
-            continue;
+        } catch (e) {
+          if (e?.status === 404) {
+            if (selectedList.isDefaultSeed) {
+              // This id was never meant to exist server-side — don't create a
+              // duplicate. Re-sync and drop the item instead of writing to a
+              // ghost list nobody else is a member of.
+              removeItemFromList(selectedListId, id);
+              setNotice(`Couldn't add "${name}" — resyncing your lists, please try again.`);
+              syncCloudLists();
+              continue;
+            }
+            try {
+              await createListApi(selectedListId, selectedList.name);
+              const { item, queued } = await createItemApi(selectedListId, { id, name, category, unit: fUnit, price: fPrice || null });
+              if (!queued) reconcileOptimisticItem(selectedListId, id, item);
+              continue;
+            } catch (e2) {
+              removeItemFromList(selectedListId, id);
+              setNotice(`Couldn't add "${name}": ${e2?.message || "something went wrong"}`);
+              continue;
+            }
           }
+          removeItemFromList(selectedListId, id);
+          setNotice(`Couldn't add "${name}": ${e?.message || "something went wrong"}`);
         }
-        removeItemFromList(selectedListId, id);
-        setNotice(`Couldn't add "${name}": ${e?.message || "something went wrong"}`);
-      }
     }
 
     setFName("");
@@ -1771,6 +1921,14 @@ function confirmStartNewTrip() {
       if (!queued) reconcileOptimisticItem(listId, id, item);
     } catch (e) {
       if (e?.status === 404) {
+        if (selectedList?.isDefaultSeed) {
+          // Same placeholder-list case as handleAddItem: don't recreate a
+          // duplicate list under the pre-login id — resync and drop it.
+          removeItemFromList(listId, id);
+          setNotice(`Couldn't add "${mi.name}" — resyncing your lists, please try again.`);
+          syncCloudLists();
+          return;
+        }
         try {
           await createListApi(listId, selectedList.name);
           const { item, queued } = await createItemApi(listId, { id, name: mi.name, category: mi.category, unit: mi.unit, price: null });
@@ -2471,7 +2629,7 @@ function confirmStartNewTrip() {
 
       {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
           pinned to the bottom of the screen, not the top of the keyboard) ===== */}
-      <View style={s.tabBar}>
+      <View style={[s.tabBar, { paddingBottom: Math.max(4, insets.bottom) }]}>
         {[
           { id: "home", label: "Home", icon: Home },
           { id: "add", label: "Add", icon: ListPlus },
@@ -3160,7 +3318,7 @@ function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
         </View>
 
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
-          Remember what to buy.
+          Remember what to Buy
         </Text>
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
           Shop smarter. Together.

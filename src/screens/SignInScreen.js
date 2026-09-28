@@ -7,7 +7,7 @@ import { useAuth } from "../context/AuthContext";
 // Deliberately minimal: one clear action, short reassurance about what
 // signing in unlocks (family sharing) vs. what still works offline.
 export default function SignInScreen({ t }) {
-  const { signIn, signingIn, googleRequestReady } = useAuth();
+  const { signIn, signingIn, signInStatus, googleRequestReady } = useAuth();
 
   return (
     <SafeAreaView style={[styles.screen, { backgroundColor: t.bg }]}>
@@ -35,7 +35,9 @@ export default function SignInScreen({ t }) {
         </TouchableOpacity>
 
         <Text style={[styles.footnote, { color: t.muted }]}>
-          Your existing on-device lists stay put — signing in adds cloud sync and sharing on top.
+          {signInStatus
+            ? signInStatus
+            : "Your existing on-device lists stay put — signing in adds cloud sync and sharing on top."}
         </Text>
       </View>
     </SafeAreaView>

@@ -23,7 +23,6 @@ import {
 } from "../utils/api";
 
 import {
-  connectSocket,
   disconnectSocket,
 } from "../utils/socket";
 
@@ -88,6 +87,10 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
+  // Non-null while a cold-start retry is in flight, e.g. "Waking up the
+  // server… (2/4)" — lets the sign-in screen show real status instead of
+  // the button just sitting there through 3 silent retries.
+  const [signInStatus, setSignInStatus] = useState(null);
 
   // --------------------------------------------------
   // Restore existing MindCart session
@@ -116,11 +119,13 @@ export function AuthProvider({ children }) {
       if (cachedUser) setUser(cachedUser);
       setAuthLoading(false);
 
-      try {
-        await connectSocket();
-      } catch (error) {
-        console.log("Socket connect skipped (likely offline):", error?.message || error);
-      }
+      // NOTE: the socket is intentionally NOT connected here. It's only
+      // needed for pushing live changes from OTHER devices/members — every
+      // read/write the user does themselves goes through plain REST calls
+      // and works with no socket at all. App.js connects it lazily, only
+      // once syncCloudLists() finds the user actually has a shared list
+      // (see maybeConnectForSharedLists in socket.js) — a first-time
+      // signup with no shared lists never opens a socket connection at all.
        notificationService.init();
 
       // Validate/refresh in the background. Only an explicit auth
@@ -159,14 +164,48 @@ export function AuthProvider({ children }) {
     try {
       console.log("Starting Google Sign-In...");
 
-      // Check Google Play Services
-      await GoogleSignin.hasPlayServices({
-        showPlayServicesUpdateDialog: true,
+      // Re-assert config right before use instead of trusting it landed at
+      // module-import time. On Android the native bridge call behind
+      // configure() isn't guaranteed to have finished by the time a user
+      // taps the button a split-second after a cold launch (e.g. right
+      // after "clear data"), so hasPlayServices()/signIn() can throw with
+      // nothing ever reaching the backend — which is why those failures
+      // show zero server-side logs. configure() is safe to call repeatedly.
+      GoogleSignin.configure({
+        webClientId: GOOGLE_WEB_CLIENT_ID,
+        offlineAccess: false,
       });
-      console.log("Google Play Services available");
 
-      // Open native Google account picker
-      const result = await GoogleSignin.signIn();
+      // The native call itself (not the backend call) gets its own short
+      // retry for the same cold-launch race — a couple hundred ms is
+      // usually enough for the bridge to settle, so this is quick, not a
+      // long backend-style backoff.
+      let result;
+      let lastNativeErr;
+      for (let i = 0; i < 3; i++) {
+        try {
+          await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+          console.log("Google Play Services available");
+          result = await GoogleSignin.signIn();
+          lastNativeErr = null;
+          break;
+        } catch (nativeErr) {
+          lastNativeErr = nativeErr;
+          // A real user action (cancel) or a real unavailability should
+          // surface immediately — only retry the ambiguous "something
+          // wasn't ready yet" cases.
+          if (
+            nativeErr?.code === statusCodes.SIGN_IN_CANCELLED ||
+            nativeErr?.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE ||
+            i === 2
+          ) {
+            throw nativeErr;
+          }
+          console.log(`Google Sign-In native call not ready yet, retrying (${i + 1}/3)...`);
+          await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+        }
+      }
+      if (lastNativeErr) throw lastNativeErr;
     
       // New versions of the library return user data inside `data`
       const idToken = result?.data?.idToken;
@@ -177,8 +216,12 @@ export function AuthProvider({ children }) {
 
       console.log("Google ID token received");
 
-      // Send Google ID token to MindCart backend
-      const response = await signInWithGoogle(idToken);
+      // Send Google ID token to MindCart backend — retries a few times with
+      // backoff if the backend is cold-starting (see withColdStartRetry in
+      // api.js) instead of failing on the first hit.
+      const response = await signInWithGoogle(idToken, (attempt, max) => {
+        setSignInStatus(`Waking up the server… (${attempt}/${max})`);
+      });
 
       const { token, user } = response;
 
@@ -193,8 +236,9 @@ export function AuthProvider({ children }) {
       setUser(user);
       await setCachedUser(user);
 
-      // Connect socket using authenticated session
-      await connectSocket();
+      // Socket connection is deferred to App.js (see the session-restore
+      // effect above for why) — a brand new signup with no shared lists
+      // yet never opens one.
 
       // setSentryUser(user);
       // Fire-and-forget: if the user denies the permission prompt, sign-in
@@ -233,6 +277,7 @@ export function AuthProvider({ children }) {
       };
     } finally {
       setSigningIn(false);
+      setSignInStatus(null);
     }
   }, [signingIn]);
 
@@ -285,6 +330,7 @@ export function AuthProvider({ children }) {
         user,
         authLoading,
         signingIn,
+        signInStatus,
         signIn,
         signOut,
 

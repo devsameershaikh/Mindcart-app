@@ -52,6 +52,8 @@ export const PUSH_TYPES = {
   INVITE_ACCEPTED: "invite:accepted",
   INVITE_DECLINED: "invite:declined",
   LIST_GRANTED: "list:granted",
+  MEMBER_REMOVED: "list:memberRemoved",   // <-- add this line
+
 };
 
 // ---------------------------------------------------------------------------

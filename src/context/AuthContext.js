@@ -23,7 +23,6 @@ import {
 } from "../utils/api";
 
 import {
-  connectSocket,
   disconnectSocket,
 } from "../utils/socket";
 
@@ -120,11 +119,13 @@ export function AuthProvider({ children }) {
       if (cachedUser) setUser(cachedUser);
       setAuthLoading(false);
 
-      try {
-        await connectSocket();
-      } catch (error) {
-        console.log("Socket connect skipped (likely offline):", error?.message || error);
-      }
+      // NOTE: the socket is intentionally NOT connected here. It's only
+      // needed for pushing live changes from OTHER devices/members — every
+      // read/write the user does themselves goes through plain REST calls
+      // and works with no socket at all. App.js connects it lazily, only
+      // once syncCloudLists() finds the user actually has a shared list
+      // (see maybeConnectForSharedLists in socket.js) — a first-time
+      // signup with no shared lists never opens a socket connection at all.
        notificationService.init();
 
       // Validate/refresh in the background. Only an explicit auth
@@ -235,8 +236,9 @@ export function AuthProvider({ children }) {
       setUser(user);
       await setCachedUser(user);
 
-      // Connect socket using authenticated session
-      await connectSocket();
+      // Socket connection is deferred to App.js (see the session-restore
+      // effect above for why) — a brand new signup with no shared lists
+      // yet never opens one.
 
       // setSentryUser(user);
       // Fire-and-forget: if the user denies the permission prompt, sign-in

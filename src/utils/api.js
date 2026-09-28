@@ -99,6 +99,16 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     if (token) headers.Authorization = `Bearer ${token}`;
   }
   let res;
+  // Render's free tier (see start.sh) can take a good while to wake a
+  // cold container, and RN's fetch has no built-in timeout — without one,
+  // a slow/cold backend leaves this call hanging indefinitely instead of
+  // failing, which is exactly what stalls anything gated on it (e.g. the
+  // post-signin loader). 15s is generous for a warm backend and still
+  // bounded for a cold one; callers already treat any rejection here the
+  // same way (offline/queue-and-retry for writes, error notice for reads).
+  const REQUEST_TIMEOUT_MS = 15000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 try {
   const fullUrl = `${API_BASE_URL}${path}`;
 
@@ -113,6 +123,7 @@ try {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: controller.signal,
   });
  console.log("-------------");
   console.log(`[api.js] ${method} ${fullUrl} => ${res.status}`);
@@ -123,10 +134,16 @@ try {
     // is actually offline". We can't tell those apart here, but for every
     // mutating call the caller treats this the same way regardless: queue
     // it and retry later rather than losing the change.
+    const isTimeout = networkError?.name === "AbortError";
     const err = new Error(
-      `Offline. Changes will sync when you’re back online`);
+      isTimeout
+        ? "The server is taking too long to respond. Changes will sync when it's reachable."
+        : `Offline. Changes will sync when you’re back online`);
     err.isOffline = true;
+    err.isTimeout = isTimeout;
     throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));

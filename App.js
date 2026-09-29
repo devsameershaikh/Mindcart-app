@@ -37,6 +37,7 @@ import {
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
 import { getTheme, RADIUS } from "./src/utils/theme";
 import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, clampQty, clampPrice } from "./src/utils/helpers";
+import { buildHistory, getSuggestions } from "./src/utils/suggestions";
 import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
 import SimpleSelect from "./src/components/Simpleselect";
@@ -50,7 +51,6 @@ import {
   getPendingSyncListIds, onSyncDropped,
 } from "./src/utils/api";
 import { getSocket, connectSocket, joinListRoom, leaveListRoom } from "./src/utils/socket";
-import { Share2 } from "lucide-react-native";
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
 import * as Sentry from '@sentry/react-native';
 import * as Updates from "expo-updates";
@@ -272,7 +272,14 @@ function AnimatedCheckbox({ checked, onPress, style }) {
     onPress();
   }
   return (
-    <TouchableOpacity onPress={handlePress} activeOpacity={0.8}>
+    <TouchableOpacity
+      onPress={handlePress}
+      activeOpacity={0.8}
+      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked: !!checked }}
+      accessibilityLabel={checked ? "Mark as not bought" : "Mark as bought"}
+    >
       <Animated.View style={[style, { transform: [{ scale }] }]}>
         {checked && <Check size={13} color="#fff" />}
       </Animated.View>
@@ -296,7 +303,25 @@ function SwipeDeleteAction({ t, onDelete }) {
   );
 }
 
+// Left-swipe-to-reveal counterpart of SwipeDeleteAction: swipe right to mark bought / undo.
+function SwipeCheckAction({ t, checked }) {
+  return (
+    <View
+      style={{
+        backgroundColor: t.accent, justifyContent: "center", alignItems: "center",
+        width: 76, borderRadius: RADIUS.md, marginRight: 8, gap: 3,
+      }}
+    >
+      <Check size={17} color="#fff" />
+      <Text style={{ color: "#fff", fontSize: 10.5, fontWeight: "700" }}>{checked ? "Undo" : "Bought"}</Text>
+    </View>
+  );
+}
+
 const ROLE_RANK = { OWNER: 0, WRITE: 1, READ: 2 };
+
+// Height of one row in the "Your lists" panel — the panel shows 3 rows, then scrolls.
+const LIST_ROW_HEIGHT = 66;
 
 function pickListId(cur, cloudLists, localLists, excludedIds = []) {
   const excluded = new Set(excludedIds);
@@ -380,6 +405,8 @@ export default Sentry.wrap(function DmartApp() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
+  const [noteOpen, setNoteOpen] = useState({}); // itemId -> true while its (optional) note box is open
+  const swipeRefs = useRef({}); // itemId -> Swipeable, so a right-swipe can close itself after acting
   const [pendingDelete, setPendingDelete] = useState(null); // { item, listId, timer }
   const pendingDeleteRef = useRef(null); // always the live entry, so back-to-back deletes can't miss it
   pendingDeleteRef.current = pendingDelete;
@@ -458,6 +485,7 @@ export default Sentry.wrap(function DmartApp() {
   const notifAnim = useRef(new Animated.Value(0)).current;
   const [invitesOpen, setInvitesOpen] = useState(false); // "Pending invitations" popup (Family tab row)
   const invitesAnim = useRef(new Animated.Value(0)).current;
+  const listsAnim = useRef(new Animated.Value(0)).current; // "Your lists" panel fade/slide
   const [makingShareable, setMakingShareable] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
@@ -665,6 +693,17 @@ export default Sentry.wrap(function DmartApp() {
       .catch(() => {});
   }
   function closeInvites() { setInvitesOpen(false); }
+
+  // "Your lists" panel: drops down from the top, right under the list switcher.
+  function openListsModal() {
+    listsAnim.setValue(0);
+    setListsModalOpen(true);
+    Animated.timing(listsAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+  }
+  function closeListsModal() {
+    setListsModalOpen(false);
+    setConfirmDeleteListId(null);
+  }
 
   // Once the last pending invite is answered there's nothing left to show.
   useEffect(() => {
@@ -1146,6 +1185,14 @@ useEffect(() => {
     const map = itemsByList[selectedList?.id] || {};
     return Object.values(map).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }, [itemsByList, selectedList?.id]);
+
+  // Add-item autocomplete data (must stay above the early `return <Loader>` — hooks can't be conditional).
+  const suggestionHistory = useMemo(() => buildHistory(itemsByList), [itemsByList]);
+  const currentSegment = fName.split(",").pop();
+  const nameSuggestions = useMemo(() => {
+    const existing = new Set(items.map((i) => `${i.category}|${String(i.name).trim().toLowerCase()}`));
+    return getSuggestions(currentSegment, suggestionHistory, existing, 6);
+  }, [currentSegment, suggestionHistory, items]);
 
   // Keep selectedListId pointing at a real list, so every action that reads
   // it (add / edit / delete item, new trip…) targets the list on screen.
@@ -1647,6 +1694,22 @@ useEffect(() => {
   }
 
   // ---------- Item management ----------
+  // ---- Add-item autocomplete handler (memoized suggestions live next to `items`, above the early return) ----
+
+  function applySuggestion(sug) {
+    const parts = fName.split(",");
+    const isSingle = parts.length === 1;
+    parts[parts.length - 1] = (isSingle ? "" : " ") + sug.name;
+    setFName(parts.join(","));
+    setItemNameError("");
+    if (isSingle) {
+      // Fill category + unit for a single item; keep the user's own choice for multi-add.
+      if (sug.category && categories.includes(sug.category)) { setFCategory(sug.category); setCategoryTouched(true); }
+      if (sug.unit && UNITS.includes(sug.unit)) setFUnit(sug.unit);
+    }
+    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+  }
+
   async function addItem() {
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (!fName.trim()) {
@@ -2011,7 +2074,7 @@ function confirmStartNewTrip() {
               </View>
               <Text style={s.brand}>MindCart</Text>
             </View>
-            <TouchableOpacity onPress={() => setListsModalOpen(true)} style={s.listSwitcher}>
+            <TouchableOpacity onPress={openListsModal} style={s.listSwitcher}>
             <ListChecks size={12} color={t.accent} />
             <Text style={s.listSwitcherText}>
               {selectedList ? selectedList.name : "Select list"}
@@ -2031,11 +2094,11 @@ function confirmStartNewTrip() {
                 )}
               </TouchableOpacity>
             )}
-            <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf}>
+            <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf} accessibilityLabel="Export list as PDF">
               {exportingPdf ? (
                 <ActivityIndicator size="small" color={t.text} />
               ) : (
-                <Share2 size={16} color={t.text} />
+                <FileDown size={17} color={t.text} />
               )}
             </TouchableOpacity>
             {/* <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
@@ -2044,14 +2107,6 @@ function confirmStartNewTrip() {
           </View>
         </View>
 
-        {pendingDelete ? (
-          <View style={s.undoRow}>
-            <Text style={{ color: t.text, fontSize: 12.5 }}>Deleted "{pendingDelete.item.name}"</Text>
-            <TouchableOpacity onPress={undoDelete}>
-              <Text style={{ color: t.accent, fontWeight: "700", fontSize: 12.5 }}>Undo</Text>
-            </TouchableOpacity>
-          </View>
-        ) : null}
 
           {showSearch && (
             <View style={s.searchWrap}>
@@ -2070,16 +2125,30 @@ function confirmStartNewTrip() {
         {tab === "home" && (
           <View style={{ paddingHorizontal: 16 }}>
               <View style={s.summaryCard}>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 18, alignItems: "center" }}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                    <CurrencyGlyph symbol={currency.symbol} color={t.accent} />
-                    <Text style={{ color: t.accent, fontSize: 13 }}>{boughtTotal.toFixed(0)} bought ({boughtItems.length})</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={{ color: t.text, fontWeight: "800", fontSize: 15 }}>
+                      {boughtItems.length} of {boughtItems.length + pendingItems.length} bought
+                    </Text>
+                    <Text style={{ color: t.muted, fontSize: 12, marginTop: 2 }} numberOfLines={1}>
+                      {currency.symbol}{boughtTotal.toFixed(0)} spent · {currency.symbol}{pendingTotal.toFixed(0)} to go
+                    </Text>
                   </View>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                    <CurrencyGlyph symbol={currency.symbol} color={t.accent2} />
-                    <Text style={{ color: t.accent2, fontSize: 13 }}>{pendingTotal.toFixed(0)} pending ({pendingItems.length})</Text>
+                  <View style={{ alignItems: "flex-end" }}>
+                    <Text style={{ color: t.muted, fontSize: 11, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.4 }}>Total</Text>
+                    <Text style={{ color: t.text, fontWeight: "800", fontSize: 16 }}>{currency.symbol}{(boughtTotal + pendingTotal).toFixed(0)}</Text>
                   </View>
-                  <Text style={{ color: t.text, fontWeight: "700", marginLeft: "auto", fontSize: 13 }}>Total {currency.symbol}{(boughtTotal + pendingTotal).toFixed(0)}</Text>
+                  <TouchableOpacity
+                    onPress={requestNewTrip}
+                    disabled={!tripDirty}
+                    accessibilityLabel="Start new trip"
+                    style={[s.tripIconBtn, !tripDirty && { opacity: 0.4 }]}
+                  >
+                    <RotateCcw size={16} color={tripDirty ? t.accent : t.muted} />
+                  </TouchableOpacity>
+                </View>
+                <View style={s.progressTrack}>
+                  <View style={[s.progressFill, { width: `${(boughtItems.length + pendingItems.length) > 0 ? Math.round((boughtItems.length / (boughtItems.length + pendingItems.length)) * 100) : 0}%` }]} />
                 </View>
 
                 {/* <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10 }}>
@@ -2113,14 +2182,6 @@ function confirmStartNewTrip() {
                   );
                 })() : null} */}
 
-                <TouchableOpacity
-                  onPress={requestNewTrip}
-                  disabled={!tripDirty}
-                  style={[s.newTripBtn, !tripDirty && { borderColor: t.border, opacity: 0.5 }]}
-                >
-                  <RotateCcw size={13} color={tripDirty ? t.accent : t.muted} />
-                  <Text style={{ color: tripDirty ? t.accent : t.muted, fontWeight: "600", fontSize: 12.5 }}>Start new trip</Text>
-                </TouchableOpacity>
               </View>
             <View style={s.stickyFilterWrap}>
               <View style={s.segmentWrap}>
@@ -2155,44 +2216,66 @@ function confirmStartNewTrip() {
 
               <View style={s.addCard}>
                 <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                  <TextInput
-                    value={fName}
-                    maxLength={200}
-                    onChangeText={(val) => {
-                      setFName(val);
-                      if (itemNameError) setItemNameError("");
-                      if (!categoryTouched && !val.includes(",")) {
-                        const guess = suggestCategory(val);
-                        if (guess) setFCategory(guess);
-                      }
-                    }}
-                    onSubmitEditing={addItem}
-                    placeholder="Item name"
-                    placeholderTextColor={t.muted}
-                    style={[s.input, { flex: 1, minWidth: 140, borderColor: itemNameError ? t.danger : t.border }]}
-                  />
-                  {/* <TouchableOpacity onPress={openScanner} style={s.iconBtn} disabled={scanLoading}>
-                    <Barcode size={16} color={scanLoading ? t.muted : t.text} />
-                  </TouchableOpacity> */}
-                  <CategorySelect
-                    value={fCategory}
-                    categories={categories}
-                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
-                    onAddCategory={addCategory}
-                    t={t}
-                    style={{ flex: 1, minWidth: 100 }}
-                  />
-                </View>
+                {/* Row 1: item name on its own line */}
+                <TextInput
+                  value={fName}
+                  maxLength={200}
+                  onChangeText={(val) => {
+                    setFName(val);
+                    if (itemNameError) setItemNameError("");
+                    if (!categoryTouched && !val.includes(",")) {
+                      const guess = suggestCategory(val);
+                      if (guess) setFCategory(guess);
+                    }
+                  }}
+                  onSubmitEditing={addItem}
+                  placeholder="Item name"
+                  placeholderTextColor={t.muted}
+                  style={[s.input, { borderColor: itemNameError ? t.danger : t.border }]}
+                />
+
+                {/* Suggestions while typing (on-device: your history first, then common items) */}
+                {nameSuggestions.length > 0 && (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    keyboardShouldPersistTaps="always"
+                    style={{ marginTop: 8, flexGrow: 0 }}
+                    contentContainerStyle={{ gap: 8 }}
+                  >
+                    {nameSuggestions.map((sug) => (
+                      <TouchableOpacity
+                        key={sug.name}
+                        onPress={() => applySuggestion(sug)}
+                        style={{ flexDirection: "row", alignItems: "center", gap: 6, borderWidth: 1, borderColor: t.border, backgroundColor: t.surface2, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 12 }}
+                      >
+                        <Text style={{ fontSize: 14 }}>{getIcon(sug.name)}</Text>
+                        <Text style={{ color: t.text, fontSize: 13, fontWeight: "600" }}>{sug.name}</Text>
+                        <Text style={{ color: t.muted, fontSize: 11 }}>{sug.category}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                )}
+
                 {itemNameError ? (
                   <View style={s.inlineError} accessibilityLiveRegion="polite">
                     <AlertCircle size={14} color={t.danger} style={{ marginTop: 1 }} />
                     <Text style={s.inlineErrorText}>{itemNameError}</Text>
                   </View>
                 ) : null}
+
+                {/* Row 2: category + unit + Add in one line */}
                 <View style={{ flexDirection: "row", gap: 8, marginTop: 8, alignItems: "center" }}>
-                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} />
-                  <TouchableOpacity onPress={addItem} style={s.addItemBtn}>
+                  <CategorySelect
+                    value={fCategory}
+                    categories={categories}
+                    onChange={(c) => { setFCategory(c); setCategoryTouched(true); }}
+                    onAddCategory={addCategory}
+                    t={t}
+                    style={{ flex: 1.4, minWidth: 0 }}
+                  />
+                  <SimpleSelect value={fUnit} options={UNITS} onChange={setFUnit} title="Unit" t={t} style={{ flex: 1, minWidth: 0 }} />
+                  <TouchableOpacity onPress={addItem} style={[s.addItemBtn, { marginLeft: 0 }]}>
                     <Plus size={15} color="#fff" />
                     <Text style={{ color: "#fff", fontWeight: "600", fontSize: 14 }}>Add</Text>
                   </TouchableOpacity>
@@ -2201,7 +2284,7 @@ function confirmStartNewTrip() {
           </View>
         )}
 
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingTop: 0, paddingBottom: pendingDelete ? 88 : 24 }} keyboardShouldPersistTaps="handled">
           {tab === "home" && (
             <>
               {items.length === 0 && (
@@ -2231,101 +2314,148 @@ function confirmStartNewTrip() {
                   if (homeFilter === "pending") return !i.checked;
                   if (homeFilter === "bought") return i.checked;
                   return true;
-                });
+                }).sort((x, y) => Number(!!x.checked) - Number(!!y.checked)); // bought items sink to the bottom (stable sort keeps the rest in order)
                 if (catItems.length === 0) return null;
                 const isCollapsed = collapsed[cat];
+                const catTotal = items.filter((i) => i.category === cat && !i.skipped).length;
+                const catDone = items.filter((i) => i.category === cat && !i.skipped && i.checked).length;
                 return (
                   <View key={cat} style={{ marginTop: 14 }}>
                     <TouchableOpacity onPress={() => { animateListChange(); toggleCollapse(cat); }} style={s.catHeader}>
-                      <Text style={s.catHeaderText}>{cat}</Text>
+                      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                        <Text style={s.catHeaderText}>{cat}</Text>
+                        <View style={[s.catCountPill, catDone === catTotal && { backgroundColor: t.accentSoft }]}>
+                          <Text style={{ color: catDone === catTotal ? t.accent : t.muted, fontSize: 11, fontWeight: "800" }}>{catDone}/{catTotal}</Text>
+                        </View>
+                      </View>
                       <ChevronDown size={15} color={t.muted} style={{ transform: [{ rotate: isCollapsed ? "-90deg" : "0deg" }] }} />
                     </TouchableOpacity>
                     {!isCollapsed && (
                       <View style={{ gap: 8, marginTop: 6 }}>
-                        {catItems.map((item) => (
+                        {catItems.map((item) => {
+                          const qtyNum = Number(item.qty) || 0;
+                          const hasNoteText = !!noteValue(item).trim();
+                          const showNote = hasNoteText || !!noteOpen[item.id];
+                          return (
                           <Swipeable
                             key={item.id}
+                            ref={(r) => { if (r) swipeRefs.current[item.id] = r; else delete swipeRefs.current[item.id]; }}
                             overshootRight={false}
+                            overshootLeft={false}
                             renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                            renderLeftActions={() => <SwipeCheckAction t={t} checked={item.checked} />}
+                            onSwipeableOpen={(direction) => {
+                              if (direction === "left") {
+                                updateItem(item.id, { checked: !item.checked });
+                                swipeRefs.current[item.id]?.close();
+                              }
+                            }}
                           >
                           <View style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
+                            {/* Row 1: checkbox, emoji, name + unit, quantity stepper */}
                             <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
                               <AnimatedCheckbox
                                 checked={item.checked}
                                 onPress={() => updateItem(item.id, { checked: !item.checked })}
                                 style={[s.checkbox, { borderColor: item.checked ? t.accent : t.border, backgroundColor: item.checked ? t.accent : "transparent" }]}
                               />
-                              <Text style={{ fontSize: 17 }}>{getIcon(item.name)}</Text>
+                              <Text style={{ fontSize: 18 }}>{getIcon(item.name)}</Text>
                               <View style={{ flex: 1, minWidth: 0 }}>
-                                <Text style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
-                                <Text style={s.itemUnit}>{item.unit}</Text>
+                                <Text numberOfLines={1} style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
+                                <Text numberOfLines={1} style={s.itemUnit}>{item.unit}</Text>
                               </View>
-                             <TouchableOpacity
-                              onPress={() => {
+                              <View style={s.stepper}>
+                                <TouchableOpacity
+                                  onPress={() => {
                                     tapHaptic(Haptics.ImpactFeedbackStyle.Light);
-                                    updateItem(item.id, { qty: Math.max(0, Number(item.qty) - 1) });
-                                   }}
-                                  disabled={Number(item.qty) <= 0}
-                                  style={[
-                                    s.qtyBtn,
-                                    Number(item.qty) <= 0 && { opacity: 0.5 }
-                                  ]}
+                                    updateItem(item.id, { qty: Math.max(0, qtyNum - 1) });
+                                  }}
+                                  disabled={qtyNum <= 0}
+                                  hitSlop={{ top: 6, bottom: 6, left: 4, right: 2 }}
+                                  accessibilityLabel={`Decrease quantity of ${item.name}`}
+                                  style={[s.qtyBtn, qtyNum <= 0 && { opacity: 0.4 }]}
                                 >
-                                <Text style={s.qtyBtnText}>−</Text>
-                              </TouchableOpacity>
-                              <Text style={s.qtyValue}>{item.qty}</Text>
-                              <TouchableOpacity
-                                onPress={() => {
-                                  tapHaptic(Haptics.ImpactFeedbackStyle.Light);
-                                  updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) });
+                                  <Text style={s.qtyBtnText}>−</Text>
+                                </TouchableOpacity>
+                                <Text style={s.qtyValue}>{qtyNum}</Text>
+                                <TouchableOpacity
+                                  onPress={() => {
+                                    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                    updateItem(item.id, { qty: Math.min(999, qtyNum + 1) });
+                                  }}
+                                  disabled={qtyNum >= 999}
+                                  hitSlop={{ top: 6, bottom: 6, left: 2, right: 4 }}
+                                  accessibilityLabel={`Increase quantity of ${item.name}`}
+                                  style={[s.qtyBtn, qtyNum >= 999 && { opacity: 0.4 }]}
+                                >
+                                  <Text style={s.qtyBtnText}>+</Text>
+                                </TouchableOpacity>
+                              </View>
+                            </View>
+
+                            {/* Row 2 (always visible): price, note, skip */}
+                            <View style={s.itemDetailsRow}>
+                              <TextInput
+                                keyboardType="decimal-pad"
+                                placeholder={qtyNum > 0 ? currency.symbol : "Qty first"}
+                                placeholderTextColor={t.muted}
+                                value={priceValue(item)}
+                                editable={qtyNum > 0}
+                                onChangeText={(v) => {
+                                  const numericValue = v.replace(/[^0-9.]/g, "");
+                                  // Allow only one decimal point
+                                  const parts = numericValue.split(".");
+                                  const cleanedValue =
+                                    parts.length > 2
+                                      ? parts[0] + "." + parts.slice(1).join("")
+                                      : numericValue;
+                                  setPriceDrafts((prev) => ({ ...prev, [item.id]: cleanedValue }));
                                 }}
-                                disabled={Number(item.qty) >= 999}
-                                style={[s.qtyBtn, Number(item.qty) >= 999 && { opacity: 0.5 }]}
-                              >
-                                <Text style={s.qtyBtnText}>+</Text>
-                              </TouchableOpacity>
-                           <TextInput
-                            keyboardType="decimal-pad"
-                            placeholder={currency.symbol}
-                            placeholderTextColor={t.muted}
-                            value={priceValue(item)}
-                            editable={Number(item.qty) > 0}
-                            onChangeText={(v) => {
-                              const numericValue = v.replace(/[^0-9.]/g, "");
-
-                              // Allow only one decimal point
-                              const parts = numericValue.split(".");
-                              const cleanedValue =
-                                parts.length > 2
-                                  ? parts[0] + "." + parts.slice(1).join("")
-                                  : numericValue;
-
-                              setPriceDrafts((prev) => ({
-                                ...prev,
-                                [item.id]: cleanedValue,
-                              }));
-                            }}
-                            onBlur={() => commitPrice(item)}
-                            style={s.priceInput}
-                          />
+                                onBlur={() => commitPrice(item)}
+                                style={[s.priceInput, { width: 84, paddingVertical: 8 }, qtyNum <= 0 && { opacity: 0.5 }]}
+                              />
+                              {/* Note is optional: shows as a small "Add note" button until tapped (or if a note already exists) */}
+                              {showNote ? (
+                                <TextInput
+                                  autoFocus={!!noteOpen[item.id] && !hasNoteText}
+                                  value={noteValue(item)}
+                                  onChangeText={(v) => setNoteDrafts((prev) => ({ ...prev, [item.id]: v }))}
+                                  onBlur={() => {
+                                    const draft = noteDrafts[item.id];
+                                    const finalVal = draft !== undefined ? draft.trim() : (item.note || "").trim();
+                                    commitNote(item);
+                                    if (!finalVal) setNoteOpen((prev) => { const n = { ...prev }; delete n[item.id]; return n; });
+                                  }}
+                                  maxLength={60}
+                                  placeholder="Note (e.g. only Amul)"
+                                  placeholderTextColor={t.muted}
+                                  style={[s.input, { flex: 1, minWidth: 0, paddingVertical: 8, fontSize: 12.5 }]}
+                                />
+                              ) : (
+                                <TouchableOpacity
+                                  onPress={() => setNoteOpen((prev) => ({ ...prev, [item.id]: true }))}
+                                  accessibilityLabel={`Add a note to ${item.name}`}
+                                  style={s.addNoteBtn}
+                                >
+                                  <Pencil size={13} color={t.muted} />
+                                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "600" }}>Add note</Text>
+                                </TouchableOpacity>
+                              )}
                               {!item.checked && (
-                                <TouchableOpacity onPress={() => updateItem(item.id, { skipped: true })} style={{ padding: 2 }}>
-                                  <EyeOff size={15} color={t.muted} />
+                                <TouchableOpacity
+                                  onPress={() => updateItem(item.id, { skipped: true })}
+                                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                                  accessibilityLabel={`Skip ${item.name} this time`}
+                                  style={s.skipIconBtn}
+                                >
+                                  <EyeOff size={17} color={t.muted} />
                                 </TouchableOpacity>
                               )}
                             </View>
-                            <TextInput
-                              value={noteValue(item)}
-                              onChangeText={(v) => setNoteDrafts((prev) => ({ ...prev, [item.id]: v }))}
-                              onBlur={() => commitNote(item)}
-                              maxLength={60}
-                              placeholder="Add a note (e.g. only Amul, small pack)"
-                              placeholderTextColor={t.muted}
-                              style={s.noteInput}
-                            />
                           </View>
                           </Swipeable>
-                        ))}
+                          );
+                        })}
                       </View>
                     )}
                   </View>
@@ -2396,7 +2526,7 @@ function confirmStartNewTrip() {
                           {item.category} · {item.unit}
                         </Text>
                       </View>
-                      <TouchableOpacity onPress={() => startEditItem(item)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
+                      <TouchableOpacity onPress={() => startEditItem(item)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel={`Edit ${item.name}`} style={{ padding: 8 }}><Pencil size={17} color={t.muted} /></TouchableOpacity>
                     </View>
                   </View>
                   </Swipeable>
@@ -2530,7 +2660,7 @@ function confirmStartNewTrip() {
                   {/* <TouchableOpacity onPress={() => toggleReminders(!reminderSettings.enabled)} style={[s.toggleTrack, reminderSettings.enabled && s.toggleTrackOn]}>
                     <View style={[s.toggleThumb, reminderSettings.enabled && s.toggleThumbOn]} />
                   </TouchableOpacity> */}
-                  <Text style={{ color: user ? t.danger : t.accent2, fontSize: 11.5, fontWeight: "700" }}>
+                  <Text style={{ color: t.muted, fontSize: 11.5, fontWeight: "700" }}>
                      Coming Soon
                     </Text>
                 </View>
@@ -2625,6 +2755,21 @@ function confirmStartNewTrip() {
             </Animated.View>
           );
         })() : null}
+
+        {/* ===== Floating "Undo" snackbar — overlays, never pushes content ===== */}
+        {pendingDelete ? (
+          <View pointerEvents="box-none" style={s.snackbarWrap}>
+            <View style={s.snackbar}>
+              <Trash2 size={15} color={t.muted} />
+              <Text numberOfLines={1} style={{ flex: 1, color: t.text, fontSize: 13, fontWeight: "600" }}>
+                Deleted "{pendingDelete.item.name}"
+              </Text>
+              <TouchableOpacity onPress={undoDelete} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} style={s.snackbarUndo}>
+                <Text style={{ color: t.accent, fontWeight: "800", fontSize: 13 }}>Undo</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        ) : null}
       </KeyboardAvoidingView>
 
       {/* ===== Bottom tab bar (outside KeyboardAvoidingView so it stays
@@ -2653,57 +2798,93 @@ function confirmStartNewTrip() {
           window on open/close, and that window transition is what was
           showing up as a flash/flicker every time a popup opened. */}
       {listsModalOpen && (
-        <KeyboardAvoidingView style={[s.overlayFill, { zIndex: 40, elevation: 20 }]} behavior={Platform.OS === "ios" ? "padding" : "height"}>
-        <Pressable style={s.modalBackdrop} onPress={() => setListsModalOpen(false)}>
-          <Pressable style={s.listsSheet} onPress={() => {}}>
-            <ScrollView keyboardShouldPersistTaps="handled">
-              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                <Text style={s.sheetTitle}>Your lists</Text>
-                <View style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
-                  <TouchableOpacity onPress={openNewListModal} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                    <Plus size={16} color={t.accent} />
-                    <Text style={{ color: t.accent, fontWeight: "700", fontSize: 13 }}>New list</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity onPress={() => setListsModalOpen(false)}><X size={18} color={t.muted} /></TouchableOpacity>
-                </View>
-              </View>
-
-              <View style={{ gap: 8 }}>
-                {lists.map((list) => (
-                  <View key={list.id} style={[s.listRow, { borderColor: list.id === selectedListId ? t.accent : t.border }]}>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                      {/* <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
-                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}{list.id === selectedListId ? " · current" : ""}</Text>
-                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
-                      </TouchableOpacity> */}
-                      <TouchableOpacity onPress={() => { setSelectedListId(list.id); setListsModalOpen(false); }} style={{ flex: 1 }}>
-                        <Text style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>
-                          {list.name}
-                          {list.id === selectedListId ? "" : ""}
-                          {!!list.role && (cloudMembersByList[list.id]?.length || 0) > 1 ? "(Shared)" : ""}
-                        </Text>
-                        <Text style={{ fontSize: 11.5, color: t.muted }}>{Object.keys(itemsByList[list.id] || {}).length} items</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity onPress={() => startRenameList(list)} style={{ padding: 4 }}><Pencil size={15} color={t.muted} /></TouchableOpacity>
-                      <TouchableOpacity onPress={() => setConfirmDeleteListId(list.id)} style={{ padding: 4 }}><Trash2 size={15} color={t.danger} /></TouchableOpacity>
-                    </View>
-                    {confirmDeleteListId === list.id && (
-                      <View style={s.confirmDeleteBox}>
-                        <Text style={{ fontSize: 12, color: t.text }}>Delete "{list.name}" and all its items? This can't be undone.</Text>
-                        <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-                          <TouchableOpacity onPress={() => deleteList(list.id)} style={[s.smallBtn, { backgroundColor: t.danger, borderColor: t.danger }]}><Text style={[s.smallBtnText, { color: "#fff" }]}>Delete</Text></TouchableOpacity>
-                          <TouchableOpacity onPress={() => setConfirmDeleteListId(null)} style={s.smallBtn}><Text style={s.smallBtnText}>Cancel</Text></TouchableOpacity>
-                        </View>
-                      </View>
-                    )}
+        <View style={[s.overlayFill, { zIndex: 40, elevation: 20 }]}>
+          <Pressable style={[s.listsBackdrop, { paddingTop: insets.top + 84 }]} onPress={closeListsModal}>
+            <Animated.View style={{ opacity: listsAnim, transform: [{ translateY: listsAnim.interpolate({ inputRange: [0, 1], outputRange: [-14, 0] }) }] }}>
+              <Pressable style={s.listsPanel} onPress={() => {}}>
+                {/* Header */}
+                <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 12 }}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={s.sheetTitle}>Your lists</Text>
+                    <Text style={{ color: t.muted, fontSize: 12, marginTop: 1 }}>
+                      {lists.length} {lists.length === 1 ? "list" : "lists"} · tap one to switch
+                    </Text>
                   </View>
-                ))}
-              </View>
+                  <TouchableOpacity onPress={closeListsModal} style={s.listActionBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <X size={16} color={t.muted} />
+                  </TouchableOpacity>
+                </View>
 
-            </ScrollView>
+                {/* Shows exactly 3 rows at a time; scrolls when there are more */}
+                <ScrollView
+                  style={{ maxHeight: LIST_ROW_HEIGHT * 3 + 8 * 2 }}
+                  contentContainerStyle={{ gap: 8 }}
+                  nestedScrollEnabled
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={lists.length > 3}
+                >
+                  {lists.map((list) => {
+                    const isCurrent = list.id === selectedListId;
+                    const itemCount = Object.keys(itemsByList[list.id] || {}).length;
+                    const isShared = !!list.role && (cloudMembersByList[list.id]?.length || 0) > 1;
+                    const listTotal = Object.values(itemsByList[list.id] || {}).reduce((sum, it) => sum + safeAmount(it.price), 0);
+                    return (
+                      <View key={list.id} style={[s.listItem, isCurrent && s.listItemActive]}>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: LIST_ROW_HEIGHT - 22 }}>
+                          <TouchableOpacity
+                            activeOpacity={0.7}
+                            onPress={() => { setSelectedListId(list.id); closeListsModal(); }}
+                            style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 10 }}
+                          >
+                            <View style={[s.listItemIcon, isCurrent && { backgroundColor: t.accent }]}>
+                              {isCurrent ? <Check size={16} color="#fff" /> : <ListChecks size={16} color={t.accent} />}
+                            </View>
+                            <View style={{ flex: 1, minWidth: 0 }}>
+                              <Text numberOfLines={1} style={{ fontWeight: "700", fontSize: 14.5, color: t.text }}>{list.name}</Text>
+                              <Text numberOfLines={1} style={{ fontSize: 11.5, color: isCurrent ? t.accent : t.muted, marginTop: 1 }}>
+                                {itemCount} {itemCount === 1 ? "item" : "items"}{listTotal > 0 ? ` · ${currency.symbol}${listTotal.toFixed(0)}` : ""}{isShared ? " · Shared" : ""}{isCurrent ? " · Current" : ""}
+                              </Text>
+                            </View>
+                          </TouchableOpacity>
+                          <TouchableOpacity onPress={() => startRenameList(list)} style={s.listActionBtn} accessibilityLabel="Rename list">
+                            <Pencil size={15} color={t.muted} />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            onPress={() => setConfirmDeleteListId(list.id)}
+                            style={[s.listActionBtn, { backgroundColor: t.dangerSoft }]}
+                            accessibilityLabel="Delete list"
+                          >
+                            <Trash2 size={15} color={t.danger} />
+                          </TouchableOpacity>
+                        </View>
+                        {confirmDeleteListId === list.id && (
+                          <View style={s.confirmDeleteBox}>
+                            <Text style={{ fontSize: 12, color: t.text }}>Delete "{list.name}" and all its items? This can't be undone.</Text>
+                            <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                              <TouchableOpacity onPress={() => deleteList(list.id)} style={[s.smallBtn, { backgroundColor: t.danger, borderColor: t.danger }]}><Text style={[s.smallBtnText, { color: "#fff" }]}>Delete</Text></TouchableOpacity>
+                              <TouchableOpacity onPress={() => setConfirmDeleteListId(null)} style={s.smallBtn}><Text style={s.smallBtnText}>Cancel</Text></TouchableOpacity>
+                            </View>
+                          </View>
+                        )}
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+
+                {lists.length > 3 && (
+                  <Text style={{ color: t.muted, fontSize: 11.5, textAlign: "center", marginTop: 8 }}>
+                    Scroll to see {lists.length - 3} more
+                  </Text>
+                )}
+
+                <TouchableOpacity onPress={openNewListModal} style={[s.addItemBtn, { marginLeft: 0, marginTop: 12, justifyContent: "center" }]}>
+                  <Plus size={16} color="#fff" />
+                  <Text style={{ color: "#fff", fontWeight: "700", fontSize: 14 }}>New list</Text>
+                </TouchableOpacity>
+              </Pressable>
+            </Animated.View>
           </Pressable>
-        </Pressable>
-        </KeyboardAvoidingView>
+        </View>
       )}
 
       {/* ===== Rename list popup — its own screen instead of an inline row,
@@ -3318,7 +3499,7 @@ function OnboardingScreen({ t, dark, onGetStarted, signingIn }) {
         </View>
 
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.text, lineHeight: 34 }}>
-          Remember what to Buy
+          Remember what To buy
         </Text>
         <Text style={{ fontSize: 27, fontWeight: "800", color: t.accent, lineHeight: 34, marginBottom: 14 }}>
           Shop smarter. Together.
@@ -3425,7 +3606,7 @@ function makeStyles(t) {
     searchWrap: { marginHorizontal: 18, marginTop: 16, marginBottom: 8, position: "relative", justifyContent: "center" },
     searchIcon: { position: "absolute", left: 14, zIndex: 1 },
     searchInput: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 11, paddingLeft: 38, paddingRight: 12, color: t.text, fontSize: 14 },
-    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 18, marginTop: 4, ...cardShadow },
+    summaryCard: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 14, marginTop: 4, ...cardShadow },
     newTripBtn: { marginTop: 14, backgroundColor: t.accentSoft, borderRadius: RADIUS.md, padding: 10, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
     emptyText: { textAlign: "center", color: t.muted, fontSize: 13, paddingVertical: 24 },
     catHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6, paddingHorizontal: 2 },
@@ -3434,9 +3615,20 @@ function makeStyles(t) {
     checkbox: { width: 22, height: 22, borderRadius: 7, borderWidth: 2, alignItems: "center", justifyContent: "center" },
     itemName: { fontSize: 14, fontWeight: "700", color: t.text },
     itemUnit: { fontSize: 11.5, color: t.muted, marginTop: 1 },
-    qtyBtn: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: 8, width: 24, height: 24, alignItems: "center", justifyContent: "center" },
-    qtyBtnText: { color: t.text, fontSize: 15, fontWeight: "700" },
-    qtyValue: { minWidth: 20, textAlign: "center", fontSize: 13, fontWeight: "700", color: t.text },
+    stepper: { flexDirection: "row", alignItems: "center", backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.pill, padding: 2 },
+    qtyBtn: { backgroundColor: t.surface, borderRadius: RADIUS.pill, width: 32, height: 32, alignItems: "center", justifyContent: "center" },
+    qtyBtnText: { color: t.text, fontSize: 18, fontWeight: "700", marginTop: -1 },
+    qtyValue: { minWidth: 26, textAlign: "center", fontSize: 14, fontWeight: "800", color: t.text },
+    addNoteBtn: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 9, borderRadius: RADIUS.md, borderWidth: 1, borderStyle: "dashed", borderColor: t.border },
+    itemDetailsRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10 },
+    skipIconBtn: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, alignItems: "center", justifyContent: "center" },
+    catCountPill: { backgroundColor: t.surface2, borderRadius: RADIUS.pill, paddingHorizontal: 8, paddingVertical: 2 },
+    tripIconBtn: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center" },
+    progressTrack: { height: 6, borderRadius: 3, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, overflow: "hidden", marginTop: 12 },
+    progressFill: { height: "100%", borderRadius: 3, backgroundColor: t.accent },
+    snackbarWrap: { position: "absolute", left: 16, right: 16, bottom: 12, zIndex: 90, elevation: 12 },
+    snackbar: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, paddingVertical: 10, paddingLeft: 14, paddingRight: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 6 } },
+    snackbarUndo: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft },
 
     priceInput: { width: 58, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.sm, paddingVertical: 6, paddingHorizontal: 8, fontSize: 12.5, color: t.text },
     menuBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "transparent", alignItems: "flex-end", paddingTop: 58, paddingRight: 16, zIndex: 50, elevation: 10 },
@@ -3471,6 +3663,14 @@ function makeStyles(t) {
     popupCard: { width: "100%", maxWidth: 420, backgroundColor: t.bg, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 20 },
     sheetTitle: { fontSize: 18, fontWeight: "800", color: t.text },
     listRow: { backgroundColor: t.surface, borderWidth: 1, borderRadius: RADIUS.md, padding: 12, ...cardShadow },
+
+    // ---- "Your lists" dropdown panel ----
+    listsBackdrop: { flex: 1, backgroundColor: "rgba(15,17,30,0.55)", paddingHorizontal: 14 },
+    listsPanel: { backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.lg, padding: 16, elevation: 8, shadowColor: "#000", shadowOpacity: 0.25, shadowRadius: 14, shadowOffset: { width: 0, height: 8 } },
+    listItem: { backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, borderRadius: RADIUS.md, padding: 10 },
+    listItemActive: { backgroundColor: t.accentSoft, borderColor: t.accent },
+    listItemIcon: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center" },
+    listActionBtn: { width: 34, height: 34, borderRadius: RADIUS.pill, backgroundColor: t.surface, borderWidth: 1, borderColor: t.border, alignItems: "center", justifyContent: "center" },
     confirmDeleteBox: { marginTop: 8, padding: 10, backgroundColor: t.dangerSoft, borderWidth: 1, borderColor: `${t.danger}55`, borderRadius: RADIUS.sm },
 
     // ---- New sections: Master Items / Family / Profile ----

@@ -23,6 +23,7 @@
 
 import { Platform } from "react-native";
 import Constants from "expo-constants";
+import * as Application from "expo-application";
 import * as Device from "expo-device";
 import * as Notifications from "expo-notifications";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -30,10 +31,13 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { registerPushToken, unregisterPushToken } from "../utils/api";
 import { captureError, addBreadcrumb } from "../utils/sentry";
 
-// Last token we successfully sent to the backend. Persisted so a relaunch
-// doesn't re-POST the same token on every cold start — Expo tokens are
-// stable for a given install, so re-registering every launch is pure noise.
+// What we last successfully sent to the backend: { token, deviceId, at }.
+// Skipping the POST when nothing changed keeps launches cheap, BUT we still
+// re-register once REREGISTER_AFTER_MS has passed so the server's
+// last_seen_at stays fresh (the server purges devices unseen for ~60 days).
+// Older app versions stored a bare token string here; readCache() accepts both.
 const TOKEN_KEY = "mindcart_push_token_v1";
+const REREGISTER_AFTER_MS = 24 * 60 * 60 * 1000;
 
 // Android needs channels declared before anything is posted, or the OS
 // silently drops the notification. One channel per category so the user can
@@ -75,6 +79,8 @@ Notifications.setNotificationHandler({
 
 let receivedSub = null;
 let responseSub = null;
+let tokenSub = null;
+let inflight = null;   // dedupes concurrent registerDevice() calls
 let initialised = false;
 const tapHandlers = new Set();
 
@@ -111,6 +117,30 @@ async function ensureAndroidChannels() {
 // Permissions
 // ---------------------------------------------------------------------------
 
+// Stable per-physical-device id. Survives reinstall / clear-data on Android
+// (Android ID) and usually on iOS (vendor id), which is what lets the server
+// REPLACE a device's old token instead of adding a second row.
+async function getDeviceId() {
+  try {
+    if (Platform.OS === "android") return Application.getAndroidId() || null;
+    if (Platform.OS === "ios") return (await Application.getIosIdForVendorAsync()) || null;
+  } catch (e) {
+    captureError(e, { scope: "notifications.deviceId" });
+  }
+  return null;
+}
+
+async function readCache() {
+  try {
+    const raw = await AsyncStorage.getItem(TOKEN_KEY);
+    if (!raw) return null;
+    if (raw.startsWith("Expo")) return { token: raw };          // legacy format
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function requestPermission() {
   const existing = await Notifications.getPermissionsAsync();
   if (existing.granted) return true;
@@ -143,7 +173,7 @@ const notificationService = {
       this._attachListeners();
       initialised = true;
  
-      const result = await this.registerDevice();
+      const result = await this.registerDevice({ force });
       // console.log("[PUSH] Device registration result:", result);
       return { ok: true, ...result };
     } catch (e) {
@@ -157,136 +187,64 @@ const notificationService = {
    * to the backend. Split out from init() so a settings screen can offer a
    * "turn on notifications" button that re-runs just this part.
    */
-  async registerDevice() {
-    // Push tokens only exist on real hardware. Simulators get local
-    // notifications but never a push token.
-    // if (!Device.isDevice) {
-    //   return { registered: false, reason: "simulator" };
-    // }
-
-  //   const granted = await requestPermission();
-  //   if (!granted) {
-  //     addBreadcrumb("push permission denied");
-  //     return { registered: false, reason: "permission-denied" };
-  //   }
-
-  //   const projectId = resolveProjectId();
-  //   if (!projectId) {
-  //     // Without the EAS projectId, getExpoPushTokenAsync throws in bare/dev
-  //     // builds. Surface it to Sentry — it means app.json lost extra.eas.
-  //     captureError(new Error("Missing EAS projectId for push token"), {
-  //       scope: "notifications.registerDevice",
-  //     });
-  //     return { registered: false, reason: "missing-project-id" };
-  //   }
-
-  //   const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId });
-  //   if (!token) return { registered: false, reason: "no-token" };
-
-  //   const previous = await AsyncStorage.getItem(TOKEN_KEY);
-  //   if (previous === token) {
-  //     return { registered: true, token, cached: true };
-  //   }
-
-  //   await registerPushToken({
-  //     token,
-  //     platform: Platform.OS,
-  //     deviceName: Device.deviceName || null,
-  //     appVersion: Constants?.expoConfig?.version || null,
-  //   });
-  //   await AsyncStorage.setItem(TOKEN_KEY, token);
-  //   addBreadcrumb("push token registered");
-  //   return { registered: true, token };
-  // },
-  console.log("[PUSH] Starting device registration");
-
-const granted = await requestPermission();
-
-// console.log("[PUSH] Permission result:", granted);
-
-if (!granted) {
-  console.log("[PUSH] ❌ Permission denied");
-  addBreadcrumb("push permission denied");
-  return { registered: false, reason: "permission-denied" };
-}
-
-// console.log("[PUSH] ✅ Notification permission granted");
-
-const projectId = resolveProjectId();
-
-
-if (!projectId) {
-  console.log("[PUSH] ❌ Missing EAS projectId");
-
-  captureError(new Error("Missing EAS projectId for push token"), {
-    scope: "notifications.registerDevice",
-  });
-
-  return { registered: false, reason: "missing-project-id" };
-}
-
-// console.log("[PUSH] Requesting Expo push token...");
-
-try {
-  const { data: token } =
-    await Notifications.getExpoPushTokenAsync({
-      projectId,
+  async registerDevice({ force = false } = {}) {
+    // init() can be triggered twice at once (session restore + sign-in);
+    // share one in-flight registration instead of racing two POSTs.
+    if (inflight) return inflight;
+    inflight = this._registerDeviceImpl(force).finally(() => {
+      inflight = null;
     });
+    return inflight;
+  },
 
+  async _registerDeviceImpl(force) {
+    const granted = await requestPermission();
+    if (!granted) {
+      addBreadcrumb("push permission denied");
+      return { registered: false, reason: "permission-denied" };
+    }
 
+    const projectId = resolveProjectId();
+    if (!projectId) {
+      // Without the EAS projectId, getExpoPushTokenAsync throws in bare/dev
+      // builds. It means app.json lost extra.eas.
+      captureError(new Error("Missing EAS projectId for push token"), {
+        scope: "notifications.registerDevice",
+      });
+      return { registered: false, reason: "missing-project-id" };
+    }
 
-  if (!token) {
-    console.log("[PUSH] ❌ No Expo push token returned");
-    return { registered: false, reason: "no-token" };
-  }
+    try {
+      const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId });
+      if (!token) return { registered: false, reason: "no-token" };
 
+      const deviceId = await getDeviceId();
 
-  const previous = await AsyncStorage.getItem(TOKEN_KEY);
+      // Skip the network call only if token AND device are unchanged AND we
+      // registered recently. `force` (explicit sign-in, token rotation)
+      // always goes through.
+      const cache = await readCache();
+      const fresh = cache?.at && Date.now() - cache.at < REREGISTER_AFTER_MS;
+      if (!force && cache?.token === token && cache?.deviceId === deviceId && fresh) {
+        return { registered: true, token, cached: true };
+      }
 
+      await registerPushToken({
+        token,
+        deviceId,
+        platform: Platform.OS,
+        deviceName: Device.deviceName || null,
+        appVersion: Constants?.expoConfig?.version || null,
+      });
+      await AsyncStorage.setItem(TOKEN_KEY, JSON.stringify({ token, deviceId, at: Date.now() }));
 
-  if (previous === token) {
-    // console.log("[PUSH] ✅ Token already registered/cached");
-
-    return {
-      registered: true,
-      token,
-      cached: true,
-    };
-  }
-
-  console.log("[PUSH] Registering token with backend...");
-
-  await registerPushToken({
-    token,
-    platform: Platform.OS,
-    deviceName: Device.deviceName || null,
-    appVersion: Constants?.expoConfig?.version || null,
-  });
-
-  await AsyncStorage.setItem(TOKEN_KEY, token);
-
-
-  addBreadcrumb("push token registered");
-
-  console.log("[PUSH] 🎉 Device push registration completed");
-
-  return {
-    registered: true,
-    token,
-  };
-} catch (error) {
-  console.log("[PUSH] ❌ Push registration failed:", error);
-
-  captureError(error, {
-    scope: "notifications.registerDevice",
-  });
-
-  return {
-    registered: false,
-    reason: "registration-failed",
-    error,
-  };
-}},
+      addBreadcrumb("push token registered");
+      return { registered: true, token };
+    } catch (error) {
+      captureError(error, { scope: "notifications.registerDevice" });
+      return { registered: false, reason: "registration-failed", error };
+    }
+  },
 
   /**
    * Call on sign-out. Removes the token server-side so the next person to
@@ -295,7 +253,8 @@ try {
    */
   async teardown() {
     try {
-      const token = await AsyncStorage.getItem(TOKEN_KEY);
+      const cache = await readCache();
+      const token = cache?.token;
       if (token) {
         // Best-effort: if the network is down the row is still cleaned up
         // server-side the first time Expo reports DeviceNotRegistered.
@@ -373,6 +332,12 @@ try {
   _attachListeners() {
     this._detachListeners();
 
+    // The device's native push token was rotated by the OS/FCM: re-register
+    // right away so the server never keeps sending to the old one.
+    tokenSub = Notifications.addPushTokenListener(() => {
+      this.registerDevice({ force: true }).catch(() => {});
+    });
+
     // Arrived while the app is in the foreground.
     receivedSub = Notifications.addNotificationReceivedListener((notification) => {
       const data = notification?.request?.content?.data || {};
@@ -397,8 +362,10 @@ try {
   _detachListeners() {
     receivedSub?.remove?.();
     responseSub?.remove?.();
+    tokenSub?.remove?.();
     receivedSub = null;
     responseSub = null;
+    tokenSub = null;
   },
 };
 

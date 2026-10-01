@@ -17,7 +17,7 @@
 
 import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { registerExecutors, enqueue, startSync, subscribe, getPendingCount, getPendingListIds, setOnDropped } from "./syncQueue";
+import { registerExecutors, enqueue, startSync, subscribe, getPendingCount, getPendingListIds, setOnDropped, setOnSynced, getPendingEntityKeys, flushAndWait } from "./syncQueue";
 
 // ============================================================
 // BACKEND URL — the #1 reason "nothing works" is this pointing
@@ -82,7 +82,6 @@ let cachedToken = null;
 export async function getToken() {
   if (cachedToken) return cachedToken;
   cachedToken = await AsyncStorage.getItem(TOKEN_KEY);
-  console.log("[api.js] Retrieved token from AsyncStorage:", cachedToken);
   return cachedToken;
 }
 export async function setToken(token) {
@@ -112,22 +111,12 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
 try {
   const fullUrl = `${API_BASE_URL}${path}`;
 
-  console.log("========== API REQUEST ==========");
-  console.log("URL:", fullUrl);
-  console.log("Method:", method);
-  console.log("Headers:", headers);
-  console.log("Body:", body);
-  console.log("=================================");
-
   res = await fetch(fullUrl, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
     signal: controller.signal,
   });
- console.log("-------------");
-  console.log(`[api.js] ${method} ${fullUrl} => ${res.status}`);
-   console.log("-------------");
 } catch (networkError) {
     // RN's fetch throws a generic "Network request failed" for anything
     // from "server not running" to "wrong IP for this device" to "phone
@@ -197,6 +186,9 @@ setOnDropped((op, err) => { if (dropListener) dropListener(op, err); });
 
 // Optional UI hook: subscribe to { pending, flushing } to show something
 // like "3 changes pending" while offline.
+export function onSyncSucceeded(fn) { setOnSynced(fn); }
+export const getPendingSyncKeys = getPendingEntityKeys;
+export const flushSyncQueue = flushAndWait;
 export const onSyncStatusChange = subscribe;
 export const getPendingSyncCount = getPendingCount;
 export const getPendingSyncListIds = getPendingListIds;

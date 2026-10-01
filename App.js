@@ -31,7 +31,7 @@ import {
   Barcode, Bell, Menu, BellRing, Info, Mail, ShieldCheck, FileText,
   ChevronRight, Users, Layers, UserCircle2, Eye,
   Cloud, Crown, Sparkles, LogOut, Palette, Wallet, BellDot,
-  Zap, ArrowRight, Star, ShoppingBag, AlertCircle,
+  Zap, ArrowRight, Star, ShoppingBag, AlertCircle, StickyNote,
 } from "lucide-react-native";
 
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
@@ -48,7 +48,7 @@ import {
   createItem as createItemApi, updateItemApi, deleteItemApi,
   sendInvite, fetchInvites, acceptInvite, declineInvite, revokeInvite,
   changeMemberRole as changeMemberRoleApi, removeMember as removeMemberApi,
-  getPendingSyncListIds, onSyncDropped,
+  getPendingSyncListIds, onSyncDropped, onSyncSucceeded, getPendingSyncKeys, flushSyncQueue,
 } from "./src/utils/api";
 import { getSocket, connectSocket, joinListRoom, leaveListRoom } from "./src/utils/socket";
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
@@ -68,7 +68,7 @@ Sentry.init({
   enableLogs: true,
 
   // Configure Session Replay
-  replaysSessionSampleRate: 0.1,
+  replaysSessionSampleRate: 0, // was 0.1: recording sessions adds startup + runtime overhead; error replays below are kept
   replaysOnErrorSampleRate: 1,
   integrations: [Sentry.mobileReplayIntegration()],
 
@@ -161,7 +161,7 @@ const DEFAULT_CURRENCY = CURRENCIES[0];
 
 // ---------- About screen content ----------
 // Edit these to match your actual details before publishing.
-const APP_VERSION = "1.0.3";
+const APP_VERSION = "1.0.4";
 const DEVELOPER_NAME = "Sameer Shaikh";
 const PRIVACY_POLICY_URL = "https://example.com/privacy-policy";
 const CONTACT_EMAIL = "support@example.com";
@@ -244,6 +244,31 @@ function arrayToItemMap(arr) {
 }
 
 
+// Folds a server snapshot of a list's items into the local map WITHOUT
+// losing anything that hasn't round-tripped yet. `pendingKeys` = ids that
+// had an unsent op at any point while the snapshot was being fetched
+// (captured before the fetch AND after it — an op that finished mid-fetch
+// is not in the snapshot yet, so it must still count as pending).
+//   - id has a pending op  -> local copy wins (newest truth on this device);
+//                             if it's not local, it was deleted locally, so
+//                             don't resurrect it from the snapshot
+//   - otherwise            -> server copy wins
+function mergeCloudItems(localMap, cloudItems, pendingKeys) {
+  const cloud = arrayToItemMap(cloudItems || []);
+  const next = {};
+  for (const [id, it] of Object.entries(cloud)) {
+    if (pendingKeys.has(id)) {
+      if (localMap[id]) next[id] = localMap[id];
+    } else {
+      next[id] = it;
+    }
+  }
+  for (const [id, it] of Object.entries(localMap || {})) {
+    if (!(id in cloud) && pendingKeys.has(id)) next[id] = it; // created offline, not on server yet
+  }
+  return next;
+}
+
 function describeDroppedOp(op, lists) {
   const listId = op.payload?.listId || op.payload?.id;
   const list = lists.find((l) => l.id === listId);
@@ -261,6 +286,83 @@ function describeDroppedOp(op, lists) {
 
 // A checkbox that gives a small satisfying "pop" (scale bounce) + a light
 // haptic tap whenever it's toggled, instead of just flipping state instantly.
+// Numeric input for the item row (qty and price). The text being typed lives
+// INSIDE this component instead of in App's state. Before, every keystroke
+// went through App's setState, re-rendering the whole ~3,700-line component;
+// on Android that round-trip could snap the caret back to the end of the
+// text while editing in the middle. Now only this input re-renders while
+// typing; the value is committed to the item on blur (or if the row
+// unmounts mid-edit, e.g. the item moves to the Bought section).
+//   onLiveChange(draft)        optional; called per keystroke for local-only UI
+//   onCommit(draft, startText) called once when editing ends and text changed
+function DraftNumberInput({ value, onCommit, onLiveChange, sanitize, editable = true, style, placeholder, placeholderTextColor, keyboardType, maxLength, accessibilityLabel, autoShrink }) {
+  const [draft, setDraft] = useState(null); // null = not editing, show `value`
+  const draftRef = useRef(null);
+  const startRef = useRef("");
+  const commitRef = useRef(onCommit);
+  commitRef.current = onCommit;
+
+  const inputRef = useRef(null);
+  const timerRef = useRef(null);
+
+  // Save the current draft if it differs from the last saved text. Keeps the
+  // draft alive (used for the auto-save while typing).
+  function flush() {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    const d = draftRef.current;
+    if (d === null || d === startRef.current) return;
+    const start = startRef.current;
+    startRef.current = d;
+    commitRef.current(d, start);
+  }
+  function finish() {
+    if (draftRef.current === null) return;
+    flush();
+    draftRef.current = null;
+    setDraft(null);
+  }
+  useEffect(() => () => { flush(); }, []);
+
+  // Shrink the font as the number gets longer so big values (e.g. 10000000)
+  // stay fully visible and centered inside the fixed-width box.
+  const shown = String(draft !== null ? draft : (value ?? ""));
+  const len = shown.length;
+  const fitFont = autoShrink
+    ? { fontSize: len <= 5 ? 14 : len === 6 ? 13 : len === 7 ? 12 : len === 8 ? 11 : len === 9 ? 10 : 9 }
+    : null;
+
+  return (
+    <TextInput
+      value={draft !== null ? draft : value}
+      editable={editable}
+      keyboardType={keyboardType}
+      maxLength={maxLength}
+      placeholder={placeholder}
+      placeholderTextColor={placeholderTextColor}
+      accessibilityLabel={accessibilityLabel}
+      ref={inputRef}
+      textAlignVertical="center"
+      includeFontPadding={false}
+      returnKeyType="done"
+      blurOnSubmit
+      onSubmitEditing={() => { if (inputRef.current) inputRef.current.blur(); }}
+      onFocus={() => { startRef.current = String(value ?? ""); }}
+      onChangeText={(v) => {
+        const clean = sanitize ? sanitize(v) : v;
+        draftRef.current = clean;
+        setDraft(clean);
+        if (onLiveChange) onLiveChange(clean);
+        // Auto-save shortly after the last keystroke, so the value is kept
+        // even without tapping outside / a keyboard "done" button.
+        if (timerRef.current) clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(flush, 1000);
+      }}
+      onBlur={finish}
+      style={[style, fitFont]}
+    />
+  );
+}
+
 function AnimatedCheckbox({ checked, onPress, style }) {
   const scale = useRef(new Animated.Value(1)).current;
   function handlePress() {
@@ -406,6 +508,7 @@ export default Sentry.wrap(function DmartApp() {
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
   const [noteOpen, setNoteOpen] = useState({}); // itemId -> true while its (optional) note box is open
+  const [expandedItems, setExpandedItems] = useState({}); // itemId -> true while its 2nd row (unit / note / hide) is open
   const swipeRefs = useRef({}); // itemId -> Swipeable, so a right-swipe can close itself after acting
   const [pendingDelete, setPendingDelete] = useState(null); // { item, listId, timer }
   const pendingDeleteRef = useRef(null); // always the live entry, so back-to-back deletes can't miss it
@@ -510,6 +613,15 @@ export default Sentry.wrap(function DmartApp() {
     if (!user) return;
     setCloudSyncing(true);
     try {
+      // Push offline changes up FIRST so the snapshot we pull next already
+      // contains them, then remember which ids were pending at fetch time.
+      const pendingBefore = getPendingSyncKeys();
+      await flushSyncQueue().catch(() => {});
+      for (const k of getPendingSyncKeys()) pendingBefore.add(k);
+      // Still something unsent after the flush => the server is unreachable
+      // right now. Don't burn another full request timeout on GET /lists;
+      // keep showing local data and retry on the next reconnect/foreground.
+      if (getPendingSyncKeys().size > 0) return;
       const { lists: cloudLists } = await fetchLists();
       const cloudIds = new Set(cloudLists.map((cl) => cl.id));
 
@@ -574,12 +686,11 @@ export default Sentry.wrap(function DmartApp() {
           }
         }
 
-        const pendingListIds = getPendingSyncListIds();
+        const pendingKeys = new Set([...pendingBefore, ...getPendingSyncKeys()]);
         setItemsByList((prev) => {
           const next = { ...prev };
           for (const cl of cloudLists) {
-            if (pendingListIds.has(cl.id)) continue;
-            next[cl.id] = arrayToItemMap(cl.items);
+            next[cl.id] = mergeCloudItems(prev[cl.id] || {}, cl.items, pendingKeys);
           }
           return next;
         });
@@ -734,6 +845,9 @@ export default Sentry.wrap(function DmartApp() {
     try {
       if (accept) {
         await acceptInvite(invite.id);
+        const pendingBefore = getPendingSyncKeys();
+        await flushSyncQueue().catch(() => {});
+        for (const k of getPendingSyncKeys()) pendingBefore.add(k);
         const { lists: cloudLists } = await fetchLists();
         const cloudIds = new Set(cloudLists.map((cl) => cl.id));
         const { lostAccessIds } = mergeCloudOnAccept(listsRef.current, cloudLists);
@@ -745,12 +859,11 @@ export default Sentry.wrap(function DmartApp() {
         }
 
 
-        const pendingListIds = getPendingSyncListIds();
+        const pendingKeys = new Set([...pendingBefore, ...getPendingSyncKeys()]);
         setItemsByList((prev) => {
           const next = { ...prev };
           for (const cl of cloudLists) {
-            if (pendingListIds.has(cl.id)) continue;
-            next[cl.id] = arrayToItemMap(cl.items);
+            next[cl.id] = mergeCloudItems(prev[cl.id] || {}, cl.items, pendingKeys);
           }
           return next;
         });
@@ -779,6 +892,22 @@ export default Sentry.wrap(function DmartApp() {
       setRespondingInviteId(null);
     }
   }
+
+  // When a queued write (e.g. an item added offline) is finally confirmed
+  // by the server, swap the local "pending" copy for the real one right
+  // away — don't wait for a socket event (solo users have no socket).
+  useEffect(() => {
+    onSyncSucceeded((op, result) => {
+      if (op.type === "createItem" && result?.item && op.payload?.listId) {
+        const listId = op.payload.listId;
+        setItemsByList((prev) => {
+          const map = prev[listId];
+          if (!map || !map[result.item.id]) return prev; // deleted locally meanwhile — don't resurrect
+          return { ...prev, [listId]: { ...map, [result.item.id]: { ...map[result.item.id], ...result.item, pending: false } } };
+        });
+      }
+    });
+  }, []);
 
   useEffect(() => {
     onSyncDropped((op, err) => {
@@ -1297,7 +1426,14 @@ useEffect(() => {
   // recognize yet (that's what produced the "Just a second..." notice and,
   // worse, a duplicate list). This is normally sub-second: syncCloudLists()
   // fires the moment `user` is set, so this almost never actually renders.
-  if (!hasSyncedOnce) {
+  // Returning users already have their cloud lists cached on disk (they
+  // carry a server `role` / `cloudConfirmed`), so show them instantly and
+  // let the sync run in the background. Only a first-ever sign-in (nothing
+  // but the local placeholder list) has to wait for the server. Before,
+  // EVERY launch sat on this loader until GET /lists returned -- seconds on
+  // a cold backend, and up to 15s+ with a bad/no connection.
+  const hasCachedCloudLists = lists.some((l) => l.role || l.cloudConfirmed);
+  if (!hasSyncedOnce && !hasCachedCloudLists) {
     return <Loader t={{ bg: "#12141A", muted: "#8B92A3", accent: "#1FAD5C" }} />;
   }
 
@@ -1752,9 +1888,7 @@ useEffect(() => {
     // `pending` until the real server copy arrives over the socket once
     // the queue flushes. A genuine failure (bad request, no permission)
     // still throws and gets rolled back below.
-    if (user && !hasSyncedOnce) {
-      console.log("User:", user);
-      console.log("Has Synced Once:", hasSyncedOnce);
+    if (user && !hasSyncedOnce && !hasCachedCloudLists) {
       // Shouldn't normally be reachable now that the render gate above
       // covers this window — kept as a safety net for any call path that
       // doesn't go through the screen (e.g. a queued/background retry).
@@ -1812,13 +1946,20 @@ useEffect(() => {
     bumpActivity(selectedListId);
   }
 
-  function updateItem(id, patch) {
+  function updateItem(id, patch, previousOverride) {
     if (!canWrite) { setNotice("You have view-only access to this list."); return; }
     if (patch.qty !== undefined) patch = { ...patch, qty: clampQty(patch.qty) };
-    if (patch.price !== undefined) patch = { ...patch, price: clampPrice(patch.price) };
+    // An emptied price box must really clear the price. Locally it's "" (the
+    // input shows nothing); to the server it's sent as null, because "" is
+    // ignored/rejected there and the old value (e.g. 100) came straight back
+    // through the item:updated socket event.
+    const clearingPrice = patch.price !== undefined && (patch.price === null || String(patch.price).trim() === "");
+    if (patch.price !== undefined) patch = { ...patch, price: clearingPrice ? "" : clampPrice(patch.price) };
     if (patch.checked !== undefined || patch.skipped !== undefined) animateListChange();
     const listId = selectedListId;
-    const previous = items.find((i) => i.id === id);
+    // previousOverride: for inputs that already patched locally while typing,
+    // so a failed save rolls back to the real pre-edit value, not the typed one.
+    const previous = previousOverride || items.find((i) => i.id === id);
     patchItem(listId, id, patch);
     if (patch.checked !== undefined) bumpActivity(listId);
     // Optimistic: local state already updated above for a snappy UI; this
@@ -1827,7 +1968,7 @@ useEffect(() => {
     // of rejecting — nothing to undo. A real failure (not a connectivity
     // one) still undoes the local change so this device doesn't silently
     // drift from what's actually saved.
-    updateItemApi(listId, id, patch).catch((e) => {
+    updateItemApi(listId, id, clearingPrice ? { ...patch, price: null } : patch).catch((e) => {
       if (previous) upsertItem(listId, previous);
       setNotice(`Change didn't save, so it's been undone: ${e?.message || "network error"}`);
     });
@@ -1941,7 +2082,7 @@ function startNewTrip() {
     // the old checked/qty/price/note values, since the server was never
     // told anything changed.
     Promise.allSettled(
-      resetItems.map((i) => updateItemApi(listId, i.id, { checked: false, skipped: false, note: "", qty: 0, price: "" }))
+      resetItems.map((i) => updateItemApi(listId, i.id, { checked: false, skipped: false, note: "", qty: 0, price: null }))
     ).then((results) => {
       if (results.some((r) => r.status === "rejected")) {
         setNotice(`"${selectedList.name}" reset locally, but some items didn't sync to the cloud.`);
@@ -2094,13 +2235,15 @@ function confirmStartNewTrip() {
                 )}
               </TouchableOpacity>
             )}
-            <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf} accessibilityLabel="Export list as PDF">
-              {exportingPdf ? (
-                <ActivityIndicator size="small" color={t.text} />
-              ) : (
-                <FileDown size={17} color={t.text} />
-              )}
-            </TouchableOpacity>
+            {tab === "home" && (
+              <TouchableOpacity onPress={exportPDF} style={s.iconBtn} disabled={exportingPdf} accessibilityLabel="Export list as PDF">
+                {exportingPdf ? (
+                  <ActivityIndicator size="small" color={t.text} />
+                ) : (
+                  <FileDown size={17} color={t.text} />
+                )}
+              </TouchableOpacity>
+            )}
             {/* <TouchableOpacity onPress={() => setHeaderMenuOpen(true)} style={s.iconBtn}>
               <Menu size={16} color={t.text} />
             </TouchableOpacity> */}
@@ -2336,6 +2479,7 @@ function confirmStartNewTrip() {
                           const qtyNum = Number(item.qty) || 0;
                           const hasNoteText = !!noteValue(item).trim();
                           const showNote = hasNoteText || !!noteOpen[item.id];
+                          const isOpen = !!expandedItems[item.id];
                           return (
                           <Swipeable
                             key={item.id}
@@ -2351,107 +2495,149 @@ function confirmStartNewTrip() {
                               }
                             }}
                           >
-                          <View style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }]}>
-                            {/* Row 1: checkbox, emoji, name + unit, quantity stepper */}
-                            <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                          <View style={[s.itemCard, { opacity: item.checked ? 0.55 : 1 }, isOpen && { borderColor: t.accent }]}>
+                            {/* One line: emoji, name + unit, qty stepper, price, dropdown.
+                                Checkbox removed to save width — swipe right on the item to mark it bought / not bought. */}
+                            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                              {/*
                               <AnimatedCheckbox
                                 checked={item.checked}
                                 onPress={() => updateItem(item.id, { checked: !item.checked })}
                                 style={[s.checkbox, { borderColor: item.checked ? t.accent : t.border, backgroundColor: item.checked ? t.accent : "transparent" }]}
                               />
-                              <Text style={{ fontSize: 18 }}>{getIcon(item.name)}</Text>
-                              <View style={{ flex: 1, minWidth: 0 }}>
-                                <Text numberOfLines={1} style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}>{item.name}</Text>
-                                <Text numberOfLines={1} style={s.itemUnit}>{item.unit}</Text>
-                              </View>
-                              <View style={s.stepper}>
-                                <TouchableOpacity
-                                  onPress={() => {
-                                    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
-                                    updateItem(item.id, { qty: Math.max(0, qtyNum - 1) });
-                                  }}
-                                  disabled={qtyNum <= 0}
-                                  hitSlop={{ top: 6, bottom: 6, left: 4, right: 2 }}
-                                  accessibilityLabel={`Decrease quantity of ${item.name}`}
-                                  style={[s.qtyBtn, qtyNum <= 0 && { opacity: 0.4 }]}
-                                >
-                                  <Text style={s.qtyBtnText}>−</Text>
-                                </TouchableOpacity>
-                                <Text style={s.qtyValue}>{qtyNum}</Text>
-                                <TouchableOpacity
-                                  onPress={() => {
-                                    tapHaptic(Haptics.ImpactFeedbackStyle.Light);
-                                    updateItem(item.id, { qty: Math.min(999, qtyNum + 1) });
-                                  }}
-                                  disabled={qtyNum >= 999}
-                                  hitSlop={{ top: 6, bottom: 6, left: 2, right: 4 }}
-                                  accessibilityLabel={`Increase quantity of ${item.name}`}
-                                  style={[s.qtyBtn, qtyNum >= 999 && { opacity: 0.4 }]}
-                                >
-                                  <Text style={s.qtyBtnText}>+</Text>
-                                </TouchableOpacity>
-                              </View>
+                              */}
+                              <Pressable
+                                onPress={() => { animateListChange(); setExpandedItems((prev) => ({ ...prev, [item.id]: !prev[item.id] })); }}
+                                accessibilityRole="button"
+                                accessibilityLabel={`${isOpen ? "Hide" : "Show"} options for ${item.name}`}
+                                style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8 }}
+                              >
+                                {/* fixed-width emoji column so every name starts at the same x */}
+                                <View style={{ width: 24, alignItems: "center", justifyContent: "center" }}>
+                                  <Text style={{ fontSize: 18 }}>{getIcon(item.name)}</Text>
+                                </View>
+                                <View style={{ flex: 1, minWidth: 0 }}>
+                                  <Text
+                                    numberOfLines={1}
+                                    style={[s.itemName, item.checked && { textDecorationLine: "line-through" }]}
+                                  >
+                                    {item.name}
+                                  </Text>
+                                  {/* line 2: unit (bold) + note preview when the row is closed */}
+                                  {(!!item.unit || item.checked || (hasNoteText && !isOpen)) && (
+                                    <Text numberOfLines={1} style={{ fontSize: 12, fontWeight: "700", color: t.muted, marginTop: 2 }}>
+                                      {item.checked ? <Text style={{ color: t.accent }}>{"✓ Bought  "}</Text> : null}
+                                        <Text style={{ fontSize: 13, fontWeight: "500", color: t.text }}>{item.unit}</Text>                                      
+                                        {hasNoteText && !isOpen && (
+                                        <Text style={{ fontWeight: "500", fontStyle: "italic" }}>{`${item.unit ? "  ·  " : ""}${noteValue(item).trim()}`}</Text>
+                                      )}
+                                    </Text>
+                                  )}
+                                </View>
+                              </Pressable>
+
+                              {/* Quantity: plain numeric input (was a -/+ stepper).
+                                  Typing updates the row locally at once (so the price box unlocks
+                                  immediately); the save is sent when you leave the field. */}
+                              <DraftNumberInput
+                                keyboardType="number-pad"
+                                placeholder="0"
+                                placeholderTextColor={t.muted}
+                                maxLength={3}
+                                accessibilityLabel={`Quantity of ${item.name}`}
+                                value={qtyNum > 0 ? String(qtyNum) : ""}
+                                sanitize={(v) => v.replace(/[^0-9]/g, "").replace(/^0+(?=\d)/, "").slice(0, 3)}
+                                onLiveChange={(d) => { if (canWrite) patchItem(selectedListId, item.id, { qty: clampQty(d === "" ? 0 : d) }); }}
+                                onCommit={(d, start) => updateItem(item.id, { qty: d === "" ? 0 : d }, { ...item, qty: clampQty(start === "" ? 0 : start) })}
+                                editable={canWrite}
+                                style={[s.priceInput, { width: 46, height: 34, paddingVertical: 0, paddingHorizontal: 2, textAlign: "center", fontSize: 14, fontWeight: "800" }]}
+                              />
+
+                              <DraftNumberInput
+                                keyboardType="decimal-pad"
+                                placeholder={currency.symbol}
+                                placeholderTextColor={t.muted}
+                                accessibilityLabel={`Price of ${item.name}`}
+                                autoShrink
+                                maxLength={10}
+                                value={String(item.price ?? "")}
+                                editable={canWrite && qtyNum > 0}
+                                sanitize={(v) => {
+                                  const numericValue = v.replace(/[^0-9.]/g, "");
+                                  const parts = numericValue.split(".");
+                                  // Allow only one decimal point
+                                  return parts.length > 2 ? parts[0] + "." + parts.slice(1).join("") : numericValue;
+                                }}
+                                onCommit={(d) => updateItem(item.id, { price: d })}
+                                style={[s.priceInput, { width: 72, height: 34, paddingVertical: 0, paddingHorizontal: 2, textAlign: "center", fontSize: 14, fontWeight: "700" }, qtyNum <= 0 && { opacity: 0.5 }]}
+                              />
+
+                              {/* Dropdown: opens / closes the options row (note + skip) */}
+                              <TouchableOpacity
+                                onPress={() => {
+                                  tapHaptic(Haptics.ImpactFeedbackStyle.Light);
+                                  animateListChange();
+                                  setExpandedItems((prev) => ({ ...prev, [item.id]: !prev[item.id] }));
+                                }}
+                                hitSlop={{ top: 8, bottom: 8, left: 4, right: 6 }}
+                                accessibilityRole="button"
+                                accessibilityLabel={`${isOpen ? "Close" : "Open"} options for ${item.name}`}
+                                accessibilityState={{ expanded: isOpen }}
+                                style={[s.editToggleBtn, isOpen && s.editToggleBtnOpen]}
+                              >
+                                <ChevronDown
+                                  size={17}
+                                  color={isOpen ? t.accent : t.muted}
+                                  style={{ transform: [{ rotate: isOpen ? "180deg" : "0deg" }] }}
+                                />
+                                {hasNoteText && !isOpen && <View style={s.editToggleDot} />}
+                              </TouchableOpacity>
                             </View>
 
-                            {/* Row 2 (always visible): price, note, skip */}
-                            <View style={s.itemDetailsRow}>
-                              <TextInput
-                                keyboardType="decimal-pad"
-                                placeholder={qtyNum > 0 ? currency.symbol : "Qty first"}
-                                placeholderTextColor={t.muted}
-                                value={priceValue(item)}
-                                editable={qtyNum > 0}
-                                onChangeText={(v) => {
-                                  const numericValue = v.replace(/[^0-9.]/g, "");
-                                  // Allow only one decimal point
-                                  const parts = numericValue.split(".");
-                                  const cleanedValue =
-                                    parts.length > 2
-                                      ? parts[0] + "." + parts.slice(1).join("")
-                                      : numericValue;
-                                  setPriceDrafts((prev) => ({ ...prev, [item.id]: cleanedValue }));
-                                }}
-                                onBlur={() => commitPrice(item)}
-                                style={[s.priceInput, { width: 84, paddingVertical: 8 }, qtyNum <= 0 && { opacity: 0.5 }]}
-                              />
-                              {/* Note is optional: shows as a small "Add note" button until tapped (or if a note already exists) */}
-                              {showNote ? (
-                                <TextInput
-                                  autoFocus={!!noteOpen[item.id] && !hasNoteText}
-                                  value={noteValue(item)}
-                                  onChangeText={(v) => setNoteDrafts((prev) => ({ ...prev, [item.id]: v }))}
-                                  onBlur={() => {
-                                    const draft = noteDrafts[item.id];
-                                    const finalVal = draft !== undefined ? draft.trim() : (item.note || "").trim();
-                                    commitNote(item);
-                                    if (!finalVal) setNoteOpen((prev) => { const n = { ...prev }; delete n[item.id]; return n; });
-                                  }}
-                                  maxLength={60}
-                                  placeholder="Note (e.g. only Amul)"
-                                  placeholderTextColor={t.muted}
-                                  style={[s.input, { flex: 1, minWidth: 0, paddingVertical: 8, fontSize: 12.5 }]}
-                                />
-                              ) : (
-                                <TouchableOpacity
-                                  onPress={() => setNoteOpen((prev) => ({ ...prev, [item.id]: true }))}
-                                  accessibilityLabel={`Add a note to ${item.name}`}
-                                  style={s.addNoteBtn}
-                                >
-                                  <Pencil size={13} color={t.muted} />
-                                  <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "600" }}>Add note</Text>
-                                </TouchableOpacity>
-                              )}
-                              {!item.checked && (
-                                <TouchableOpacity
-                                  onPress={() => updateItem(item.id, { skipped: true })}
-                                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-                                  accessibilityLabel={`Skip ${item.name} this time`}
-                                  style={s.skipIconBtn}
-                                >
-                                  <EyeOff size={17} color={t.muted} />
-                                </TouchableOpacity>
-                              )}
-                            </View>
+                            {/* Row 2 (tap the name to open): note, hide */}
+                            {expandedItems[item.id] && (
+                              <View style={s.itemDetailsRow}>
+                                {/* Note is optional: shows as a small "Add note" button until tapped (or if a note already exists) */}
+                                {showNote ? (
+                                  <TextInput
+                                    autoFocus={!!noteOpen[item.id] && !hasNoteText}
+                                    value={noteValue(item)}
+                                    onChangeText={(v) => setNoteDrafts((prev) => ({ ...prev, [item.id]: v }))}
+                                    onBlur={() => {
+                                      const draft = noteDrafts[item.id];
+                                      const finalVal = draft !== undefined ? draft.trim() : (item.note || "").trim();
+                                      commitNote(item);
+                                      if (!finalVal) setNoteOpen((prev) => { const n = { ...prev }; delete n[item.id]; return n; });
+                                    }}
+                                    maxLength={60}
+                                    placeholder="Note (e.g. only Amul)"
+                                    placeholderTextColor={t.muted}
+                                    style={[s.input, { flex: 1, minWidth: 0, height: 36, paddingVertical: 0, fontSize: 12.5 }]}
+                                  />
+                                ) : (
+                                  <TouchableOpacity
+                                    onPress={() => setNoteOpen((prev) => ({ ...prev, [item.id]: true }))}
+                                    accessibilityLabel={`Add a note to ${item.name}`}
+                                    style={[s.addNoteBtn, { height: 36, paddingVertical: 0 }]}
+                                  >
+                                    <StickyNote size={13} color={t.muted} />
+                                    <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "600" }}>Add note</Text>
+                                  </TouchableOpacity>
+                                )}
+
+                                {!item.checked && (
+                                  <TouchableOpacity
+                                    onPress={() => updateItem(item.id, { skipped: true })}
+                                    hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                                    accessibilityLabel={`Skip ${item.name} this time`}
+                                    style={[s.skipBtn, { height: 36 }]}
+                                  >
+                                    <EyeOff size={15} color={t.muted} />
+                                    <Text style={{ color: t.muted, fontSize: 12.5, fontWeight: "600" }}>Skip</Text>
+                                  </TouchableOpacity>
+                                )}
+                              </View>
+                            )}
                           </View>
                           </Swipeable>
                           );
@@ -3621,6 +3807,10 @@ function makeStyles(t) {
     qtyValue: { minWidth: 26, textAlign: "center", fontSize: 14, fontWeight: "800", color: t.text },
     addNoteBtn: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 9, borderRadius: RADIUS.md, borderWidth: 1, borderStyle: "dashed", borderColor: t.border },
     itemDetailsRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10 },
+    editToggleBtn: { width: 30, height: 30, borderRadius: RADIUS.pill, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, alignItems: "center", justifyContent: "center" },
+    editToggleBtnOpen: { backgroundColor: t.accentSoft, borderColor: t.accent },
+    editToggleDot: { position: "absolute", top: -1, right: -1, width: 8, height: 8, borderRadius: 4, backgroundColor: t.accent, borderWidth: 1.5, borderColor: t.surface },
+    skipBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingHorizontal: 12, borderRadius: RADIUS.pill, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border },
     skipIconBtn: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.surface2, borderWidth: 1, borderColor: t.border, alignItems: "center", justifyContent: "center" },
     catCountPill: { backgroundColor: t.surface2, borderRadius: RADIUS.pill, paddingHorizontal: 8, paddingVertical: 2 },
     tripIconBtn: { width: 38, height: 38, borderRadius: RADIUS.pill, backgroundColor: t.accentSoft, alignItems: "center", justifyContent: "center" },

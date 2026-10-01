@@ -87,6 +87,23 @@ export function getPendingListIds() {
   return ids;
 }
 
+// Every entity id (item id / list id) that still has an unsent op in the
+// outbox. App.js uses this when merging a server snapshot so that an
+// item which hasn't reached the server yet is never wiped from the screen.
+export function getPendingEntityKeys() {
+  return new Set(queue.map((op) => op.entityKey).filter(Boolean));
+}
+
+// Resolves once the outbox has been fully drained (or a network failure
+// stopped it). Lets callers flush BEFORE fetching a server snapshot so the
+// snapshot already contains their offline changes.
+export async function flushAndWait() {
+  await ensureLoaded();
+  // If a flush is already running, wait for it instead of skipping.
+  while (flushing) await new Promise((r) => setTimeout(r, 50));
+  await flush();
+}
+
 // ---------- Enqueue, with collapsing ----------
 //
 // entityKey identifies "the same thing" across ops so we can collapse
@@ -146,6 +163,11 @@ function makeOpId() {
 // through onDropped so the UI can tell the user something didn't make it.
 let onDropped = null;
 export function setOnDropped(fn) { onDropped = fn; }
+// Called after a queued op is confirmed by the server, with the server's
+// response. Lets the UI swap its "pending" local copy for the real one
+// immediately, even when no socket is connected.
+let onSynced = null;
+export function setOnSynced(fn) { onSynced = fn; }
 
 export async function flush() {
   await ensureLoaded();
@@ -159,10 +181,11 @@ export async function flush() {
       const executor = executors[op.type];
       if (!executor) { queue.shift(); continue; } // unknown op type — nothing we can do with it
       try {
-        await executor(op.payload);
+        const result = await executor(op.payload);
         queue.shift();
         await persist();
         notify();
+        if (onSynced) { try { onSynced(op, result); } catch { /* noop */ } }
       } catch (e) {
         if (isNetworkError(e)) {
           // Leave it at the front of the queue and stop; we'll retry on

@@ -36,7 +36,7 @@ import {
 
 import { loadState, saveState, DEFAULT_CATEGORIES, makeId } from "./src/utils/storage";
 import { getTheme, RADIUS } from "./src/utils/theme";
-import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, clampQty, clampPrice } from "./src/utils/helpers";
+import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, clampQty, clampPrice, isSafeId } from "./src/utils/helpers";
 import { buildHistory, getSuggestions } from "./src/utils/suggestions";
 import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
@@ -56,31 +56,44 @@ import { getSocket, connectSocket, joinListRoom, leaveListRoom } from "./src/uti
 import notificationService, { PUSH_TYPES } from "./src/service/notificationService";
 import * as Sentry from '@sentry/react-native';
 import * as Updates from "expo-updates";
+import { log } from "./src/utils/logger";
+import { scrubEvent } from "./src/utils/sentry";
 
 const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN || "";
 
 Sentry.init({
   dsn: DSN,
 
-  // Adds more context data to events (IP address, cookies, user, etc.)
-  // For more information, visit: https://docs.sentry.io/platforms/react-native/data-management/data-collected/
-  sendDefaultPii: true,
+  // SECURITY: don't attach IP address / cookies / user details to every event
+  // automatically. Identify users explicitly (id only) if you need to.
+  sendDefaultPii: false,
 
-  // Enable Logs
-  enableLogs: true,
+  // Structured logs can carry arbitrary app data off the device; keep off.
+  enableLogs: false,
+
+  // Strip tokens / auth headers / cookies before anything leaves the device.
+  beforeSend: (event) => scrubEvent(event),
 
   // Configure Session Replay
   replaysSessionSampleRate: 0, // was 0.1: recording sessions adds startup + runtime overhead; error replays below are kept
   replaysOnErrorSampleRate: 1,
-  integrations: [Sentry.mobileReplayIntegration()],
+  // SECURITY: replays are screen recordings. This app shows names, emails,
+  // shopping lists, notes and prices, so mask all text/images/vectors.
+  integrations: [
+    Sentry.mobileReplayIntegration({
+      maskAllText: true,
+      maskAllImages: true,
+      maskAllVectors: true,
+    }),
+  ],
 
   // uncomment the line below to enable Spotlight (https://spotlightjs.com)
   // spotlight: __DEV__,
 });
 
-console.log("[Updates] isEnabled:", Updates.isEnabled);
-console.log("[Updates] runtimeVersion:", Updates.runtimeVersion);
-console.log("[Updates] updateId:", Updates.updateId);
+// log("[Updates] isEnabled:", Updates.isEnabled);
+// log("[Updates] runtimeVersion:", Updates.runtimeVersion);
+// log("[Updates] updateId:", Updates.updateId);
 
 
 // This app is local-first: everything lives in on-device storage (see
@@ -263,7 +276,13 @@ function CurrencyGlyph({ symbol, color, size = 12 }) {
 // of items (e.g. from the server) needs folding into that map at once.
 function arrayToItemMap(arr) {
   const map = {};
-  for (const it of arr) map[it.id] = it;
+  for (const it of arr) {
+    // SECURITY: ids come from the server / other list members. "__proto__"
+    // (and friends) match the server's id pattern but would rewrite the map's
+    // prototype instead of adding an entry, so they are skipped.
+    if (!it || !isSafeId(it.id)) continue;
+    map[it.id] = it;
+  }
   return map;
 }
 
@@ -1530,6 +1549,20 @@ useEffect(() => {
   // are always writable.
   const canWrite = !selectedList?.role || selectedList.role !== "READ";
 
+  // Someone else's list shared with this account (role is set and isn't
+  // OWNER). Sharing is the owner's job, so the Family tab is locked for
+  // every shared-in member; the Add tab is locked for view-only (READ)
+  // members, who can't write anyway. WRITE members keep Add.
+  const isSharedMember = !!selectedList?.role && selectedList.role !== "OWNER";
+  const tabLocks = { add: !canWrite, family: isSharedMember };
+
+  // If the list on screen changes to one that locks the current tab (e.g.
+  // switching lists while on Add/Family), fall back to Home.
+  useEffect(() => {
+    if (tabLocks[tab]) setTab("home");
+    // eslint-disable-next-line
+  }, [tab, tabLocks.add, tabLocks.family]);
+
   const derived = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
     const filtered = items.filter((i) => i.name.toLowerCase().includes(q));
@@ -1602,6 +1635,7 @@ useEffect(() => {
     setItemsByList((prev) => ({ ...prev, [listId]: updater(prev[listId] || {}) }));
   }
   function upsertItem(listId, item) {
+    if (!isSafeId(listId) || !item || !isSafeId(item.id)) return; // see isSafeId in helpers.js
     setListItems(listId, (map) => ({ ...map, [item.id]: item }));
   }
   function upsertItems(listId, itemsArr) {
@@ -2418,6 +2452,7 @@ function confirmStartNewTrip() {
                 placeholder={`Search "${selectedList ? selectedList.name : ""}"...`}
                 placeholderTextColor={t.muted}
                 style={s.searchInput}
+                maxLength={100}
               />
             </View>
           )}
@@ -2595,10 +2630,12 @@ function confirmStartNewTrip() {
                   </View>
                   <Text style={s.emptyStateTitle}>"{selectedList ? selectedList.name : "This list"}" is empty</Text>
                   <Text style={s.emptyStateSub}>Nothing here yet — add your first item and MindCart will remember it for next time.</Text>
-                  <TouchableOpacity onPress={() => setTab("add")} style={s.emptyStateBtn}>
-                    <Plus size={16} color="#fff" />
-                    <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13.5 }}>Add your first item</Text>
-                  </TouchableOpacity>
+                  {canWrite && (
+                    <TouchableOpacity onPress={() => setTab("add")} style={s.emptyStateBtn}>
+                      <Plus size={16} color="#fff" />
+                      <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13.5 }}>Add your first item</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
               )}
               {items.length > 0 && noSearchResults && (
@@ -2644,7 +2681,7 @@ function confirmStartNewTrip() {
                             ref={(r) => { if (r) swipeRefs.current[item.id] = r; else delete swipeRefs.current[item.id]; }}
                             overshootRight={false}
                             overshootLeft={false}
-                            renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
+                            // renderRightActions={() => <SwipeDeleteAction t={t} onDelete={() => deleteItem(item)} />}
                             renderLeftActions={() => <SwipeCheckAction t={t} checked={item.checked} />}
                             onSwipeableOpen={(direction) => {
                               if (direction === "left") {
@@ -2697,20 +2734,30 @@ function confirmStartNewTrip() {
                               {/* Quantity: plain numeric input (was a -/+ stepper).
                                   Typing updates the row locally at once (so the price box unlocks
                                   immediately); the save is sent when you leave the field. */}
+                              <View style={{ alignItems: "center" }}>
                               <DraftNumberInput
-                                keyboardType="number-pad"
+                                keyboardType="decimal-pad"
                                 placeholder="0"
                                 placeholderTextColor={t.muted}
-                                maxLength={3}
+                                maxLength={6}
                                 accessibilityLabel={`Quantity of ${item.name}`}
                                 value={qtyNum > 0 ? String(qtyNum) : ""}
-                                sanitize={(v) => v.replace(/[^0-9]/g, "").replace(/^0+(?=\d)/, "").slice(0, 3)}
+                                sanitize={(v) => {
+                                  // Digits + one decimal point (1.5, 0.25): max 3 whole digits, 2 decimals.
+                                  const cleaned = v.replace(/,/g, ".").replace(/[^0-9.]/g, "");
+                                  const [whole = "", ...rest] = cleaned.split(".");
+                                  const w = whole.replace(/^0+(?=\d)/, "").slice(0, 3);
+                                  return rest.length ? `${w || "0"}.${rest.join("").slice(0, 2)}` : w;
+                                }}
                                 onLiveChange={(d) => { if (canWrite) patchItem(selectedListId, item.id, { qty: clampQty(d === "" ? 0 : d) }); }}
                                 onCommit={(d, start) => updateItem(item.id, { qty: d === "" ? 0 : d }, { ...item, qty: clampQty(start === "" ? 0 : start) })}
                                 editable={canWrite}
-                                style={[s.priceInput, { width: 46, height: 34, paddingVertical: 0, paddingHorizontal: 2, textAlign: "center", fontSize: 14, fontWeight: "800" }]}
+                                style={[s.priceInput, { width: 68, height: 34, paddingVertical: 0, paddingHorizontal: 2, textAlign: "center", fontSize: 14, fontWeight: "800" }]}
                               />
+                              <Text style={{ fontSize: 9, fontWeight: "700", letterSpacing: 0.6, color: t.muted, marginTop: 2 }}>QUANTITY</Text>
+                              </View>
 
+                              <View style={{ alignItems: "center" }}>
                               <DraftNumberInput
                                 keyboardType="decimal-pad"
                                 placeholder={currency.symbol}
@@ -2729,6 +2776,8 @@ function confirmStartNewTrip() {
                                 onCommit={(d) => updateItem(item.id, { price: d })}
                                 style={[s.priceInput, { width: 72, height: 34, paddingVertical: 0, paddingHorizontal: 2, textAlign: "center", fontSize: 14, fontWeight: "700" }, qtyNum <= 0 && { opacity: 0.5 }]}
                               />
+                              <Text style={{ fontSize: 9, fontWeight: "700", letterSpacing: 0.6, color: t.muted, marginTop: 2, opacity: qtyNum <= 0 ? 0.5 : 1 }}>PRICE</Text>
+                              </View>
 
                               {/* Dropdown: opens / closes the options row (note + skip) */}
                               <TouchableOpacity
@@ -3126,7 +3175,18 @@ function confirmStartNewTrip() {
           { id: "family", label: "Family", icon: Users },
           { id: "profile", label: "Profile", icon: UserCircle2 },
         ].filter(Boolean).map(({ id, label, icon: Icon }) => (
-          <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
+          <TouchableOpacity
+            key={id}
+            onPress={() => {
+              if (tabLocks[id]) {
+                setNotice(id === "add" ? "You have view-only access to this list." : "Only the owner can manage sharing for this list.");
+                return;
+              }
+              setTab(id);
+            }}
+            accessibilityState={{ disabled: !!tabLocks[id] }}
+            style={[s.tabBtn, tabLocks[id] && { opacity: 0.35 }]}
+          >
             <View ref={id === "family" ? setTourRef("familyTab") : undefined} collapsable={false} style={{ alignItems: "center" }}>
             <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
               <Icon size={18} color={tab === id ? "#fff" : t.muted} />
@@ -3503,6 +3563,7 @@ function confirmStartNewTrip() {
                 placeholder="Search currency (e.g. USD, Euro)"
                 placeholderTextColor={t.muted}
                 style={[s.input, { marginBottom: 10 }]}
+                maxLength={40}
               />
             </View>
 
@@ -3634,6 +3695,7 @@ function confirmStartNewTrip() {
                 keyboardType="number-pad"
                 value={String(reminderSettings.days ?? 5)}
                 onChangeText={updateReminderDays}
+                maxLength={3}
                 style={[s.priceInput, { width: 50, textAlign: "center" }]}
               />
               <Text style={{ color: t.text, fontSize: 14 }}>days of no activity</Text>

@@ -15,7 +15,6 @@
       "bundleIdentifier": "com.samappstudio.mindcart",
       "infoPlist": {
         "UIBackgroundModes": [
-          "remote-notification",
           "remote-notification"
         ]
       }
@@ -24,11 +23,11 @@
       "package": "com.samappstudio.mindcart",
       "edgeToEdgeEnabled": true,
       "permissions": [
-        "POST_NOTIFICATIONS",
         "POST_NOTIFICATIONS"
       ],
       "googleServicesFile": "./google-services.json",
-      "versionCode": 9
+      "versionCode": 11,
+      "allowBackup": false
     },
     "extra": {
       "eas": {

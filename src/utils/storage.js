@@ -10,6 +10,8 @@
 // is effectively atomic and there's exactly one schema to migrate.
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { error as logError } from "./logger";
+import { captureError } from "./sentry";
 
 export const SCHEMA_VERSION = 1;
 const STORAGE_KEY = "dmart_app_state_v1";
@@ -206,7 +208,8 @@ export async function loadState() {
     const parsed = raw ? JSON.parse(raw) : null;
     return migrate(parsed);
   } catch (e) {
-    console.error("loadState: failed to read AsyncStorage", e);
+    logError("loadState: failed to read AsyncStorage", e?.message);
+    captureError(e, { scope: "storage.load" });
     persistent = false;
     return migrate(memoryState);
   }
@@ -219,7 +222,8 @@ export async function saveState(state) {
     persistent = true;
     return true;
   } catch (e) {
-    console.error("saveState: failed to write AsyncStorage", e);
+    logError("saveState: failed to write AsyncStorage", e?.message);
+    captureError(e, { scope: "storage.save" });
     persistent = false;
     memoryState = toSave;
     return false;

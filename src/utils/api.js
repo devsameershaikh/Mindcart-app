@@ -17,6 +17,7 @@
 
 import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { log } from "./logger";
 import { registerExecutors, enqueue, startSync, subscribe, getPendingCount, getPendingListIds, setOnDropped, setOnSynced, getPendingEntityKeys, flushAndWait } from "./syncQueue";
 
 // ============================================================
@@ -48,50 +49,93 @@ const ENV = process.env.EXPO_PUBLIC_ENV;
 
 export function resolveApiBaseUrl() {
   if (ENV === "prod") {
-    console.log("[api.js] Environment: PROD");
-    console.log("[api.js] full URL:", PROD_API_URL);
-
-    console.log("[api.js] Environment:", ENV);
-    console.log("[api.js] API length:", PROD_API_URL?.length);
-    console.log("[api.js] API contains spring:",PROD_API_URL?.includes("mindcart-backend-spring.onrender.com"));
-console.log(
-  "[api.js] API contains old:",
-  PROD_API_URL?.includes("mindcart-backend.onrender.com")
-);
-
+    // SECURITY: the session JWT is sent on every request, so a production
+    // build must never talk to the backend over cleartext http.
+    if (!PROD_API_URL || !/^https:\/\//i.test(PROD_API_URL)) {
+      throw new Error("[api.js] EXPO_PUBLIC_PROD_API_URL must be set to an https:// URL for production builds");
+    }
+    // log("[api.js] Environment: PROD");
     return PROD_API_URL;
   }
 
   if (ENV === "dev") {
-    // console.log("[api.js] Environment: DEV");
-    // console.log("[api.js] API:", DEV_LAN_IP);
-     console.log("[api.js] Environment: DEV");
-    console.log("[api.js] API:", DEV_LAN_IP);
-
-    return DEV_LAN_IP ;
+    // log("[api.js] Environment: DEV");
+    return DEV_LAN_IP;
   }
 
   throw new Error(`[api.js] Unknown environment: ${ENV}`);
 }
 
 export const API_BASE_URL = resolveApiBaseUrl();
+// Ids end up inside URL paths. Encoding them means a malformed/hostile id
+// (e.g. one containing "/" or "..") can never change which endpoint is hit.
+const enc = (v) => encodeURIComponent(String(v));
+
 const TOKEN_KEY = "mindcart_session_token_v1";
 
 let cachedToken = null;
 
-export async function getToken() {
-  if (cachedToken) return cachedToken;
-  cachedToken = await AsyncStorage.getItem(TOKEN_KEY);
-  return cachedToken;
+// SECURITY: the session JWT is the key to the whole account, so it should
+// live in the OS keystore (Android Keystore / iOS Keychain) rather than in
+// AsyncStorage, which is plain unencrypted storage readable on rooted
+// devices and in backups. expo-secure-store is used when installed
+// (`npx expo install expo-secure-store`); until then this falls back to
+// AsyncStorage exactly as before, so nothing breaks. A token already sitting
+// in AsyncStorage is moved into the keystore the first time it's read.
+let SecureStore = null;
+try {
+  // eslint-disable-next-line global-require
+  SecureStore = require("expo-secure-store");
+} catch {
+  // Not installed — AsyncStorage fallback below.
 }
-export async function setToken(token) {
-  cachedToken = token;
+
+async function readStoredToken() {
+  if (SecureStore) {
+    try {
+      const secure = await SecureStore.getItemAsync(TOKEN_KEY);
+      if (secure) return secure;
+      const legacy = await AsyncStorage.getItem(TOKEN_KEY);
+      if (legacy) {
+        await SecureStore.setItemAsync(TOKEN_KEY, legacy);
+        await AsyncStorage.removeItem(TOKEN_KEY);
+        return legacy;
+      }
+      return null;
+    } catch {
+      // Keystore unavailable on this device — fall through to AsyncStorage.
+    }
+  }
+  return AsyncStorage.getItem(TOKEN_KEY);
+}
+
+async function writeStoredToken(token) {
+  if (SecureStore) {
+    try {
+      if (token) await SecureStore.setItemAsync(TOKEN_KEY, token);
+      else await SecureStore.deleteItemAsync(TOKEN_KEY);
+      // Never leave a stale copy behind in the unencrypted store.
+      await AsyncStorage.removeItem(TOKEN_KEY);
+      return;
+    } catch {
+      // Keystore unavailable — fall through to AsyncStorage.
+    }
+  }
   if (token) await AsyncStorage.setItem(TOKEN_KEY, token);
   else await AsyncStorage.removeItem(TOKEN_KEY);
 }
 
+export async function getToken() {
+  if (cachedToken) return cachedToken;
+  cachedToken = await readStoredToken();
+  return cachedToken;
+}
+export async function setToken(token) {
+  cachedToken = token;
+  await writeStoredToken(token);
+}
+
 async function request(path, { method = "GET", body, auth = true } = {}) {
-  // console.log(`API request: ${method} ${path}`);
   const headers = { "Content-Type": "application/json" };
   if (auth) {
     const token = await getToken();
@@ -167,14 +211,14 @@ async function attemptOrQueue({ type, entityKey, run, queuedPayload, optimisticR
 // when syncQueue replays a pending write after reconnecting.
 registerExecutors({
   createList: (p) => request("/lists", { method: "POST", body: { id: p.id, name: p.name } }),
-  renameList: (p) => request(`/lists/${p.listId}`, { method: "PATCH", body: { name: p.name } }),
-  deleteList: (p) => request(`/lists/${p.listId}`, { method: "DELETE" }),
-  createItem: (p) => request(`/lists/${p.listId}/items`, { method: "POST", body: p.body }),
+  renameList: (p) => request(`/lists/${enc(p.listId)}`, { method: "PATCH", body: { name: p.name } }),
+  deleteList: (p) => request(`/lists/${enc(p.listId)}`, { method: "DELETE" }),
+  createItem: (p) => request(`/lists/${enc(p.listId)}/items`, { method: "POST", body: p.body }),
   updateItem: (p) => {
     const { listId, itemId, ...patch } = p;
-    return request(`/lists/${listId}/items/${itemId}`, { method: "PATCH", body: patch });
+    return request(`/lists/${enc(listId)}/items/${enc(itemId)}`, { method: "PATCH", body: patch });
   },
-  deleteItem: (p) => request(`/lists/${p.listId}/items/${p.itemId}`, { method: "DELETE" }),
+  deleteItem: (p) => request(`/lists/${enc(p.listId)}/items/${enc(p.itemId)}`, { method: "DELETE" }),
 });
 
 // Surfaces ops that couldn't be replayed for a real (non-network) reason —
@@ -256,7 +300,7 @@ export const createList = (id, name) => attemptOrQueue({
 export const renameList = (listId, name) => attemptOrQueue({
   type: "renameList",
   entityKey: listId,
-  run: () => request(`/lists/${listId}`, { method: "PATCH", body: { name } }),
+  run: () => request(`/lists/${enc(listId)}`, { method: "PATCH", body: { name } }),
   queuedPayload: { listId, name },
   optimisticResult: { list: { id: listId, name } },
 });
@@ -264,7 +308,7 @@ export const renameList = (listId, name) => attemptOrQueue({
 export const deleteListApi = (listId) => attemptOrQueue({
   type: "deleteList",
   entityKey: listId,
-  run: () => request(`/lists/${listId}`, { method: "DELETE" }),
+  run: () => request(`/lists/${enc(listId)}`, { method: "DELETE" }),
   queuedPayload: { listId },
   optimisticResult: {},
 });
@@ -274,7 +318,7 @@ export const deleteListApi = (listId) => attemptOrQueue({
 export const createItem = (listId, item) => attemptOrQueue({
   type: "createItem",
   entityKey: item.id,
-  run: () => request(`/lists/${listId}/items`, { method: "POST", body: item }),
+  run: () => request(`/lists/${enc(listId)}/items`, { method: "POST", body: item }),
   queuedPayload: { listId, body: item },
   optimisticResult: { item: { ...item } },
 });
@@ -282,7 +326,7 @@ export const createItem = (listId, item) => attemptOrQueue({
 export const updateItemApi = (listId, itemId, patch) => attemptOrQueue({
   type: "updateItem",
   entityKey: itemId,
-  run: () => request(`/lists/${listId}/items/${itemId}`, { method: "PATCH", body: patch }),
+  run: () => request(`/lists/${enc(listId)}/items/${enc(itemId)}`, { method: "PATCH", body: patch }),
   queuedPayload: { listId, itemId, ...patch },
   optimisticResult: { item: { id: itemId, ...patch } },
 });
@@ -290,7 +334,7 @@ export const updateItemApi = (listId, itemId, patch) => attemptOrQueue({
 export const deleteItemApi = (listId, itemId) => attemptOrQueue({
   type: "deleteItem",
   entityKey: itemId,
-  run: () => request(`/lists/${listId}/items/${itemId}`, { method: "DELETE" }),
+  run: () => request(`/lists/${enc(listId)}/items/${enc(itemId)}`, { method: "DELETE" }),
   queuedPayload: { listId, itemId },
   optimisticResult: {},
 });
@@ -305,13 +349,13 @@ export const deleteItemApi = (listId, itemId) => attemptOrQueue({
 export const sendInvite = ({ recipientEmail, role, listId, allLists }) =>
   request("/sharing/invites", { method: "POST", body: { recipientEmail, role, listId, allLists } });
 export const fetchInvites = () => request("/sharing/invites");
-export const acceptInvite = (inviteId) => request(`/sharing/invites/${inviteId}/accept`, { method: "POST" });
-export const declineInvite = (inviteId) => request(`/sharing/invites/${inviteId}/decline`, { method: "POST" });
-export const revokeInvite = (inviteId) => request(`/sharing/invites/${inviteId}/revoke`, { method: "POST" });
+export const acceptInvite = (inviteId) => request(`/sharing/invites/${enc(inviteId)}/accept`, { method: "POST" });
+export const declineInvite = (inviteId) => request(`/sharing/invites/${enc(inviteId)}/decline`, { method: "POST" });
+export const revokeInvite = (inviteId) => request(`/sharing/invites/${enc(inviteId)}/revoke`, { method: "POST" });
 export const changeMemberRole = (listId, userId, role) =>
-  request(`/sharing/lists/${listId}/members/${userId}`, { method: "PATCH", body: { role } });
+  request(`/sharing/lists/${enc(listId)}/members/${enc(userId)}`, { method: "PATCH", body: { role } });
 export const removeMember = (listId, userId) =>
-  request(`/sharing/lists/${listId}/members/${userId}`, { method: "DELETE" });
+  request(`/sharing/lists/${enc(listId)}/members/${enc(userId)}`, { method: "DELETE" });
 
 // ---------- Devices / push ----------
 // Not offline-queued: a push token is only useful while online anyway, and

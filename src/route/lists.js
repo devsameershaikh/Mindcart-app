@@ -32,7 +32,9 @@ const writeLimiter = rateLimit({
 // interpolated into things like socket room names and stored as PKs.
 const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 function isValidClientId(id) {
-  return typeof id === "string" && CLIENT_ID_RE.test(id);
+  // "__proto__" / "constructor" / "prototype" match the character class but
+  // are dangerous as object keys on clients, so they are rejected outright.
+  return typeof id === "string" && CLIENT_ID_RE.test(id) && !["__proto__", "constructor", "prototype"].includes(id);
 }
 
 function clampString(val, max) {
@@ -52,7 +54,7 @@ function emitToList(req, listId, event, payload) {
 
 // GET /lists -> every list the user owns or has been shared into, with role
 router.get("/", readLimiter, async (req, res) => {
-  devLog("Fetching lists for user:", req.userId);
+  devLog("Fetching lists");
   const memberships = await prisma.listMember.findMany({
     where: { userId: req.userId },
     include: {
@@ -85,6 +87,9 @@ router.get("/", readLimiter, async (req, res) => {
 // first attempt actually succeeded), the unique-constraint hit on that id
 // is treated as an idempotent success instead of an error.
 router.post("/", writeLimiter, async (req, res) => {
+  if (req.body?.name !== undefined && typeof req.body.name !== "string") {
+    return res.status(400).json({ error: "Invalid name" });
+  }
   const name = clampString(req.body?.name || "", 100);
   const clientId = req.body?.id;
   if (!name) return res.status(400).json({ error: "List name is required" });
@@ -104,7 +109,11 @@ router.post("/", writeLimiter, async (req, res) => {
   } catch (err) {
     if (clientId && err.code === "P2002") {
       const existing = await prisma.list.findUnique({ where: { id: clientId } });
-      if (existing) return res.status(200).json({ list: existing });
+      // SECURITY: only treat this as an idempotent retry if the list is the
+      // caller's own. Previously ANY existing list with this id was returned,
+      // leaking another user's list (name, ownerId) to whoever guessed its id.
+      if (existing && existing.ownerId === req.userId) return res.status(200).json({ list: existing });
+      if (existing) return res.status(409).json({ error: "Id already in use" });
     }
     throw err;
   }
@@ -113,6 +122,9 @@ router.post("/", writeLimiter, async (req, res) => {
 router.patch("/:listId", writeLimiter, async (req, res) => {
   const { listId } = req.params;
   if (!(await hasAtLeast(listId, req.userId, "WRITE"))) return res.status(404).json({ error: "Not found" });
+  if (req.body?.name !== undefined && typeof req.body.name !== "string") {
+    return res.status(400).json({ error: "Invalid name" });
+  }
   const name = clampString(req.body?.name || "", 100);
   if (!name) return res.status(400).json({ error: "List name is required" });
   try {
@@ -145,11 +157,19 @@ router.delete("/:listId", writeLimiter, async (req, res) => {
 // already landed (a retried request after a dropped response) is treated
 // as success rather than an error.
 router.post("/:listId/items", writeLimiter, async (req, res) => {
-  devLog("Creating item in list:", req.params.listId, "for user:", req.userId);
+  devLog("Creating item");
   const { listId } = req.params;
   if (!(await hasAtLeast(listId, req.userId, "WRITE"))) return res.status(404).json({ error: "Not found" });
   const { id: clientId, name, category, unit, price } = req.body || {};
-  if (!name || !name.trim()) return res.status(400).json({ error: "Item name is required" });
+  // typeof checks first: a non-string name used to crash on .trim() (500),
+  // and non-string category/unit were passed straight through to Prisma.
+  if (typeof name !== "string" || !name.trim()) return res.status(400).json({ error: "Item name is required" });
+  if (category !== undefined && category !== null && typeof category !== "string") {
+    return res.status(400).json({ error: "Invalid category" });
+  }
+  if (unit !== undefined && unit !== null && typeof unit !== "string") {
+    return res.status(400).json({ error: "Invalid unit" });
+  }
   if (clientId !== undefined && !isValidClientId(clientId)) {
     return res.status(400).json({ error: "Invalid id" });
   }
@@ -173,14 +193,17 @@ router.post("/:listId/items", writeLimiter, async (req, res) => {
   } catch (err) {
     if (clientId && err.code === "P2002") {
       const existing = await prisma.item.findUnique({ where: { id: clientId } });
-      if (existing) return res.status(200).json({ item: existing });
+      // SECURITY: same as lists — only an item in THIS list counts as a
+      // retry; otherwise an item from another tenant's list was returned.
+      if (existing && existing.listId === listId) return res.status(200).json({ item: existing });
+      if (existing) return res.status(409).json({ error: "Id already in use" });
     }
     throw err;
   }
 });
 
 router.patch("/:listId/items/:itemId", writeLimiter, async (req, res) => {
-  devLog("Updating item:", req.params.itemId, "in list:", req.params.listId, "for user:", req.userId);
+  devLog("Updating item");
   const { listId, itemId } = req.params;
   if (!(await hasAtLeast(listId, req.userId, "WRITE"))) return res.status(404).json({ error: "Not found" });
 
@@ -212,7 +235,7 @@ router.patch("/:listId/items/:itemId", writeLimiter, async (req, res) => {
     data.price = body.price != null ? String(body.price).slice(0, 20) : null;
   }
   if (body.qty !== undefined) {
-    if (typeof body.qty !== "number" || !Number.isFinite(body.qty) || body.qty < 0) {
+    if (typeof body.qty !== "number" || !Number.isFinite(body.qty) || body.qty < 0 || body.qty > 100000) {
       return res.status(400).json({ error: "Invalid qty" });
     }
     data.qty = body.qty;

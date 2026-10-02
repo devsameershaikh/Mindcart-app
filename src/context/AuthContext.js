@@ -28,6 +28,7 @@ import {
 
 import notificationService from "../service/notificationService";
 import { setSentryUser, captureError } from "../utils/sentry";
+import { log, warn } from "../utils/logger";
 
 const AuthContext = createContext(null);
 
@@ -97,14 +98,15 @@ export function AuthProvider({ children }) {
   // --------------------------------------------------
 
   useEffect(() => {
-    console.log("Restoring MindCart session...");
+    log("Restoring MindCart session...");
 
     (async () => {
       let token = null;
       try {
         token = await getToken();
       } catch (error) {
-        console.log("Session restore error (reading token):", error);
+        warn("Session restore error (reading token):", error?.message);
+        captureError(error, { scope: "auth.restore.readToken" });
       }
 
       if (!token) {
@@ -135,18 +137,17 @@ export function AuthProvider({ children }) {
       // dead connection never logs someone out.
       try {
         const { user } = await fetchMe();
-        console.log("Restoring user:");
         setUser(user);
         await setCachedUser(user);
       } catch (error) {
         if (isAuthRejection(error)) {
-          console.log("Stored token rejected by server — signing out");
+          log("Stored token rejected by server — signing out");
           await setToken(null);
           await setCachedUser(null);
           setUser(null);
           disconnectSocket();
         } else {
-          console.log("Couldn't reach server to refresh session (offline?):", error?.message || error);
+          log("Couldn't reach server to refresh session (offline?):", error?.message);
         }
       }
     })();
@@ -162,7 +163,7 @@ export function AuthProvider({ children }) {
     setSigningIn(true);
 
     try {
-      console.log("Starting Google Sign-In...");
+      log("Starting Google Sign-In...");
 
       // Re-assert config right before use instead of trusting it landed at
       // module-import time. On Android the native bridge call behind
@@ -185,7 +186,7 @@ export function AuthProvider({ children }) {
       for (let i = 0; i < 3; i++) {
         try {
           await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
-          console.log("Google Play Services available");
+          log("Google Play Services available");
           result = await GoogleSignin.signIn();
           lastNativeErr = null;
           break;
@@ -201,7 +202,7 @@ export function AuthProvider({ children }) {
           ) {
             throw nativeErr;
           }
-          console.log(`Google Sign-In native call not ready yet, retrying (${i + 1}/3)...`);
+          log(`Google Sign-In native call not ready yet, retrying (${i + 1}/3)...`);
           await new Promise((r) => setTimeout(r, 400 * (i + 1)));
         }
       }
@@ -213,8 +214,6 @@ export function AuthProvider({ children }) {
       if (!idToken) {
         throw new Error("Google ID token was not returned");
       }
-
-      console.log("Google ID token received");
 
       // Send Google ID token to MindCart backend — retries a few times with
       // backoff if the backend is cold-starting (see withColdStartRetry in
@@ -247,28 +246,26 @@ export function AuthProvider({ children }) {
         captureError(e, { scope: "auth.signIn.notifications" })
       );
 
-      console.log("MindCart Google Sign-In successful");
+      log("MindCart Google Sign-In successful");
 
       return {
         success: true,
         user,
       };
     } catch (error) {
-      console.log("Google Sign-In error:", error);
+      // Never log the raw error object here: it can carry the response from
+      // Google / our backend. Log only the code + message in dev.
+      log("Google Sign-In error:", error?.code, error?.message);
 
       if (error?.code === statusCodes.SIGN_IN_CANCELLED) {
-        console.log("User cancelled Google Sign-In");
+        log("User cancelled Google Sign-In");
       } else if (error?.code === statusCodes.IN_PROGRESS) {
-        console.log("Google Sign-In already in progress");
-      } else if (
-        error?.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE
-      ) {
-        console.log("Google Play Services unavailable");
+        log("Google Sign-In already in progress");
+      } else if (error?.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE) {
+        log("Google Play Services unavailable");
       } else {
-        console.log(
-          "Google authentication failed:",
-          error?.message || error
-        );
+        // A genuine failure (not a cancel) — worth knowing about in prod.
+        captureError(error, { scope: "auth.signIn" });
       }
 
       return {
@@ -287,7 +284,7 @@ export function AuthProvider({ children }) {
 
   const signOut = useCallback(async () => {
     try {
-      console.log("Signing out...");
+      log("Signing out...");
 
       // Both are cleared before anything else so that even if a later step
       // in this function throws, the token/cached profile are already gone
@@ -308,15 +305,13 @@ export function AuthProvider({ children }) {
       try {
         await GoogleSignin.signOut();
       } catch (googleError) {
-        console.log(
-          "Google sign-out warning:",
-          googleError?.message || googleError
-        );
+        warn("Google sign-out warning:", googleError?.message);
       }
 
-      console.log("MindCart sign-out successful");
+      log("MindCart sign-out successful");
     } catch (error) {
-      console.log("Sign-out error:", error);
+      warn("Sign-out error:", error?.message);
+      captureError(error, { scope: "auth.signOut" });
     }
   }, []);
 

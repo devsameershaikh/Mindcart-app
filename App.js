@@ -40,6 +40,8 @@ import { UNITS, getIcon, suggestCategory, validateListName, validateItemName, cl
 import { buildHistory, getSuggestions } from "./src/utils/suggestions";
 import { exportListPdf } from "./src/utils/exportpdf";
 import CategorySelect from "./src/components/Categoryselect";
+import GuidedTour from "./src/components/GuidedTour";
+import NotificationPrompt from "./src/components/NotificationPrompt";
 import SimpleSelect from "./src/components/Simpleselect";
 import FamilySyncScreen from "./src/screens/FamilySyncScreen";
 import { useAuth } from "./src/context/AuthContext";
@@ -125,6 +127,28 @@ function summarizeItemErrors(errors) {
 // prices everywhere in the app. There's no conversion or exchange rate
 // involved — a price the user typed under "$" stays the same number if
 // they later switch the label to "€".
+// ---------- First-run guided tour (new users only) ----------
+// `target` keys match the refs attached via setTourRef() inside the app;
+// `tab` is the tab the app switches to before spotlighting the target.
+const TOUR_STEPS = [
+  { id: "welcome", icon: Sparkles, tab: "home", title: "Welcome to MindCart 👋",
+    body: "Here's a quick 30-second tour of the essentials: lists, adding items, ticking them off and shopping together with family." },
+  { id: "lists", icon: ListChecks, tab: "home", target: "lists", title: "Create & switch lists",
+    body: "Your current list lives in this chip. Tap it to switch lists or hit “New list” — try Groceries, Pharmacy or Weekend Party." },
+  { id: "add", icon: ListPlus, tab: "add", target: "addCard", title: "Add items in seconds",
+    body: "Type an item and tap Add. Tip: write “milk, bread, eggs” to add all three at once. Category is picked for you, and suggestions show up as you type." },
+  { id: "bought", icon: Check, tab: "home", demo: "swipe", title: "Swipe to mark as bought",
+    body: "In Home, swipe an item to the right to mark it bought (swipe again to undo). Swipe left to delete. Tap the arrow on an item for notes or to hide it." },
+  { id: "qtyprice", icon: Wallet, tab: "home", demo: "qtyprice", title: "Add quantity & final price",
+    body: "On any item, first type how many you need in the QTY box. That unlocks the PRICE box next to it — enter the final amount you paid for that item. The list total updates instantly." },
+  { id: "spend", icon: Wallet, tab: "home", target: "summary", title: "Track your spending",
+    body: "This card shows what you've already spent on bought items and what's still to go. Tap ↻ to start a fresh trip next time." },
+  { id: "family", icon: Users, tab: "family", target: "familyTab", title: "Shop together with family",
+    body: "Invite family by email and choose whether they can view or edit. Everyone sees changes live. Invites you receive appear under the 🔔 bell." },
+  { id: "done", icon: ShoppingBag, tab: "home", title: "You're all set!",
+    body: "Add your first item and you're shopping. Happy shopping! 🛒" },
+];
+
 const CURRENCIES = [
   { code: "INR", symbol: "₹", name: "Indian Rupee" },
   { code: "USD", symbol: "$", name: "US Dollar" },
@@ -592,6 +616,17 @@ export default Sentry.wrap(function DmartApp() {
   const [makingShareable, setMakingShareable] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null); // userId currently being role-changed or removed
+
+  // ---------- Guided tour (first-time users only) ----------
+  // `profile.tourPending` is set exactly once, when a brand-new user picks
+  // their currency for the first time (see selectCurrency). Existing users
+  // already have a currency, so they never get it. `tourDone` makes it
+  // one-shot; both flags live on `profile`, which is already persisted.
+  const [tourOpen, setTourOpen] = useState(false);
+  const tourRefs = useRef({});
+  const tourStarted = useRef(false);
+  const setTourRef = (key) => (r) => { tourRefs.current[key] = r; };
+  const getTourTarget = useCallback((key) => tourRefs.current[key] || null, []);
   const showSearch = tab === "home"||tab === "add";
   const badgeCount = receivedInvites.length + activity.filter((a) => !a.read).length;
   // Live mirrors so socket handlers can read current values synchronously
@@ -1178,6 +1213,126 @@ export default Sentry.wrap(function DmartApp() {
       setAppLoaded(true);
     })();
   }, []);
+
+  // Start the tour once, after sign-in + first sync, and only for a user who
+  // just finished first-time setup. A user who already has items (e.g. signed
+  // in on a second device) is marked done silently instead.
+  useEffect(() => {
+    if (tourStarted.current) return;
+    if (!appLoaded || !user || !hasSyncedOnce || !profile.currency) return;
+    if (!profile.tourPending || profile.tourDone) return;
+    tourStarted.current = true;
+    const hasData = Object.values(itemsByList).some((m) => m && Object.keys(m).length > 0);
+    if (hasData) { setProfile((p) => ({ ...p, tourPending: false, tourDone: true })); return; }
+    setTimeout(() => setTourOpen(true), 700);
+  }, [appLoaded, user, hasSyncedOnce, profile.currency, profile.tourPending, profile.tourDone, itemsByList]);
+
+  function finishTour() {
+    setTourOpen(false);
+    setProfile((p) => ({ ...p, tourPending: false, tourDone: true }));
+    setTab("home");
+  }
+
+  // ---------- "Notifications are off" popup ----------
+  // Only for someone who HAD notifications on and later switched them off in
+  // the phone's settings. If they declined at first sign-in they never had
+  // them on, so we never nag (`profile.notifWasGranted` stays false).
+  // No schedule/snooze: it's checked each time the app is opened (cold start,
+  // or coming back after being away a while). Cancel just closes it for now.
+  const [notifPromptOpen, setNotifPromptOpen] = useState(false);
+  const [notifNeedsSettings, setNotifNeedsSettings] = useState(false);
+  const [notifBusy, setNotifBusy] = useState(false);
+  const notifLaunchChecked = useRef(false);
+  const notifBackgroundAt = useRef(0);
+
+  // Always-fresh view of state for the async check / AppState listener.
+  const notifGate = useRef({});
+  notifGate.current = {
+    ready: appLoaded && !!user && hasSyncedOnce && !!profile.currency,
+    tourBusy: tourOpen || !!profile.tourPending,
+    wasGranted: !!profile.notifWasGranted,
+    open: notifPromptOpen,
+  };
+
+  const runNotifCheck = useRef(null);
+  runNotifCheck.current = async ({ allowPrompt }) => {
+    const g = notifGate.current;
+    if (!g.ready) return;
+    const st = await notificationService.getPermissionStatus();
+    if (st.granted) {
+      // Remember they've had notifications on, so a later "off" is worth a prompt.
+      if (!g.wasGranted) setProfile((p) => (p.notifWasGranted ? p : { ...p, notifWasGranted: true }));
+      // Also covers "turned back on in Settings": make sure this device has a push token.
+      notificationService.registerDevice().catch(() => {});
+      if (g.open) { setNotifPromptOpen(false); setNotice("Notifications are on 🔔"); }
+      return;
+    }
+    // Off now. Only prompt if it was on before, and nothing else is on screen.
+    if (!allowPrompt || !g.wasGranted || g.tourBusy || g.open) return;
+    setNotifNeedsSettings(!st.canAskAgain);
+    setNotifPromptOpen(true);
+  };
+
+  // App opened (cold start): check once the app is ready and no tour is running.
+  useEffect(() => {
+    if (notifLaunchChecked.current) return;
+    if (!appLoaded || !user || !hasSyncedOnce || !profile.currency) return;
+    if (tourOpen || profile.tourPending) return;
+    notifLaunchChecked.current = true;
+    const timer = setTimeout(() => { runNotifCheck.current?.({ allowPrompt: true }).catch(() => {}); }, 1200);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line
+  }, [appLoaded, user, hasSyncedOnce, profile.currency, tourOpen, profile.tourPending]);
+
+  // App brought back to the foreground: always re-read the permission (keeps
+  // the "was on" flag and closes the popup after Settings), but only prompt
+  // again if the user was away for a while, so quick app-switching isn't nagged.
+  useEffect(() => {
+    if (!user) return;
+    const AWAY_MS = 30 * 1000;
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "background") { notifBackgroundAt.current = Date.now(); return; }
+      if (state !== "active") return;
+      const away = notifBackgroundAt.current && Date.now() - notifBackgroundAt.current >= AWAY_MS;
+      notifBackgroundAt.current = 0;
+      runNotifCheck.current?.({ allowPrompt: !!away }).catch(() => {});
+    });
+    return () => sub.remove();
+  }, [user]);
+
+  function dismissNotifPrompt() { setNotifPromptOpen(false); }
+
+  function onNotificationsEnabled() {
+    setNotifPromptOpen(false);
+    setProfile((p) => ({ ...p, notifWasGranted: true }));
+    // Register this device for pushes now that permission exists.
+    notificationService.registerDevice({ force: true }).catch(() => {});
+    setNotice("Notifications are on 🔔");
+  }
+
+  async function enableNotificationsFromPrompt() {
+    if (notifBusy) return;
+    setNotifBusy(true);
+    try {
+      const st = await notificationService.getPermissionStatus();
+      if (st.granted) { onNotificationsEnabled(); return; }
+      if (st.canAskAgain) {
+        const res = await Notifications.requestPermissionsAsync();
+        if (res.granted) { onNotificationsEnabled(); return; }
+        dismissNotifPrompt();
+        setNotice("No problem — you can turn notifications on anytime in your phone's Settings.");
+        return;
+      }
+      // OS won't show its dialog again: send them to Settings. The popup stays
+      // open and closes itself when they return with notifications enabled.
+      setNotifNeedsSettings(true);
+      Linking.openSettings().catch(() => setNotice("Open your phone's Settings and enable notifications for MindCart."));
+    } catch {
+      setNotice("Couldn't turn on notifications. Try again from your phone's Settings.");
+    } finally {
+      setNotifBusy(false);
+    }
+  }
 
   // ---------- Persist on every change (debounced so rapid edits coalesce into one write) ----------
   useEffect(() => {
@@ -2177,7 +2332,8 @@ function confirmStartNewTrip() {
 
   // ---------- Currency ----------
   function selectCurrency(cur) {
-    setProfile((prev) => ({ ...prev, currency: cur }));
+    // First-ever currency pick == brand-new user -> queue the guided tour.
+    setProfile((prev) => ({ ...prev, currency: cur, ...(!prev.currency && !prev.tourDone ? { tourPending: true } : {}) }));
     setCurrencyModalOpen(false);
     setCurrencySearch("");
   }
@@ -2215,6 +2371,7 @@ function confirmStartNewTrip() {
               </View>
               <Text style={s.brand}>MindCart</Text>
             </View>
+            <View ref={setTourRef("lists")} collapsable={false} style={{ alignSelf: "flex-start" }}>
             <TouchableOpacity onPress={openListsModal} style={s.listSwitcher}>
             <ListChecks size={12} color={t.accent} />
             <Text style={s.listSwitcherText}>
@@ -2223,6 +2380,7 @@ function confirmStartNewTrip() {
             </Text>
             <ChevronDown size={12} color={t.accent} />
           </TouchableOpacity>
+            </View>
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
             {!!user && (
@@ -2267,7 +2425,7 @@ function confirmStartNewTrip() {
         {/* ===== Pinned header (does NOT scroll): summary + All/Pending/Bought ===== */}
         {tab === "home" && (
           <View style={{ paddingHorizontal: 16 }}>
-              <View style={s.summaryCard}>
+              <View ref={setTourRef("summary")} collapsable={false} style={s.summaryCard}>
                 <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
                   <View style={{ flex: 1, minWidth: 0 }}>
                     <Text style={{ color: t.text, fontWeight: "800", fontSize: 15 }}>
@@ -2357,7 +2515,7 @@ function confirmStartNewTrip() {
                 </Text>
               ) : null}
 
-              <View style={s.addCard}>
+              <View ref={setTourRef("addCard")} collapsable={false} style={s.addCard}>
                 <Text style={s.addHint}>Add an item whenever you remember (tip: "milk, bread, eggs" adds all three)</Text>
                 {/* Row 1: item name on its own line */}
                 <TextInput
@@ -2969,11 +3127,13 @@ function confirmStartNewTrip() {
           { id: "profile", label: "Profile", icon: UserCircle2 },
         ].filter(Boolean).map(({ id, label, icon: Icon }) => (
           <TouchableOpacity key={id} onPress={() => setTab(id)} style={s.tabBtn}>
+            <View ref={id === "family" ? setTourRef("familyTab") : undefined} collapsable={false} style={{ alignItems: "center" }}>
             <View style={[s.tabIconWrap, tab === id && s.tabIconWrapActive]}>
               <Icon size={18} color={tab === id ? "#fff" : t.muted} />
               {id === "family" && receivedInvites.length > 0 && tab !== "family" && <View style={s.tabDot} />}
             </View>
             <Text style={{ fontSize: 10.5, fontWeight: "700", color: tab === id ? t.accent : t.muted, marginTop: 2 }}>{label}</Text>
+            </View>
           </TouchableOpacity>
         ))}
       </View>
@@ -3641,6 +3801,25 @@ function confirmStartNewTrip() {
         </Pressable>
       </Pressable>
     )}
+    {/* "Notifications are off" popup */}
+    <NotificationPrompt
+      visible={notifPromptOpen && !!user && !tourOpen}
+      t={t}
+      needsSettings={notifNeedsSettings}
+      busy={notifBusy}
+      onEnable={enableNotificationsFromPrompt}
+      onCancel={dismissNotifPrompt}
+    />
+    {/* First-run guided tour (new users only) */}
+    <GuidedTour
+      visible={tourOpen}
+      t={t}
+      steps={TOUR_STEPS}
+      currencySymbol={currency.symbol}
+      getTarget={getTourTarget}
+      onStepChange={(step) => { if (step.tab) setTab(step.tab); }}
+      onFinish={finishTour}
+    />
     </View>
     </GestureHandlerRootView>
   );

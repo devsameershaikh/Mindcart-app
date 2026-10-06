@@ -2,6 +2,7 @@
 // App.js subscribes to events to keep shared lists live across devices/people.
 import { io } from "socket.io-client";
 import { API_BASE_URL, getToken } from "./api";
+import { log, warn } from "./logger";
 
 let socket = null;
 
@@ -17,10 +18,10 @@ export async function connectSocket() {
     reconnectionDelayMax: 10000, // backoff instead of hammering the server
   });
 
-  socket.on("connect", () => console.log("[socket] connected", socket.id));
-  socket.on("connect_error", (err) => console.log("[socket] connect_error:", err.message));
+  socket.on("connect", () => log("[socket] connected"));
+  socket.on("connect_error", (err) => warn("[socket] connect_error:", err?.message));
   socket.on("disconnect", (reason) => {
-    console.log("[socket] disconnected:", reason);
+    log("[socket] disconnected:", reason);
     // "io server disconnect" means the SERVER closed this connection --
     // socket.io-client deliberately does NOT auto-reconnect for this
     // reason (it assumes the server meant to kick the client, e.g. a

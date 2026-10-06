@@ -79,16 +79,25 @@ export function validateItemName(name, category, items, excludeId = null) {
   if (dup) return `"${trimmed}" is already in ${category}.`;
   return "";
 }
+// Quantity may be fractional (e.g. 1.5 kg): up to 2 decimal places, 0–999.
 export function clampQty(qty) {
-  const n = Math.floor(Number(qty));
+  const n = Number(qty);
   if (!Number.isFinite(n) || n < 0) return 0;
   if (n > 999) return 999;
-  return n;
+  return Math.round(n * 100) / 100;
 }
 export function clampPrice(price) {
-  console.log("clampPrice", price);
   if (price === "" || price === null || price === undefined) return "";
   const n = Number(price);
   if (!Number.isFinite(n) || n < 0) return "";
   return Math.round(Math.min(n, 100000) * 100) / 100;
+}
+
+// Ids are used as object keys and in URL paths. Accept only the same shape
+// the backend enforces (letters, digits, "_" and "-", max 64) and reject the
+// names that would hit Object.prototype ("__proto__", "constructor", ...).
+const SAFE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const BLOCKED_IDS = new Set(["__proto__", "constructor", "prototype"]);
+export function isSafeId(id) {
+  return typeof id === "string" && SAFE_ID_RE.test(id) && !BLOCKED_IDS.has(id);
 }

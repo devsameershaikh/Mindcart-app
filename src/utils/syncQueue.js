@@ -16,6 +16,7 @@
 // to status updates to show a "3 changes pending" indicator.
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { warn } from "./logger";
 
 const QUEUE_KEY = "mindcart_sync_queue_v1";
 
@@ -35,10 +36,11 @@ function notify() {
 async function persist() {
   try {
     await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
-  } catch {
+  } catch (e) {
     // If disk write fails, the in-memory queue is still correct for this
     // session — worst case we lose the outbox on a crash, not on a normal
     // app switch.
+    warn("[syncQueue] couldn't persist outbox:", e?.message);
   }
 }
 
@@ -46,8 +48,14 @@ async function ensureLoaded() {
   if (loaded) return;
   try {
     const raw = await AsyncStorage.getItem(QUEUE_KEY);
-    queue = raw ? JSON.parse(raw) : [];
-  } catch {
+    const parsed = raw ? JSON.parse(raw) : [];
+    // Never trust persisted data blindly: a corrupt/tampered outbox must not
+    // be replayed as network calls.
+    queue = Array.isArray(parsed)
+      ? parsed.filter((op) => op && typeof op === "object" && typeof op.type === "string" && op.payload && typeof op.payload === "object")
+      : [];
+  } catch (e) {
+    warn("[syncQueue] outbox unreadable, starting empty:", e?.message);
     queue = [];
   }
   loaded = true;
@@ -197,6 +205,8 @@ export async function flush() {
         // written, so drop it rather than blocking everything behind it.
         queue.shift();
         await persist();
+        // Type + status only — never the payload (it holds user content).
+        warn("[syncQueue] dropped op", op.type, e?.status);
         if (onDropped) { try { onDropped(op, e); } catch { /* noop */ } }
       }
     }

@@ -164,17 +164,14 @@ const notificationService = {
    * not block sign-in or leave the app on a loading screen.
    */
   async init({ force = false } = {}) {
-    // console.log("[PUSH] Initialising notification service...");
     if (initialised && !force) return { ok: true, alreadyInitialised: true };
 
     try {
-      // console.log("[PUSH] Requesting permission...");
       await ensureAndroidChannels();
       this._attachListeners();
       initialised = true;
  
       const result = await this.registerDevice({ force });
-      // console.log("[PUSH] Device registration result:", result);
       return { ok: true, ...result };
     } catch (e) {
       captureError(e, { scope: "notifications.init" });

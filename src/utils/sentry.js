@@ -13,15 +13,46 @@
 
 import * as Sentry from "@sentry/react-native";
 import Constants from "expo-constants";
+import { log } from "./logger";
 
 const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN || "";
 const ENV = process.env.EXPO_PUBLIC_ENV || "dev";
+
+// Shared scrubber: the JWT and Google id token are the only genuinely
+// sensitive values the app holds. Strip anything that looks like one before
+// it leaves the device, regardless of which code path attached it.
+const SENSITIVE_KEY = /token|authorization|secret|password|cookie/i;
+
+function scrubObject(obj) {
+  if (!obj || typeof obj !== "object") return;
+  for (const key of Object.keys(obj)) {
+    if (SENSITIVE_KEY.test(key)) obj[key] = "[redacted]";
+    else if (obj[key] && typeof obj[key] === "object") scrubObject(obj[key]);
+  }
+}
+
+export function scrubEvent(event) {
+  if (!event) return event;
+  if (event.request?.headers) {
+    delete event.request.headers.Authorization;
+    delete event.request.headers.authorization;
+    delete event.request.headers.Cookie;
+    delete event.request.headers.cookie;
+  }
+  if (event.request) delete event.request.cookies;
+  scrubObject(event.extra);
+  scrubObject(event.contexts);
+  if (Array.isArray(event.breadcrumbs)) {
+    for (const b of event.breadcrumbs) scrubObject(b?.data);
+  }
+  return event;
+}
 
 let enabled = false;
 
 export function initSentry() {
   if (!DSN) {
-    console.log("[sentry] no EXPO_PUBLIC_SENTRY_DSN set — reporting disabled");
+    log("[sentry] no EXPO_PUBLIC_SENTRY_DSN set — reporting disabled");
     return;
   }
   Sentry.init({
@@ -35,26 +66,14 @@ export function initSentry() {
     enableNativeCrashHandling: true,
     enableAutoSessionTracking: true,
     // Don't let a debug build pollute prod issue counts.
-    debug: ENV !== "prod",
+    debug: __DEV__ && ENV !== "prod",
     release: Constants?.expoConfig?.version
       ? `mindcart@${Constants.expoConfig.version}`
       : undefined,
     beforeSend(event) {
-      // The JWT and Google id token are the only genuinely sensitive values
-      // the app holds. Strip anything that looks like one before it leaves
-      // the device, regardless of which code path attached it.
-      if (event.request?.headers) delete event.request.headers.Authorization;
-      if (event.extra) {
-        for (const key of Object.keys(event.extra)) {
-          if (/token|authorization|secret|password/i.test(key)) {
-            event.extra[key] = "[redacted]";
-          }
-        }
-      }
-      return event;
+      return scrubEvent(event);
     },
   });
-  Sentry.captureException(new Error("My first Sentry error!"));
 
   enabled = true;
 }
@@ -76,7 +95,7 @@ export function setSentryUser(user) {
  */
 export function captureError(error, context = {}) {
   if (!enabled) {
-    console.log("[sentry:disabled]", context?.scope || "", error?.message || error);
+    log("[sentry:disabled]", context?.scope || "", error?.message || error);
     return;
   }
   Sentry.withScope((scope) => {

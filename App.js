@@ -58,7 +58,7 @@ import * as Sentry from '@sentry/react-native';
 import * as Updates from "expo-updates";
 import { log } from "./src/utils/logger";
 import { scrubEvent } from "./src/utils/sentry";
-
+import WelcomeOfferPopup from "./src/components/WelcomeOfferPopup";
 const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN || "";
 
 Sentry.init({
@@ -642,6 +642,7 @@ export default Sentry.wrap(function DmartApp() {
   // already have a currency, so they never get it. `tourDone` makes it
   // one-shot; both flags live on `profile`, which is already persisted.
   const [tourOpen, setTourOpen] = useState(false);
+  const [offerOpen, setOfferOpen] = useState(false);
   const tourRefs = useRef({});
   const tourStarted = useRef(false);
   const setTourRef = (key) => (r) => { tourRefs.current[key] = r; };
@@ -1246,12 +1247,13 @@ export default Sentry.wrap(function DmartApp() {
     setTimeout(() => setTourOpen(true), 700);
   }, [appLoaded, user, hasSyncedOnce, profile.currency, profile.tourPending, profile.tourDone, itemsByList]);
 
-  function finishTour() {
-    setTourOpen(false);
-    setProfile((p) => ({ ...p, tourPending: false, tourDone: true }));
-    setTab("home");
-  }
-
+function finishTour() {
+  setTourOpen(false);
+  const showOffer = !profile.welcomeOfferShown;
+  setProfile((p) => ({ ...p, tourPending: false, tourDone: true, welcomeOfferShown: true }));
+  setTab("home");
+  if (showOffer) setTimeout(() => setOfferOpen(true), 450); // let the tour modal close first
+}
   // ---------- "Notifications are off" popup ----------
   // Only for someone who HAD notifications on and later switched them off in
   // the phone's settings. If they declined at first sign-in they never had
@@ -3882,6 +3884,7 @@ function confirmStartNewTrip() {
       onStepChange={(step) => { if (step.tab) setTab(step.tab); }}
       onFinish={finishTour}
     />
+    <WelcomeOfferPopup visible={offerOpen} t={t} onClose={() => setOfferOpen(false)} />
     </View>
     </GestureHandlerRootView>
   );
